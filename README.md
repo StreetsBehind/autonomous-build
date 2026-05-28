@@ -9,6 +9,11 @@ vision.md   ──/vision──▶   plan.md
 plan.md     ──/compose──▶  beads DAG (epics + tasks + deps)
                                   │
                                   ▼
+                          /quality-pass   ──▶  per-bead score; under 95 → /split
+                                  │              (atomize oversized beads
+                                  │               along a named seam,
+                                  │               propose-then-confirm)
+                                  ▼
               ┌──── /loop /build-next ────┐
               │  bd ready → claim → build │   ◀── /flag bd-<id> <reason>
               │  → gate → commit          │       (in-flight workflow capture)
@@ -28,7 +33,7 @@ plan.md     ──/compose──▶  beads DAG (epics + tasks + deps)
 | Path | What it is |
 | --- | --- |
 | `formulas/` | beads workflow templates — the reusable intellectual property |
-| `skills/` | Claude Code skills that drive each stage (`vision`, `compose`, `build-next`, `escalate`, `flag`, `retro`) |
+| `skills/` | Claude Code skills that drive each stage (`vision`, `compose`, `quality-pass`, `split`, `build-next`, `build-batch`, `escalate`, `flag`, `retro`) |
 | `templates/vision.md` | The form you fill out per app |
 | `hooks/post-build-gate.ps1` | Quality gate (typecheck/lint/test + Jankurai audit/witness) run before every `bd close` |
 | `retros/` | Markdown retros produced by `/retro` after each app finishes |

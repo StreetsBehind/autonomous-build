@@ -1,4 +1,4 @@
-# post-build-gate.ps1
+﻿# post-build-gate.ps1
 #
 # Quality gate run by /build-next before `bd close`. Detects the stack and
 # runs lint + typecheck + test. Exits 0 only if everything passes.

@@ -147,7 +147,7 @@ For every bead with score < 95, propose remediations **specific to this bead** �
 
 | Pattern | When | Output |
 |---|---|---|
-| **Split** | Sizing penalties dominate, especially cross-layer | Suggest the seam: "Split into Xa (DB+API) and Xb (UI consuming the API). The API is the stable boundary." |
+| **Split** | Sizing penalties dominate, especially cross-layer | Suggest the seam: "Split into Xa (DB+API) and Xb (UI consuming the API). The API is the stable boundary." Then recommend the user mechanize the decomposition via `/split <beadId> <seam>` — the /split skill takes the seam, proposes child beads with partitioned ACs + preserved dep edges, and (after user confirmation) closes the source as `superseded`. |
 | **Pin contracts** | API contract missing | Paste the proposed schema/types directly. |
 | **Add file map** | File paths missing | Enumerate: "Files to read: A, B, C. Files to create: X. Files to modify: Y." |
 | **Add test list** | testPlanFile missing | Name target file and cases: "`tests/services/widgets.test`: 1) create succeeds, 2) read by id, 3) delete removes, 4) list paginates". This is the kind of thing the formula's `[steps.testPlan]` should have declared — if /compose dropped it, surface that as a separate issue too. |
