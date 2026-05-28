@@ -160,11 +160,29 @@ Use a HEREDOC for multi-line commit bodies.
 
 ### Step 8: emit BUILD_COMPLETE
 
-```
-<!-- BUILD_COMPLETE:{"beadId":"<id>","status":"ready-to-merge","commitSha":"<sha>","notes":"<one-line summary of what changed>"} -->
+Write the completion marker **two ways** — file first (cheap for the orchestrator to poll), stdout second (legacy fallback):
+
+```powershell
+$marker = @{
+  beadId    = $beadId
+  status    = "ready-to-merge"   # or "blocked" / "failed"
+  commitSha = $sha               # or $null on blocked/failed
+  notes     = "<one-line summary of what changed>"
+} | ConvertTo-Json -Compress
+
+# 1. Write the marker file in the worktree root. The orchestrator's poll loop
+#    Test-Paths this before falling back to TaskOutput scraping — it's the
+#    builder-driven completion signal that replaces 10s-interval stdout reads.
+Set-Content -Path ".bd-build-complete.json" -Value $marker -Encoding utf8
+
+# 2. Emit the legacy stdout marker as your final line. Old orchestrators (and
+#    the TaskOutput fallback path) still scrape this.
+Write-Host "<!-- BUILD_COMPLETE:$marker -->"
 ```
 
-The orchestrator parses this from your tail output, runs `git merge --no-ff bead/<id>` into main, re-runs the gate on main, and closes the bead. You are done.
+Emit exactly once. Both the file and the stdout marker must encode identical JSON — the orchestrator treats them as equivalent.
+
+The orchestrator parses one of these, runs `git merge --no-ff bead/<id>` into main, re-runs the gate on main, and closes the bead. You are done.
 
 ## Do not
 

@@ -158,12 +158,26 @@ On red:
 
 ### Step 9: commit
 
+Stage **explicitly**, never with a blanket `add --all`. The gate's pre-commit safety scan already ran in Step 8 — any file that appeared between then and now (a scratch file, an .env an agent created to test something, a forgotten kickoff receipt) is unscreened. Blanket-staging puts those in the commit. Derive the path list from the kickoff's ownership boundary, which already enumerates what the bead is allowed to touch:
+
+**App mode:**
 ```powershell
-git add -A
+$kickoff = Get-Content "target/jankurai/kickoff-$id.json" -Raw | ConvertFrom-Json
+# The kickoff's ownership list is the bounded set of paths this bead may write.
+# Intersect against `git status --porcelain` so we stage only files that (a) are
+# inside ownership AND (b) actually changed. Glob expansion handled by `git add`.
+$dirty = git status --porcelain | ForEach-Object { ($_ -split '\s+', 2)[1] }
+foreach ($path in $kickoff.ownership) {
+    # Each ownership entry may be a literal path or a glob — pass to git add as-is
+    # and let git match. Anything outside ownership stays unstaged and won't be committed.
+    git add -- $path
+}
 git commit -m "<issue.title> (bd: $id)"
 ```
 
-Use a HEREDOC for multi-line bodies. Do not include co-author lines unless the user has previously enabled them. Do **not** stage `target/jankurai/` — it should be in `.gitignore`.
+**Meta mode:** no kickoff exists. Enumerate the files this tick touched (from your own edit history this session) and pass them to `git add` explicitly. Do not use the blanket `--all` flag. If you genuinely need a broad stage (e.g. a refactor that touched dozens of files), list them with `git status --porcelain` first, sanity-check the list yourself, then `git add` each path explicitly.
+
+Use a HEREDOC for multi-line commit bodies. Do not include co-author lines unless the user has previously enabled them. Do **not** stage `target/jankurai/` — it should be in `.gitignore`, and even if it isn't, the kickoff's ownership list won't include it so the explicit-staging approach already excludes it.
 
 ### Step 10: close
 

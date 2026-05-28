@@ -132,11 +132,33 @@ while ($true) {
   }
 
   # ── 2. Poll active pipelines ──
-  # Batch all TaskOutput calls into a single response — they're independent.
+  # Prefer the marker FILE the worker drops on completion over reading TaskOutput.
+  # `Test-Path <worktree>/.bd-build-complete.json` is a single stat() per worker — cheap.
+  # `TaskOutput` is a billed read of the worker's full stdout buffer; doing that every
+  # 10s × N workers × ~30 min wall is a meaningful Opus token spend on idle agents.
+  # Workers write `<worktree>/.bd-build-complete.json` (same payload as the legacy
+  # `<!-- BUILD_COMPLETE:{...} -->` stdout marker) the instant they finish. We fall back
+  # to scraping stdout only if the file is somehow absent on an exited task.
   foreach ($id in $activePipelines.Keys) {
-    $pipeline = $activePipelines[$id]
-    $output = TaskOutput -taskId $pipeline.taskId -block $false -timeout 5000
-    $marker = Find-BuildCompleteMarker $output
+    $pipeline    = $activePipelines[$id]
+    $markerFile  = Join-Path $pipeline.worktreePath ".bd-build-complete.json"
+    $marker      = $null
+
+    if (Test-Path $markerFile) {
+      try { $marker = Get-Content $markerFile -Raw | ConvertFrom-Json } catch { $marker = $null }
+    }
+
+    if (-not $marker) {
+      # Fallback: scrape stdout. Only do this if the task has actually exited or we're
+      # past the stage timeout — checking TaskOutput on a still-running worker is the
+      # exact cost we're trying to avoid.
+      $taskState = TaskGet -taskId $pipeline.taskId
+      if ($taskState.status -in @('completed','failed','stopped')) {
+        $output = TaskOutput -taskId $pipeline.taskId -block $false -timeout 5000
+        $marker = Find-BuildCompleteMarker $output
+      }
+    }
+
     if ($marker) {
       Process-WorkerCompletion $id $marker
     } elseif ((Get-Date) - $pipeline.dispatchTime -gt $stageTimeout) {
@@ -298,7 +320,19 @@ Merge-And-Close($beadId):
   Push-Location (git rev-parse --show-toplevel)
   try {
     git checkout main
-    git pull --ff-only origin main 2>&1 | Out-Null   # if a remote is configured; ignore if not
+    # Pull only if a remote is configured. The prior implementation suppressed errors
+    # with `2>&1 | Out-Null` but still proceeded to merge against (potentially stale)
+    # local main — silently hiding pull failures from a real remote. Gate explicitly.
+    $remotes = (git remote) -split "`n" | Where-Object { $_.Trim() -ne '' }
+    if ($remotes.Count -gt 0) {
+      git pull --ff-only origin main
+      if ($LASTEXITCODE -ne 0) {
+        bd update $beadId --status=blocked --notes "git pull --ff-only origin main failed before merge — local main is behind remote and cannot fast-forward"
+        $blockedSet += $beadId
+        $mergeInFlight = $null
+        return
+      }
+    }
     $mergeOutput = git merge --no-ff $pipeline.branch -m "Merge $beadId" 2>&1
     if ($LASTEXITCODE -ne 0) {
       # Conflict. Abort the merge, block the bead.
