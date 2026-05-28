@@ -1,0 +1,182 @@
+# integration-http: an outbound HTTP client integration.
+#
+# Use for: third-party APIs (Stripe, SendGrid, OpenAI), internal service-to-service
+# HTTP calls, anything requiring a typed client with retry + timeout.
+#
+# Out of scope for v1 — each is a separate follow-on formula:
+# - Request signing (HMAC bodies beyond simple header signatures): integration-http-signed-bodies
+# - OAuth refresh flows: integration-http-oauth-refresh
+# - Rate-limit handling / token-bucket: integration-http-rate-limited
+# - Streaming / SSE: integration-http-streaming
+#
+# Dependency-graph design (critical):
+#   client ──┬── happy-path-test
+#            └── error-path-test
+#   secret-handling  (independent — does NOT block client or tests)
+#
+# secret-handling is the only step that needs human input (the touches-secrets
+# escalation gates it). Putting it on its own branch lets the loop ship the
+# client + tests in parallel with humans deciding the secret store, rotation,
+# and access-control. Tests use hardcoded fake creds passed to the client
+# constructor directly — they do not mock or depend on secret-handling.
+
+formula = "integration-http"
+description = """
+An outbound HTTP client integration: typed client with retry + timeout, separate secret-handling on its own escalation track, happy- and error-path tests that ship in parallel with the secret work.
+"""
+type = "workflow"
+version = 1
+
+[vars.integration_name]
+description = "Integration slug in kebab-case (e.g. stripe, sendgrid, internal-billing). Used as the file-glob root and the client class stem."
+required = true
+
+[vars.base_url]
+description = "Base URL of the API (e.g. https://api.stripe.com). The client prepends this to all request paths."
+required = true
+
+[vars.auth_strategy]
+description = "Credential transport: 'api-key' (Authorization: Bearer | X-API-Key header), 'oauth-client-credentials' (token endpoint exchange), 'hmac-signed' (request signature), or 'none' (public API)."
+required = true
+
+[vars.retry_policy]
+description = "Retry behavior on 5xx / network errors: 'exponential-3-attempts' (default: 3 tries, exponential backoff), 'linear-5-attempts' (5 tries, fixed delay), 'none' (no retry)."
+default = "exponential-3-attempts"
+
+[vars.timeout_seconds]
+description = "Per-request timeout in seconds. Applied to both connect and read phases."
+default = "30"
+
+# =============================================================================
+# Client (no secret handling here — accepts creds as a constructor parameter)
+# =============================================================================
+
+[[steps]]
+id = "client"
+title = "{{integration_name}}: HTTP client with retry + timeout"
+type = "feature"
+priority = 1
+files = [
+  "services/integrations/{{integration_name}}/client.*",
+  "src/integrations/{{integration_name}}/client.*",
+  "src/services/integrations/{{integration_name}}/client.*",
+]
+description = """
+The typed HTTP client. Constructor / init accepts credentials as a plain parameter — there is NO secret-store coupling here. That's the secret-handling step's job and it ships independently on its own escalation track.
+
+**Configuration baked into the client:**
+- base_url = {{base_url}}
+- auth_strategy = {{auth_strategy}}
+- retry_policy = {{retry_policy}}
+- timeout_seconds = {{timeout_seconds}}
+
+**Acceptance:**
+- Client class / module exported from one of the file paths above
+- Constructor accepts credentials directly (e.g. `new {{integration_name}}Client({ credentials: { ... } })`) — does NOT read from process.env, secret managers, or config files
+- Applies {{auth_strategy}} on every outbound request (Authorization header, signed request, or none — whichever the strategy requires)
+- Implements {{retry_policy}} on 5xx and network errors; does NOT retry on 4xx (those are application errors, not transient failures)
+- Applies a per-request timeout of {{timeout_seconds}}s to connect AND read phases; on timeout raises a typed timeout error
+- Surfaces typed errors per response class: 4xx → client error, 5xx (after retries) → server error, network/timeout → transport error
+- Type-checker passes
+"""
+
+[steps.testPlan]
+file = "tests/integrations/{{integration_name}}/client.test"
+cases = 4
+coverage = "client constructs with hardcoded fake credentials; client honors retry_policy={{retry_policy}} on 5xx (count attempts); client respects timeout_seconds={{timeout_seconds}} (test against a slow server); client applies {{auth_strategy}} on every request (verify outbound header / signature)"
+
+# =============================================================================
+# Secret handling (INDEPENDENT BRANCH — touches-secrets escalation)
+# =============================================================================
+
+[[steps]]
+id = "secret-handling"
+title = "{{integration_name}}: wire credentials from secret store"
+type = "feature"
+priority = 1
+labels = ["touches-secrets"]
+files = [
+  "config/secrets/{{integration_name}}.*",
+  "services/secrets.*",
+  "src/services/secrets.*",
+]
+description = """
+Wire {{integration_name}} credentials from the chosen secret store (env, AWS Secrets Manager, Vault, encrypted file, etc.) into the client's constructor at app startup.
+
+**Why this is a separate step on its own branch:**
+- The client step ships without this — happy-path and error-path tests construct the client with hardcoded fake credentials directly
+- This step blocks for human decision on secret store, rotation policy, and access-control (touches-secrets escalation per docs/ESCALATION_RULES.md)
+- Putting this on its own dep branch means the loop can finish 3 of the 4 steps in parallel while waiting for the human
+
+**Escalation:** /build-next blocks on touches-secrets. The human must answer BEFORE this step proceeds:
+1. Where do the credentials live? (env var? secret manager? encrypted config?)
+2. Who/what has read access? (the runtime process only? CI? local dev?)
+3. Rotation policy: how often, by whom, with what coordination?
+4. What's the failure mode if the secret is missing or unreadable at startup? (fail-closed crash? fall back to a stub? read-only mode?)
+
+**Acceptance (after the human unblocks):**
+- A loader module reads credentials from the agreed source and constructs the client
+- The loader is invoked at app startup (or first use, per the decision)
+- Credentials never appear in logs, error messages, or telemetry — verify by grep against test output and by reading any error-rendering code paths
+- Missing-credential path matches the agreed failure mode
+- No test in this repo exercises a real credential value — tests of the loader use a fake or in-memory secret source
+"""
+
+# =============================================================================
+# Happy-path test (depends on client, NOT on secret-handling)
+# =============================================================================
+
+[[steps]]
+id = "happy-path-test"
+title = "{{integration_name}}: happy-path integration test"
+type = "feature"
+priority = 2
+needs = ["client"]
+files = [
+  "tests/integrations/{{integration_name}}/happy.*",
+]
+description = """
+Integration test for a representative successful call against the {{integration_name}} API. Uses a mocked HTTP server (msw, nock, vcr-style fixtures, or similar) — does NOT hit the real {{base_url}}.
+
+**Acceptance:**
+- Test constructs the client with hardcoded fake credentials (no dependency on secret-handling)
+- Test stands up a mock server that responds with a representative successful payload for at least one endpoint of the {{integration_name}} API
+- The client's method-under-test returns a parsed response object matching the API's success shape
+- Test verifies the request shape the client emitted (URL path, method, body, headers including {{auth_strategy}}-derived auth)
+- Test passes under the project's test runner with no live network dependency
+"""
+
+[steps.testPlan]
+file = "tests/integrations/{{integration_name}}/happy.test"
+cases = 2
+coverage = "representative successful call returns parsed response shape; client emits the expected outbound request (path, method, body, {{auth_strategy}} auth header / signature)"
+
+# =============================================================================
+# Error-path test (depends on client, NOT on secret-handling)
+# =============================================================================
+
+[[steps]]
+id = "error-path-test"
+title = "{{integration_name}}: error-path + retry integration test"
+type = "feature"
+priority = 2
+needs = ["client"]
+files = [
+  "tests/integrations/{{integration_name}}/errors.*",
+]
+description = """
+Integration test for the client's failure and retry surfaces. Same mock-server approach as happy-path-test — no live network.
+
+**Acceptance:**
+- Test constructs the client with hardcoded fake credentials (no dependency on secret-handling)
+- 5xx response triggers retry per {{retry_policy}}: attempt count matches policy, backoff timing is at least the floor for the policy
+- 4xx response surfaces a typed client error without retry (4xx are not transient)
+- Timeout surfaces a typed transport error (mock server delays past {{timeout_seconds}}s)
+- Final failure after exhausting retries surfaces a typed server error including the last response's status and (truncated) body
+- All tests pass under the project's test runner with no live network dependency
+"""
+
+[steps.testPlan]
+file = "tests/integrations/{{integration_name}}/errors.test"
+cases = 4
+coverage = "5xx triggers retry per {{retry_policy}} (attempt count + backoff floor); 4xx surfaces typed client error without retry; timeout surfaces typed transport error; final failure after retries surfaces typed server error with last-response context"
