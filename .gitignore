@@ -1,0 +1,14 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/
+
+# Local-only beads test scratch (formulas get tested by initializing throwaway projects)
+scratch/
+*.local/
+.beads/
+
+# Logs from loop runs
+loop-*.log
