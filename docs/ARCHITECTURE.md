@@ -58,6 +58,28 @@ The skill schedules the next wake via `ScheduleWakeup`:
 
 Reads `bd blocked --json`, groups by reason category, and sends a single `PushNotification` with the summary. User responds, unblocks issues (`bd reopen` + edits), restarts the loop.
 
+### `/flag` — in-flight workflow capture
+
+When the user notices the loop did something the workflow itself should have prevented (vision picked wrong stack, gate too lax, formula's acceptance was vague), they invoke `/flag bd-<id> <reason>`. The skill labels the issue `workflow-issue` + a category sub-label and appends a `FLAG:` note. `/retro` reads these labels.
+
+### `/retro` — workflow performance review
+
+Runs automatically at the loop's DONE exit (both ready and blocked are empty), and manually any time. Pulls from:
+- App's beads DB: closure metrics, retry counts, flagged issues, blocked issues
+- App git log: reverts of loop commits, post-close edits within 24h, suspiciously-fast closures (<30s)
+- `autonomous-build`'s git log during the build window: mid-build edits to skills/formulas/gate (each one is evidence the workflow needed adjustment)
+- `bd audit` interactions.jsonl: per-task tool-call activity
+
+Outputs:
+1. A markdown report at `retros/retro-<app>-<date>.md`
+2. Concrete improvement issues filed into autonomous-build's own beads DB under the `Workflow improvements` epic, with `workflow-improvement` and `from-app:<name>` labels and acceptance criteria the loop can later self-verify (e.g. "edit `skills/vision/SKILL.md` to add SQLite bias for simple-v1 apps; verify by grep").
+
+## The meta-loop
+
+`autonomous-build/` is itself a `bd init`'d repo. Workflow improvement tasks filed by `/retro` are real beads issues here. You can work them by hand or — for ones whose acceptance is self-verifiable — run `/loop /build-next` *on this repo* and let the loop improve the loop. The same machinery applies; the only difference is the work product is a SKILL.md / formula.yaml diff instead of app code.
+
+This is where the workflow compounds: the more apps you build, the more retros run, the more improvement issues get filed, and the better the next app's first draft is. The infrastructure improves itself.
+
 ## Why beads specifically
 
 - **Dependency-aware ready queue** (`bd ready` excludes blocked, in-progress, deferred, hooked) — no custom scheduler needed.

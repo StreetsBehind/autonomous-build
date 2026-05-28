@@ -10,14 +10,17 @@ plan.md     ──/compose──▶  beads DAG (epics + tasks + deps)
                                   │
                                   ▼
               ┌──── /loop /build-next ────┐
-              │  bd ready → claim → build │
-              │  → preflight → commit     │
+              │  bd ready → claim → build │   ◀── /flag bd-<id> <reason>
+              │  → preflight → commit     │       (in-flight workflow capture)
               │  → bd close (or block)    │
-              └────── exits when ready=0 ─┘
-                                  │
-                                  ▼
-                             /escalate
-                             (PushNotification with blocker summary)
+              └─┬───────────────────┬─────┘
+                │ ready=0,          │ ready=0,
+                │ blocked>0         │ blocked=0
+                ▼                   ▼
+            /escalate            /retro
+            (PushNotification)   (workflow performance report +
+                                  files improvements into
+                                  autonomous-build's own beads)
 ```
 
 ## Repo layout
@@ -25,9 +28,11 @@ plan.md     ──/compose──▶  beads DAG (epics + tasks + deps)
 | Path | What it is |
 | --- | --- |
 | `formulas/` | beads workflow templates — the reusable intellectual property |
-| `skills/` | Claude Code skills that drive each stage |
+| `skills/` | Claude Code skills that drive each stage (`vision`, `compose`, `build-next`, `escalate`, `flag`, `retro`) |
 | `templates/vision.md` | The form you fill out per app |
 | `hooks/post-build-gate.ps1` | Quality gate (typecheck/lint/test) run before every `bd close` |
+| `retros/` | Markdown retros produced by `/retro` after each app finishes |
+| `.beads/` | This repo's *own* beads DB — tracks workflow improvements (retro-filed) |
 | `docs/` | Architecture, install, escalation rules |
 
 ## Getting started

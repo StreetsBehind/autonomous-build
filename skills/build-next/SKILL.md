@@ -111,8 +111,10 @@ bd worktree remove "task-$id"
 
 Output the next-action hint for `/loop`:
 - `bd ready --json --limit 1` non-empty → "READY: <count> remaining" — loop should wake in 60–180s
-- empty + blocked present → "BLOCKED: <count>" — loop should call `/escalate` and exit
-- both empty → "DONE" — loop should exit
+- empty + blocked present → invoke `/escalate`, then "BLOCKED: <count>" — loop should exit
+- both empty → invoke `/retro` (the build is done; generate the workflow performance report and file improvements), then "DONE" — loop should exit
+
+The DONE-path `/retro` invocation is automatic. The user can also run `/retro` mid-build for a partial review — the skill handles either case.
 
 ## Stopping conditions (escalate, do not guess)
 

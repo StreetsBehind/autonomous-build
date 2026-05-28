@@ -5,10 +5,19 @@ Thumbs.db
 .vscode/
 .idea/
 
-# Local-only beads test scratch (formulas get tested by initializing throwaway projects)
+# Local-only formula test scratch (formulas get dry-run-cooked in throwaway projects)
 scratch/
 *.local/
-.beads/
+
+# NOTE: .beads/ is intentionally NOT ignored. autonomous-build itself runs on beads
+# (workflow-improvements epic + retro-filed tasks). The Dolt backend + JSONL are
+# designed to be committed.
 
 # Logs from loop runs
 loop-*.log
+
+# Claude Code local hook settings (regenerate per machine via `bd setup claude --project`)
+.claude/settings.local.json
+
+# Retro temp files (created during /retro analysis, not the final reports)
+.retro-tmp/
