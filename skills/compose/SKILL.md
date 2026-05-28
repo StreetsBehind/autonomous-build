@@ -52,11 +52,16 @@ Convert `plan.md` into a live beads DAG inside the current app repo. After this 
    Capture the returned epic ID.
 
 4. **For each feature in `plan.md` §"Feature order":**
+
+   Maintain `$pouredFeatures = @{}` across the loop; Step 5 reads it for the coverage check.
+
    a. Pour the formula directly (no separate cook+persist step — `bd mol pour` accepts a formula name):
       ```powershell
       $pourOutput = bd mol pour <formula-name> --var key=value ... 2>&1
       # Parse "Root issue: <id>" from $pourOutput to get the molecule's root.
       $pourRoot = ($pourOutput | Select-String -Pattern 'Root issue: (\S+)').Matches[0].Groups[1].Value
+      if (-not $pouredFeatures.ContainsKey($featureName)) { $pouredFeatures[$featureName] = @() }
+      $pouredFeatures[$featureName] += $pourRoot
       ```
       (Use `--dry-run` first to preview if the formula is unfamiliar; print the planned issues to the user, then proceed without confirmation.)
    b. Reparent the molecule's root epic under the app-level epic. `bd mol pour` has no `--parent` flag (verified 2026-05-28); reparent after the fact:
@@ -93,19 +98,45 @@ Convert `plan.md` into a live beads DAG inside the current app repo. After this 
 
       Use the `@<file>` pattern — coverage strings contain semicolons that would break inline JSON quoting. The TOML parser used by PowerShell is whatever is convenient (a small parser in this skill, or shell out to `python -c "import tomllib; ..."` if Python is available in the build env). If a step has no `[steps.testPlan]`, skip it — that's a valid signal that the step doesn't produce code with tests (e.g., a `chore: write README`).
 
-5. **Add cross-feature dependencies** from `plan.md` §"Cross-feature dependencies":
+5. **Coverage check: every plan.md feature produced an epic.** During Step 4, build a map `$pouredFeatures[<feature-name>] = @($pourRoot, ...)`. After the loop, parse `plan.md` §"Feature order" to extract feature names (the bolded label before the em-dash) and verify each appears as a key in `$pouredFeatures` with at least one pour-root. Report any feature with no associated pour:
+
+   ```powershell
+   # Parse plan.md §"Feature order" — feature lines look like:
+   #   "1. Habits CRUD — formulas: `[crud-feature]`, vars: `{entity=Habit}`"
+   # The feature name is the text before the em-dash (—).
+   $planLines = Get-Content plan.md
+   $inFeatureSection = $false
+   $planFeatures = @()
+   foreach ($line in $planLines) {
+       if ($line -match '^##\s+Feature order')        { $inFeatureSection = $true;  continue }
+       if ($inFeatureSection -and $line -match '^##\s'){ break }
+       if ($inFeatureSection -and $line -match '^\s*\d+\.\s+(.+?)\s+—') {
+           $planFeatures += $Matches[1].Trim()
+       }
+   }
+
+   $missing = $planFeatures | Where-Object { -not $pouredFeatures.ContainsKey($_) }
+   if ($missing.Count -gt 0) {
+       Write-Host "PLAN COVERAGE GAP — these plan.md features produced no epic:"
+       $missing | ForEach-Object { Write-Host "  - $_" }
+   }
+   ```
+
+   Do NOT auto-correct, do NOT block — print the gap to the compose summary so the user can fix `plan.md` or re-pour the missing formula(s). This is the cheap insurance against a typo in plan.md silently dropping a feature.
+
+6. **Add cross-feature dependencies** from `plan.md` §"Cross-feature dependencies":
    ```powershell
    bd dep add <blocked-id> <blocker-id>
    ```
 
-6. **Validate the DAG.**
+7. **Validate the DAG.**
    ```powershell
    bd dep cycles            # must report none
    bd ready --json          # must return at least one issue
    bd graph --json          # visual sanity check
    ```
 
-7. **Sizing audit (post-pour).** Walk every spawned bead and flag outliers that are likely to exhaust the `/build-next` builder's context window (~70-85K tokens after fixed overhead). This is an advisory pass — surface, don't block:
+8. **Sizing audit (post-pour).** Walk every spawned bead and flag outliers that are likely to exhaust the `/build-next` builder's context window (~70-85K tokens after fixed overhead). This is an advisory pass — surface, don't block:
 
    ```powershell
    $beads = bd list --status=open --json | ConvertFrom-Json | Where-Object { $_.issue_type -ne 'epic' }
@@ -138,7 +169,7 @@ Convert `plan.md` into a live beads DAG inside the current app repo. After this 
 
    Do NOT auto-split, do NOT block. Print to the compose summary so the user can review before invoking `/loop /build-next`. Genuine formula bugs surface this way; one-off outliers can stay.
 
-8. **Commit the beads state and Jankurai scaffold.**
+9. **Commit the beads state and Jankurai scaffold.**
    ```powershell
    git add .beads/ AGENTS.md agent/ .gitignore
    git commit -m "Compose: initial task DAG + Jankurai scaffold"
