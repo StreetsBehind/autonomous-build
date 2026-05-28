@@ -94,6 +94,8 @@ Verify the run is viable. Produces a `Context` object the rest of the workflow c
 
 The heart of the workflow. One orchestrator script holds in-memory pipeline state and dispatches `beads-builder` subagents in the background. The loop iterates every 10 s until the exit condition fires.
 
+> **v1 implementation note.** The dynamic-workflow runtime exposes `agent()` and `parallel(thunks)` but not background tasks or sleep primitives, so `workflows/build-batch.js` v1 implements this phase as **wave-dispatch** rather than continuous polling: pick up to `workers` candidates with pairwise filesTouched disjointness, `parallel()` them, await the whole wave, then run serialized merges of the wave's `ready-to-merge` results, then refresh `bd ready` and repeat. Every load-bearing guarantee in this section is preserved — up to N concurrent builders, at most one merger in flight, filesTouched conflict filtering, post-merge gate, blocking on errors. The only difference vs the continuous-poll wording below is "the next wave can't start until the slowest builder in the current wave finishes," which the smoke test (sibling B3 bead) confirms is acceptable. The pseudo-code below is written in continuous-poll form because that's the eventual target; v1's wave-dispatch is a strict subset of those semantics. If the runtime later gains background-task primitives, the JS upgrade is local to Phase 2 — Phase 0, 1, and 3 are unchanged.
+
 ### In-memory pipeline state
 
 The orchestrator holds this as script variables (do not persist to a build epic — the run is bounded by a single workflow invocation, and recovery from a crash mid-batch is a deliberate non-goal for v1):
