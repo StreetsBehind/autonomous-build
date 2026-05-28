@@ -51,6 +51,31 @@ if ((Test-Path "pyproject.toml") -or (Test-Path "requirements.txt")) {
     }
 }
 
+# --- Pre-commit safety: refuse common secret/receipt patterns ---
+# .gitignore catches most, but an autonomous loop can create files .gitignore
+# doesn't know about (a pasted .env, a copied id_rsa, a cred dump). The gate
+# runs before commit, so failing here blocks the bead before the leak lands.
+Write-Host "=== pre-commit safety scan ==="
+$suspicious = git status --porcelain | ForEach-Object {
+    # porcelain format: two status chars, space, then path (or "old -> new" for renames)
+    $path = ($_ -replace '^.{2}\s+', '')
+    if ($path -match ' -> ') { $path = ($path -split ' -> ')[-1] }
+    $path
+} | Where-Object {
+    $_ -match '(^|/)\.env(\.|$)' -or
+    $_ -match '\.(pem|key|p12|pfx)$' -or
+    $_ -match 'id_rsa' -or
+    $_ -match 'credentials.*\.json$' -or
+    $_ -match '(^|/)target/jankurai/'
+}
+if ($suspicious) {
+    Write-Host "FAIL: pre-commit safety — suspicious files in tree:"
+    $suspicious | ForEach-Object { Write-Host "  - $_" }
+    $failures += "pre-commit-safety"
+} else {
+    Write-Host "PASS: pre-commit safety"
+}
+
 # --- Jankurai (quality standard) ---
 # Audit is always advisory in the inner loop. Witness vs. baseline is hard-fail
 # only after a baseline has been accepted at agent/baselines/main.repo-score.json.

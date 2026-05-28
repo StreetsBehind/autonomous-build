@@ -17,7 +17,7 @@ Outputs: `plan.md` containing:
 - Tech stack decision with one-line reasoning per choice
 - Data model (entities, fields, relationships)
 - Feature list ranked by dependency
-- Formula picks (which `formulas/*.formula.yaml` to pour, with variable bindings)
+- Formula picks (which `formulas/*.formula.toml` to pour, with variable bindings)
 - Escalation budget (e.g. "block on >$5/day API spend")
 
 This stage runs *with the user in the loop*. The plan is a contract — the loop won't second-guess it later.
@@ -76,7 +76,7 @@ Outputs:
 
 ## The meta-loop
 
-`autonomous-build/` is itself a `bd init`'d repo. Workflow improvement tasks filed by `/retro` are real beads issues here. You can work them by hand or — for ones whose acceptance is self-verifiable — run `/loop /build-next` *on this repo* and let the loop improve the loop. The same machinery applies; the only difference is the work product is a SKILL.md / formula.yaml diff instead of app code.
+`autonomous-build/` is itself a `bd init`'d repo. Workflow improvement tasks filed by `/retro` are real beads issues here. You can work them by hand or — for ones whose acceptance is self-verifiable — run `/loop /build-next` *on this repo* and let the loop improve the loop. The same machinery applies; the only difference is the work product is a SKILL.md / formula.toml diff instead of app code.
 
 This is where the workflow compounds: the more apps you build, the more retros run, the more improvement issues get filed, and the better the next app's first draft is. The infrastructure improves itself.
 
@@ -86,7 +86,6 @@ This is where the workflow compounds: the more apps you build, the more retros r
 - **Atomic claim** (`bd update --claim`) — multi-agent safe out of the box.
 - **Formula/molecule system** — first-class workflow templates with variable substitution and DAG composition.
 - **`bd worktree create`** — auto-redirects the beads DB so all worktrees share state.
-- **`bd preflight`** — built-in PR-readiness checklist usable as a quality gate.
 - **JSON output everywhere** — skills can parse without scraping.
 
 ## Why a dedicated workflow repo

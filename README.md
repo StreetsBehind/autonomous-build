@@ -11,7 +11,7 @@ plan.md     ──/compose──▶  beads DAG (epics + tasks + deps)
                                   ▼
               ┌──── /loop /build-next ────┐
               │  bd ready → claim → build │   ◀── /flag bd-<id> <reason>
-              │  → preflight → commit     │       (in-flight workflow capture)
+              │  → gate → commit          │       (in-flight workflow capture)
               │  → bd close (or block)    │
               └─┬───────────────────┬─────┘
                 │ ready=0,          │ ready=0,

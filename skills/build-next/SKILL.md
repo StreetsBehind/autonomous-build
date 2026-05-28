@@ -16,17 +16,19 @@ This skill must:
 
 ## Modes
 
-**App mode** (default): the repo is an app scaffolded by `/compose`. `AGENTS.md` exists at repo root, Jankurai is initialized (or about to be), and the full Step 5–8 sequence runs. This is what 99% of /build-next ticks do.
+**App mode** (default): the repo is an app scaffolded by `/compose`. Jankurai is initialized (or about to be), and the full Step 5–8 sequence runs. This is what 99% of /build-next ticks do.
 
 **Meta mode**: the repo is `autonomous-build` itself, and the work is editing skills, formulas, hooks, or docs. Detect this at the top of the tick:
 
 ```powershell
-$metaMode = -not (Test-Path "AGENTS.md")
+$metaMode = Test-Path "skills/build-next/SKILL.md"
 ```
+
+The marker is this skill's own source file. It is present by definition in the workflow repo and absent in any app the loop builds. (Don't use `Test-Path AGENTS.md` for this — Jankurai writes an `AGENTS.md` into every app, and this repo also has one, so that check misfires both ways.)
 
 In meta mode:
 - **Skip Step 5 (worktree)** unless the change is genuinely risky (cross-skill rewrite, schema change). Skill/formula edits are small enough that working on `main` is fine.
-- **Skip Step 6 (Jankurai kickoff)** entirely — there's no `AGENTS.md` to bound against, and skills/formulas aren't Jankurai-tracked source code.
+- **Skip Step 6 (Jankurai kickoff)** entirely — skills/formulas aren't Jankurai-tracked source code, and there's no app-level `AGENTS.md` intent to bound against.
 - **Step 8 quality gate** runs unchanged — the gate is self-detecting (no package.json → no Node checks; no baseline → no witness; jankurai audit runs but is advisory).
 - **Step 11 worktree cleanup** is also skipped when Step 5 was skipped.
 - Print `MODE: meta` at the start of the tick so the loop driver and any human observer know which path the skill took.

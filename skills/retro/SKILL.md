@@ -71,7 +71,7 @@ git log --since="$since" --format="%H|%ct|%s|%an" --name-only > .retro-tmp/aubui
 
 For each changed file in the window:
 - `skills/<name>/SKILL.md` edited → that skill needed fixing mid-build (high signal)
-- `formulas/<name>.formula.yaml` edited → that formula needed fixing mid-build (high signal)
+- `formulas/<name>.formula.toml` edited → that formula needed fixing mid-build (high signal)
 - `hooks/post-build-gate.ps1` edited → gate logic needed adjustment (high signal)
 
 ## Analysis
