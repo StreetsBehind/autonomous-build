@@ -183,6 +183,8 @@ After successful pour, print:
 - Total issues created
 - Number of epics / tasks
 - IDs of the first 3 ready tasks (`bd ready --limit 3`)
+- Any items surfaced by Step 5 (coverage gaps) or Step 8 (oversized beads)
+- **Recommend running `/quality-pass <app-epic-id>`** before `/loop /build-next` — it scores each bead against the buildability rubric and surfaces risks (sizing, missing test plans, scope drift) the structural validation in Step 7 can't see.
 - The command to start the autonomous loop: `/loop /build-next`
 
 ## Stopping conditions
