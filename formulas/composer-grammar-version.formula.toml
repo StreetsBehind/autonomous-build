@@ -1,0 +1,560 @@
+# composer-grammar-version: scaffold a new versioned grammar dir composer/grammar/v{N}/.
+#
+# Phase 1 use: `bd formula pour composer-grammar-version --var version=1` writes
+# the entire v1 grammar (tenant.schema.json + defs/* + examples/* + Rust
+# typify-generated zone declaration + TS json-schema-to-typescript zone
+# declaration + meta-validation step). This satisfies ADR 0002 Decision A/B/G
+# and Phase-1 directive items 1, 2, 13.
+#
+# Phase 4+ use: `bd formula pour composer-grammar-version --var version=2
+# --var bump_from=1` adds composer/grammar/v2/ AND a migrations/from_v1.rs
+# skeleton that is a pure function `v1::Tenant -> v2::Tenant` (per ADR 0002
+# Decision E). Migration receipts are signed at runtime — not authored here.
+#
+# Out of scope for v1 — separate follow-on formulas:
+# - Generating the typify proc-macro invocation (lives in crates/smbuild-
+#   grammar/build.rs — this formula scaffolds the build.rs; the build.rs's
+#   own evolution is owned by the grammar crate's beads)
+# - Tenant config migration RUN (composer-tenant-migrate-run) — the per-tenant
+#   migration application, receipt-emission, audit-chain-row formula
+# - The composer LLM emission path (composer-emit-plan / composer-emit-compile
+#   formulas) — Phase 4
+#
+# Dependency-graph design:
+#   create-version-dir ──┬── entity-defs ──┐
+#                        ├── workflow-defs ─┤
+#                        ├── pricing-defs ──┤
+#                        ├── notification-defs ──┤
+#                        ├── branding-defs ──────┤── examples ── meta-validation
+#                        └── roles-defs ─────────┘
+#   create-version-dir ── generated-zone-declare ──┬── typify-config
+#                                                  └── ts-codegen-config
+#   version-bump-migration (only when version > 1) ── needs create-version-dir
+#
+# Phase-1 directive items (ADR 0002, non-negotiable):
+#   #1 — JSON Schema 2020-12 from day one
+#   #2 — composer/ as generated zone + boundary
+#   #11 — universal schema (NOT per-tenant) — the schema in v{N} is the SAME
+#         schema every tenant of v{N} validates against
+#   #13 — additionalProperties: false AND unevaluatedProperties: false at every
+#         object boundary — what makes the grammar closed (T-7)
+
+formula = "composer-grammar-version"
+description = """
+Scaffold composer/grammar/v{N}/ — root tenant.schema.json + defs/*.schema.json + examples/* + typify (Rust) and json-schema-to-typescript (TS) generated-zone declarations + meta-validation. For version > 1 also writes a from_v{N-1}.rs migration skeleton (pure function v{N-1}::Tenant -> v{N}::Tenant).
+"""
+type = "workflow"
+version = 1
+
+[vars.version]
+description = "Integer grammar version (>=1). Phase 1 pours version=1; Phase 4+ pours version=2 etc. when a breaking change requires it. Pre-transformed at pour time as a string; the schema files embed it as the URI segment `composer/grammar/v{{version}}/`."
+required = true
+default = "1"
+
+[vars.bump_from]
+description = "Integer = version - 1. Required when version > 1; ignored when version = 1. Drives the version-bump-migration step (skeleton for pure-function migration from v{{bump_from}}::Tenant to v{{version}}::Tenant per ADR 0002 Decision E)."
+default = ""
+
+# =============================================================================
+# Bootstrap: create the version directory and the root tenant schema
+# =============================================================================
+
+[[steps]]
+id = "create-version-dir"
+title = "composer/grammar/v{{version}}: root tenant.schema.json"
+type = "feature"
+priority = 1
+files = [
+  "composer/grammar/v{{version}}/tenant.schema.json",
+]
+description = """
+Author the root tenant schema for grammar version v{{version}}.
+
+**Schema shape (non-negotiable per ADR 0002 Decision A + Phase-1 directive #1, #13):**
+- `"$schema": "https://json-schema.org/draft/2020-12/schema"` (Draft 2020-12 only — Ajv 2020-12 mode on the TS side, jsonschema crate in 2020-12 mode on the Rust side)
+- `"$id": "https://schemas.smbuild.io/composer/v{{version}}/tenant.schema.json"`
+- `"type": "object"`
+- `"additionalProperties": false` AND `"unevaluatedProperties": false` (T-7 closure — without both, oneOf escapes the closure)
+- `"required": ["grammar_version", "tenant_id", "branding", "entities", "job_workflow", "pricing_model", "notifications", "roles"]`
+- `"properties":` references the per-def files via `$ref`:
+  - `"branding": { "$ref": "defs/branding.schema.json" }`
+  - `"entities": { "$ref": "defs/entity.schema.json" }`
+  - `"job_workflow": { "$ref": "defs/workflow.schema.json" }`
+  - `"pricing_model": { "$ref": "defs/pricing.schema.json" }`
+  - `"notifications": { "type": "array", "items": { "$ref": "defs/notifications.schema.json" } }`
+  - `"roles": { "$ref": "defs/roles.schema.json" }`
+  - `"grammar_version": { "type": "string", "const": "{{version}}.0.0" }`
+  - `"tenant_id": { "type": "string", "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$" }` (ULID)
+- Reserved keys per ADR 0002 (`_grammar_version`, `_audit_chain_head`, `_tenant_id_assertion`) are NOT exposed as properties — the composer cannot emit them
+
+**Acceptance:**
+- File written at `composer/grammar/v{{version}}/tenant.schema.json`
+- Valid JSON; opens in Ajv 2020-12 mode without errors
+- `ajv compile --strict --spec=draft2020 composer/grammar/v{{version}}/tenant.schema.json` exits 0 (this is the meta-validation step's job; this step's acceptance is just "valid JSON shape")
+- additionalProperties: false AND unevaluatedProperties: false present on every object boundary (verified by grep; if either is missing, BLOCK as T-7 violation)
+"""
+
+# =============================================================================
+# Per-concern def schemas (parallel fan-out)
+# =============================================================================
+
+[[steps]]
+id = "entity-defs"
+title = "v{{version}}: defs/entity.schema.json (entities slot)"
+type = "feature"
+priority = 2
+needs = ["create-version-dir"]
+files = [
+  "composer/grammar/v{{version}}/defs/entity.schema.json",
+]
+description = """
+Author `defs/entity.schema.json` defining the shape of the `entities` slot in
+tenant config (per the Bayou HVAC canonical example in ADR 0002).
+
+**Shape:**
+- `"type": "object"`
+- `"additionalProperties": false`, `"unevaluatedProperties": false`
+- `"properties":` one entry per Phase-1 entity (`customers`, `properties`, `jobs`, `crews`, `inventory`, `invoices`)
+- Each entry is an object: `{ "enabled": boolean, "custom_fields": array }`
+- `custom_fields` items have the shape from Phase-1 directive #4 + the Bayou HVAC example:
+  ```
+  {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["key", "label", "type", "required"],
+    "properties": {
+      "key":       { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+      "label":     { "type": "string", "minLength": 1 },
+      "type":      { "type": "string", "enum": ["string","integer","number","boolean","enum","date"] },
+      "options":   { "type": "array", "items": { "type": "string" } },
+      "required":  { "type": "boolean" },
+      "queryable": { "type": "boolean", "default": false }
+    },
+    "allOf": [
+      { "if": { "properties": { "type": { "const": "enum" } }, "required": ["type"] },
+        "then": { "required": ["options"] } }
+    ]
+  }
+  ```
+
+**Acceptance:**
+- File written at `composer/grammar/v{{version}}/defs/entity.schema.json`
+- Valid JSON; additionalProperties + unevaluatedProperties: false on EVERY object boundary
+- Both literal HVAC custom_field entries from the ADR 0002 canonical example validate against this schema (verified manually by the builder before declaring acceptance; the formal check lives in meta-validation step's examples-validate phase)
+"""
+
+[[steps]]
+id = "workflow-defs"
+title = "v{{version}}: defs/workflow.schema.json (job_workflow slot)"
+type = "feature"
+priority = 2
+needs = ["create-version-dir"]
+files = [
+  "composer/grammar/v{{version}}/defs/workflow.schema.json",
+]
+description = """
+Author `defs/workflow.schema.json` for the `job_workflow` slot per the ADR 0002
+example.
+
+**Shape:**
+- Object with `states` and `transitions` arrays
+- `states[]`: object with `key` (snake_case string), `label` (string), `terminal` (bool), `color` (string from a fixed palette: blue, amber, green, slate, red — extend in v2 if a vertical needs it)
+- `transitions[]`: object with `from` (key referencing a state key), `to` (same), `requires_role` (array of role keys)
+- additionalProperties: false, unevaluatedProperties: false on EVERY object
+- (Cross-key validity — e.g. `from` and `to` must reference declared state keys — is enforced at TENANT BOOT TIME by smbuild-grammar's typed validator, NOT by the schema. Schema-level enforcement is per-object; semantic refs are application-level. Comment this distinction in the schema's `description` field at the top.)
+
+**Acceptance:**
+- File written; valid JSON; closure flags on every object
+- Validates the Bayou HVAC `job_workflow` block from ADR 0002 verbatim
+"""
+
+[[steps]]
+id = "pricing-defs"
+title = "v{{version}}: defs/pricing.schema.json (pricing_model slot)"
+type = "feature"
+priority = 2
+needs = ["create-version-dir"]
+files = [
+  "composer/grammar/v{{version}}/defs/pricing.schema.json",
+]
+description = """
+Author `defs/pricing.schema.json` for the `pricing_model` slot. Uses oneOf
+keyed by `kind` per the four Phase-1 pricing kinds.
+
+**Shape:**
+- `"type": "object"`
+- `"required": ["kind"]`
+- `"oneOf"`: four branches discriminated by `kind`:
+  - `flat_rate`: requires `flat_rate_book_ref` (string)
+  - `hourly`: requires `hourly_rate_cents` (integer >= 0)
+  - `flat_rate_with_estimate`: requires `flat_rate_book_ref`, `estimate_required_above_cents` (integer >= 0)
+  - `time_and_materials`: requires `materials_markup_bps` (integer >= 0), `labor_hourly_cents` (integer >= 0)
+- Common optional: `tax_rate_bps` (integer 0..10000)
+- additionalProperties: false on the root AND on each branch
+- unevaluatedProperties: false at the root (closes the oneOf — without this, oneOf escapes the closure and the composer can sneak unknown keys in)
+
+**Acceptance:**
+- File written; valid JSON; closure flags
+- The Bayou HVAC `flat_rate_with_estimate` block from ADR 0002 validates verbatim
+- An invalid mix (e.g. `kind: hourly` with `flat_rate_book_ref`) is REJECTED — the oneOf branch enforces per-kind exclusivity
+"""
+
+[[steps]]
+id = "notification-defs"
+title = "v{{version}}: defs/notifications.schema.json (notification trigger items)"
+type = "feature"
+priority = 2
+needs = ["create-version-dir"]
+files = [
+  "composer/grammar/v{{version}}/defs/notifications.schema.json",
+]
+description = """
+Author `defs/notifications.schema.json` — the shape of a SINGLE item in the
+top-level `notifications: [...]` array.
+
+**Shape:**
+- `"type": "object"`
+- `"required": ["trigger", "channel", "audience", "template_ref"]`
+- Properties:
+  - `trigger`: string, pattern matches event keys like `job.state.changed_to.<state_key>`, `invoice.sent`, `invoice.overdue.day_N`; pattern is permissive enough for the composer to emit valid event strings without requiring a closed enum (which would force a v-bump to add an event type — pattern is the right closure level for this slot)
+  - `channel`: enum ["sms", "email"]
+  - `audience`: enum ["customer", "tech", "owner"]
+  - `template_ref`: string, references a NotificationTemplate row's `ref` column (validated semantically at tenant boot, not at schema time)
+  - `condition_jsonpath`: optional string (JSONPath expression; semantic validity checked at boot)
+  - `enabled`: boolean, default true
+- additionalProperties: false, unevaluatedProperties: false
+
+**Acceptance:**
+- File written; valid JSON; closure flags
+- All three Bayou HVAC notification entries from ADR 0002 validate verbatim
+"""
+
+[[steps]]
+id = "branding-defs"
+title = "v{{version}}: defs/branding.schema.json"
+type = "feature"
+priority = 2
+needs = ["create-version-dir"]
+files = [
+  "composer/grammar/v{{version}}/defs/branding.schema.json",
+]
+description = """
+Author `defs/branding.schema.json` for the `branding` slot.
+
+**Shape:**
+- `"type": "object"`
+- `"required": ["company_name", "vertical"]`
+- Properties:
+  - `company_name`: string, minLength 1, maxLength 256
+  - `primary_color`: string, pattern `^#[0-9A-Fa-f]{6}$` (hex color; optional)
+  - `logo_url`: string, format "uri" (s3:// or https://); optional
+  - `vertical`: enum — for v1 the Phase 1 verticals: `["hvac","plumbing","electrical","landscaping","handyman"]`. New verticals added in Phase 5 are an additive grammar change (Decision E channel 1: new enum value, no v-bump needed if it's truly additive to a permissive enum; if instead we want the enum to be closed-as-of-this-version, we v-bump — for v1 we leave it permissive via NOT marking the enum as `closed` separately)
+- additionalProperties: false, unevaluatedProperties: false
+
+**Acceptance:**
+- File written; valid JSON; closure flags
+- The Bayou HVAC branding block from ADR 0002 validates verbatim
+"""
+
+[[steps]]
+id = "roles-defs"
+title = "v{{version}}: defs/roles.schema.json"
+type = "feature"
+priority = 2
+needs = ["create-version-dir"]
+files = [
+  "composer/grammar/v{{version}}/defs/roles.schema.json",
+]
+description = """
+Author `defs/roles.schema.json` for the `roles` slot.
+
+**Shape:**
+- `"type": "object"`
+- `"required": ["shape"]`
+- Properties:
+  - `shape`: enum (for v1 the supported role shapes): `["owner_plus_techs", "owner_plus_admins_plus_techs", "owner_only"]`
+  - `members_seed`: array of `{ "email": string-format-email, "role_key": string }` — pre-populated team members the composer suggests; defaults to []
+- additionalProperties: false, unevaluatedProperties: false
+
+**Acceptance:**
+- File written; valid JSON; closure flags
+- `{"shape": "owner_plus_techs", "members_seed": []}` (Bayou HVAC default) validates
+"""
+
+# =============================================================================
+# Examples (validate against the assembled schema)
+# =============================================================================
+
+[[steps]]
+id = "examples"
+title = "v{{version}}: examples/{hvac,plumbing,landscaping}.tenant.json"
+type = "feature"
+priority = 2
+needs = [
+  "entity-defs",
+  "workflow-defs",
+  "pricing-defs",
+  "notification-defs",
+  "branding-defs",
+  "roles-defs",
+]
+files = [
+  "composer/grammar/v{{version}}/examples/hvac.tenant.json",
+  "composer/grammar/v{{version}}/examples/plumbing.tenant.json",
+  "composer/grammar/v{{version}}/examples/landscaping.tenant.json",
+]
+description = """
+Author three tenant config examples — one per anchor trades vertical.
+
+**HVAC (canonical per ADR 0002):**
+- Copy the Bayou HVAC example from ADR 0002 verbatim into
+  `examples/hvac.tenant.json`. This is the canonical Phase 1 reference; the
+  build loop and Phase 4 composer few-shot examples both read from here.
+
+**Plumbing:**
+- Same overall shape, with plumbing-vertical adjustments:
+  - branding.vertical = "plumbing"
+  - entities.properties.custom_fields adds `water_heater_type` (enum: tank, tankless, hybrid)
+  - entities.jobs.custom_fields adds `permit_required` (boolean)
+  - pricing_model.kind = "hourly", hourly_rate_cents = 12500
+  - notifications include `job.state.changed_to.on_site -> sms -> customer -> trades/plumbing/on_site_sms`
+
+**Landscaping:**
+- branding.vertical = "landscaping"
+- entities.properties.custom_fields adds `lot_size_sqft` (integer)
+- entities.crews.enabled = true (landscaping uses crews; trades HVAC does not — proves entities.X.enabled toggle works)
+- pricing_model.kind = "flat_rate", flat_rate_book_ref = "trades/landscaping/standard_v1"
+- notifications include a `job.state.changed_to.completed -> email -> customer -> trades/landscaping/completed_email`
+
+**Acceptance:**
+- Three files written
+- Each is valid JSON
+- Each validates against `composer/grammar/v{{version}}/tenant.schema.json` via `ajv validate -s composer/grammar/v{{version}}/tenant.schema.json -d composer/grammar/v{{version}}/examples/<file>.tenant.json` (the actual validation runs in meta-validation step; here the acceptance is just "intended to validate")
+- HVAC example is byte-for-byte the Bayou HVAC example from ADR 0002 (the loop's Phase 4 few-shot reference; if any drift, BLOCK and align)
+"""
+
+# =============================================================================
+# Generated zone declarations + codegen wiring
+# =============================================================================
+
+[[steps]]
+id = "generated-zone-declare"
+title = "v{{version}}: declare generated zones in agent/generated-zones.toml"
+type = "chore"
+priority = 2
+needs = ["create-version-dir"]
+files = [
+  "agent/generated-zones.toml",
+]
+description = """
+Append two declarations to `agent/generated-zones.toml` so HLT-002 catches any
+hand edit to the generated type files:
+
+```
+[[zone]]
+path = "crates/smbuild-grammar/src/v{{version}}/types.rs"
+generator = "typify"
+source = "composer/grammar/v{{version}}/tenant.schema.json"
+trip_on = ["any-hand-edit"]
+
+[[zone]]
+path = "frontend/src/composer/grammar/v{{version}}/types.gen.ts"
+generator = "json-schema-to-typescript"
+source = "composer/grammar/v{{version}}/tenant.schema.json"
+trip_on = ["any-hand-edit"]
+```
+
+**Acceptance:**
+- `agent/generated-zones.toml` exists (if not, it should have been created by app-skeleton-rust-cargo — if missing, BLOCK as a dependency-order error)
+- The two `[[zone]]` blocks above are appended (idempotent: re-running this step does not duplicate them — dedupe by `path`)
+- Jankurai `audit . --changed-fast` parses the file successfully
+"""
+
+[[steps]]
+id = "typify-config"
+title = "v{{version}}: crates/smbuild-grammar/build.rs typify invocation"
+type = "feature"
+priority = 3
+needs = ["create-version-dir", "generated-zone-declare"]
+files = [
+  "crates/smbuild-grammar/build.rs",
+  "crates/smbuild-grammar/Cargo.toml",
+]
+description = """
+Wire `crates/smbuild-grammar/build.rs` to invoke `typify` on
+`composer/grammar/v{{version}}/tenant.schema.json` and emit Rust types into
+`crates/smbuild-grammar/src/v{{version}}/types.rs`.
+
+**Pattern (typify build-script form):**
+```rust
+fn main() {
+    println!("cargo:rerun-if-changed=../../composer/grammar/v{{version}}/tenant.schema.json");
+    println!("cargo:rerun-if-changed=../../composer/grammar/v{{version}}/defs/");
+
+    let mut settings = typify::TypeSpaceSettings::default();
+    settings.with_derive("serde::Serialize".to_string())
+            .with_derive("serde::Deserialize".to_string())
+            .with_derive("Debug".to_string())
+            .with_derive("Clone".to_string());
+
+    let schema_text = std::fs::read_to_string("../../composer/grammar/v{{version}}/tenant.schema.json").unwrap();
+    let schema: schemars::schema::RootSchema = serde_json::from_str(&schema_text).unwrap();
+
+    let mut type_space = typify::TypeSpace::new(&settings);
+    type_space.add_root_schema(schema).unwrap();
+
+    let contents = format!("{}", type_space.to_stream());
+    let out_dir = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("src/v{{version}}");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    std::fs::write(out_dir.join("types.rs"), contents).unwrap();
+}
+```
+
+For version > 1, the build.rs invokes typify for ALL versions in parallel (each
+into its own `src/v{N}/types.rs`) — earlier versions remain present so per-
+tenant runtime migration code can construct typed `v1::Tenant` and `v2::Tenant`
+side-by-side.
+
+**Acceptance:**
+- `crates/smbuild-grammar/build.rs` exists (or is updated for version > 1 to add the new typify pass)
+- `crates/smbuild-grammar/Cargo.toml` declares `[build-dependencies] typify = "0.x", serde_json = "1", schemars = "0.8"` (versions resolved at bead time against current crates.io)
+- `cargo build -p smbuild-grammar` exits 0; `crates/smbuild-grammar/src/v{{version}}/types.rs` exists after the build
+- The generated `Tenant` type is `pub struct Tenant { ... }` with fields matching the schema's required + optional properties
+- The generated file is committed (per ADR 0003 hermetic build doctrine — generated zones are committed; build.rs is the regenerator, not the run-every-build emitter)
+- Jankurai's `audit . --changed-fast` flags any hand edit to `src/v{{version}}/types.rs` (HLT-002 — verifies the generated-zone-declare step's wiring)
+"""
+
+[[steps]]
+id = "ts-codegen-config"
+title = "v{{version}}: frontend json-schema-to-typescript wiring"
+type = "feature"
+priority = 3
+needs = ["create-version-dir", "generated-zone-declare"]
+files = [
+  "frontend/package.json",
+  "frontend/scripts/gen-grammar-types.mjs",
+]
+description = """
+Add a `pnpm` script and a small Node script that runs
+`json-schema-to-typescript` against `composer/grammar/v{{version}}/tenant.schema.json`
+and writes the result to `frontend/src/composer/grammar/v{{version}}/types.gen.ts`.
+
+**`frontend/package.json` additions:**
+- `"devDependencies": { "json-schema-to-typescript": "^15.x" }` (resolved at bead time)
+- `"scripts": { "gen:grammar:v{{version}}": "node scripts/gen-grammar-types.mjs --version {{version}}", "gen:grammar": "pnpm gen:grammar:v{{version}}" }` (for version > 1, `gen:grammar` runs both: `pnpm gen:grammar:v1 && pnpm gen:grammar:v2`)
+
+**`frontend/scripts/gen-grammar-types.mjs`** (new file for v=1; updated to handle multiple versions when version > 1):
+- Reads `composer/grammar/v{N}/tenant.schema.json`
+- Calls `compileFromFile()` with the schema's $defs resolved via the package's bundling support
+- Writes `frontend/src/composer/grammar/v{N}/types.gen.ts` with a generated-zone header comment (`// generated-zone: do not hand-edit — regenerate via pnpm gen:grammar`)
+
+**Acceptance:**
+- `frontend/package.json` has the dep and the scripts
+- `frontend/scripts/gen-grammar-types.mjs` exists and runs: `pnpm gen:grammar:v{{version}}` exits 0
+- `frontend/src/composer/grammar/v{{version}}/types.gen.ts` is generated and contains a `Tenant` type that compiles under `tsc --noEmit`
+- The generated file is committed (same hermetic-build doctrine as Rust)
+- Re-running `pnpm gen:grammar:v{{version}}` produces zero git diff (deterministic codegen per T-11)
+"""
+
+# =============================================================================
+# Meta-validation (CI gate)
+# =============================================================================
+
+[[steps]]
+id = "meta-validation"
+title = "v{{version}}: Ajv meta-validation + examples validate against tenant.schema.json"
+type = "feature"
+priority = 3
+needs = ["examples"]
+files = [
+  ".github/workflows/composer-grammar-validate.yml",
+  "scripts/validate-grammar.sh",
+]
+description = """
+Add a CI step that:
+1. Validates `composer/grammar/v{{version}}/tenant.schema.json` against the JSON Schema 2020-12 meta-schema (`ajv compile --strict --spec=draft2020`)
+2. Validates each `composer/grammar/v{{version}}/examples/*.tenant.json` against `composer/grammar/v{{version}}/tenant.schema.json`
+3. Verifies every object boundary in the schema files has `additionalProperties: false` AND `unevaluatedProperties: false` (T-7 closure check; T-13 quality gate). Implemented as a small jq pipeline in `scripts/validate-grammar.sh`.
+
+For version > 1, the CI step runs the validation matrix for v1, v2, ..., v{{version}} — earlier versions remain validated so a v-bump cannot silently break older tenant configs.
+
+**Acceptance:**
+- `scripts/validate-grammar.sh` exists and exits 0 against the freshly poured grammar
+- `.github/workflows/composer-grammar-validate.yml` runs the script on every PR
+- Running the script against an INTENTIONALLY broken example (drop a required field) makes it exit non-zero — verified by the bead's own quality gate via a temp broken file (cleaned up before commit)
+- For version > 1: the v{{bump_from}} examples STILL validate against v{{bump_from}}/tenant.schema.json (per ADR 0002 Decision E channel 1 + 2: additive is non-breaking; if `bump_from` validation fails on a freshly poured v{{version}} branch, BLOCK as a Decision E violation — the v-bump may have unintentionally broken back-compat)
+"""
+
+# =============================================================================
+# Version-bump migration (only when version > 1)
+# =============================================================================
+
+[[steps]]
+id = "version-bump-migration"
+title = "v{{version}}: pure-function migration from_v{{bump_from}} (skipped when version=1)"
+type = "feature"
+priority = 3
+needs = ["create-version-dir"]
+files = [
+  "composer/grammar/v{{version}}/migrations/from_v{{bump_from}}.rs",
+  "composer/grammar/v{{version}}/migrations/from_v{{bump_from}}_test.rs",
+]
+description = """
+Per ADR 0002 Decision E: a breaking grammar change requires a pure-function
+migration `v{{bump_from}}::Tenant -> v{{version}}::Tenant`.
+
+**Skip-at-pour-time:** if `version=1` (and thus `bump_from=""`), this step is
+a no-op. The builder closes with "no-op: version=1; no prior version to migrate
+from" and creates no file. This matches the `idempotency-guard` pattern from
+`background-job.formula.toml`.
+
+**When version > 1, the skeleton (the bead implements the actual transforms;
+the formula scaffolds the function shape):**
+
+`composer/grammar/v{{version}}/migrations/from_v{{bump_from}}.rs`:
+```rust
+//! Migration v{{bump_from}}.Tenant -> v{{version}}.Tenant.
+//!
+//! Pure function — deterministic, no I/O. Per ADR 0002 Decision E:
+//! - Errors are typed (`MigrateError`) and listed exhaustively
+//! - Output is a receipt + the migrated Tenant; the receipt is anchored to
+//!   the audit chain by the caller (this function has no audit dep)
+//! - For per-tenant application, the runtime's tenant-migrate command takes
+//!   the OLD tenant config, calls this function, signs the receipt, runs
+//!   the new tenant_id-scoped DDL (none in additive bumps), and writes
+//!   to the audit chain. This function does NONE of that.
+
+use smbuild_grammar::v{{bump_from}};
+use smbuild_grammar::v{{version}};
+
+#[derive(Debug, thiserror::Error)]
+pub enum MigrateError {
+    // populated by the bead based on the specific differences between
+    // v{{bump_from}} and v{{version}}
+}
+
+pub fn migrate(input: v{{bump_from}}::Tenant) -> Result<v{{version}}::Tenant, MigrateError> {
+    // Bead authors the transformations here.
+    todo!("populated by the v{{version}} migration bead")
+}
+```
+
+`composer/grammar/v{{version}}/migrations/from_v{{bump_from}}_test.rs`:
+- Round-trips each `composer/grammar/v{{bump_from}}/examples/*.tenant.json`
+  through `migrate()`; asserts the result validates against
+  `v{{version}}/tenant.schema.json`
+- Asserts pure-function determinism: two calls with the same input produce
+  byte-equal Tenant outputs
+
+**Acceptance (when version > 1):**
+- Files written
+- `cargo check -p smbuild-grammar` passes (skeleton compiles; the `todo!()`
+  body is replaced by the migration bead — this formula step's job is to
+  scaffold the SHAPE, not to author the transforms)
+- The test file compiles and is excluded from `cargo test` until the migration
+  bead lands (gate via `#[ignore = "v{{version}} migration not yet implemented"]`
+  on the test fns)
+
+**Acceptance (when version=1):**
+- Step closes as no-op; no files created
+"""

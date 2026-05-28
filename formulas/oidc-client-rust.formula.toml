@@ -1,0 +1,449 @@
+# oidc-client-rust: Zitadel-flavored OIDC verifier + WebAuthn passkey auth for a Rust/Axum backend.
+#
+# Use for: SMBuild Phase 1 (#16 Zitadel integration). Adapts integration-http's
+# pattern for the case where the "integration" is an OIDC IdP we verify Bearer
+# tokens against on every request. Default IdP is Zitadel per ADR 0003 §Decision
+# 5, but the openidconnect crate works against any OIDC-compliant issuer — the
+# idp_provider var is documentation only.
+#
+# Out of scope for v1 — each gets a follow-on formula:
+# - Server-side OIDC login flow with PKCE (we delegate to Zitadel hosted UI in
+#   Phase 1; oidc-server-flow-pkce is the Phase-4-skinned-login formula)
+# - SAML federation (oidc-saml-bridge)
+# - mTLS-bound tokens (oidc-mtls)
+# - Token introspection (we use local JWKS validation; oidc-introspection if a
+#   tenant requires opaque-token-only flows)
+# - Multi-IdP routing (one IdP per tenant — Phase 3 problem)
+#
+# Dependency-graph design (critical — mirrors integration-http's "secret track is
+# independent" pattern):
+#
+#   oidc-verifier-middleware ──┬── user-upsert ─────────────┐
+#                              ├── passkey-registration ────┤
+#                              ├── passkey-auth ────────────┼── integration-test
+#                              └── tower-layer-mounting ────┤
+#   frontend-auth-context ─────────────────────────────────┘
+#   secret-handling  (INDEPENDENT — touches-secrets escalation)
+#
+# secret-handling is the only step that needs human input. /build-next escalates
+# on `touches-secrets`. The human provisions: Zitadel deployment, OIDC application
+# registration, issuer URL, client_id, client_secret, redirect URIs, JWKS endpoint
+# config. Putting it on its own branch means the verifier + tests + UI ship in
+# parallel using hardcoded fake creds + a local mock IdP discovery server.
+
+formula = "oidc-client-rust"
+description = """
+Rust/Axum OIDC verifier middleware against an OIDC-compliant IdP (Zitadel by default), with WebAuthn passkey registration + authentication endpoints, control-plane User upsert, and a React Context for the frontend auth flow. Secret-handling rides its own escalation track per integration-http convention.
+"""
+type = "workflow"
+version = 1
+
+[vars.idp_provider]
+description = "OIDC IdP name (documentation only — the openidconnect crate works against any RFC-8414-compliant issuer). Default 'zitadel' per ADR 0003. Accepts: zitadel, keycloak, auth0, okta, kratos, custom."
+default = "zitadel"
+
+[vars.default_issuer_url]
+description = "OIDC issuer URL — the base for discovery (/.well-known/openid-configuration). Real value comes from the secret-handling step at runtime; this var is the placeholder the verifier reads at boot."
+required = true
+
+[vars.user_table]
+description = "Control-plane User table the verifier upserts into on first successful token validation. Schema: id ULID PK, email citext UNIQUE, zitadel_subject text UNIQUE, last_seen_at timestamptz, created_at timestamptz."
+default = "users"
+
+[vars.api_crate]
+description = "The Cargo crate that hosts the Axum router + tonic services. Files for this formula land under this crate's src/ tree."
+default = "smbuild-api"
+
+[vars.frontend_dir]
+description = "Frontend root directory (Vite + React). The auth-context step writes under {{frontend_dir}}/src/lib/."
+default = "frontend"
+
+# =============================================================================
+# OIDC verifier middleware (THE chokepoint — every authenticated request rides this)
+# =============================================================================
+
+[[steps]]
+id = "oidc-verifier-middleware"
+title = "{{idp_provider}}: OIDC Bearer-token verifier as Axum tower::Layer"
+type = "feature"
+priority = 1
+files = [
+  "crates/{{api_crate}}/src/transport/oidc_layer.rs",
+  "crates/{{api_crate}}/src/transport/mod.rs",
+  "crates/{{api_crate}}/Cargo.toml",
+]
+description = """
+A `tower::Layer` that validates the incoming Authorization: Bearer JWT against the IdP's discovery document on every request. Uses the `openidconnect` crate's `CoreClient` + `CoreJsonWebKeySet` — no hand-rolled JWT verifier (that's where vulnerabilities live; OWASP 2025 still lists JWT alg-confusion as a top-10 web vuln).
+
+**Architecture:**
+- At boot: fetch `{{default_issuer_url}}/.well-known/openid-configuration`; construct an `IssuerUrl` + `CoreProviderMetadata::discover_async`. Cache the metadata + JWKS at the layer level.
+- JWKS refresh: re-fetch JWKS on the cache-control max-age the IdP advertises, or every 1h floor, whichever is shorter. Per RFC-8414 §3.
+- Per request:
+  1. Extract `Authorization: Bearer <token>` (no header -> 401, no Bearer prefix -> 401).
+  2. Verify the JWT signature against the cached JWKS using `openidconnect::IdTokenVerifier`.
+  3. Validate `iss`, `aud`, `exp`, `nbf`, `iat` (`openidconnect` does this in `claims()`).
+  4. Extract `sub`, `email`, `email_verified`, raw claims map.
+  5. Attach `Extension<AuthenticatedSubject { sub: String, email: Option<String>, claims: serde_json::Value }>` to the request via `request.extensions_mut().insert(...)`.
+- On failure: return `axum::http::StatusCode::UNAUTHORIZED` (401) with a typed problem-details body (RFC 7807) — no leaking internal error strings.
+
+**Acceptance:**
+- `crates/{{api_crate}}/src/transport/oidc_layer.rs` exports `pub struct OidcVerifyLayer { issuer: IssuerUrl, audiences: Vec<Audience>, jwks_cache: Arc<RwLock<JwksCache>> }` and `pub struct OidcVerifyService<S> { inner: S, ... }`.
+- `impl<S> tower::Layer<S> for OidcVerifyLayer` produces `OidcVerifyService<S>`.
+- `impl<S, B> tower::Service<http::Request<B>> for OidcVerifyService<S>` validates the token and either calls `inner` with `Extension<AuthenticatedSubject>` attached, or short-circuits with `Response<Body>` 401.
+- Dependencies in Cargo.toml: `openidconnect = "3"`, `tower = "0.5"`, `axum = "0.7"`, `serde = { version = "1", features = ["derive"] }`, `serde_json = "1"`, `tokio = { version = "1", features = ["sync", "rt"] }`.
+- `cargo clippy -p {{api_crate}} -- -D warnings` clean.
+- `cargo fmt --check -p {{api_crate}}` clean.
+
+**Explicitly NOT in this step:**
+- The route mounting (separate step `tower-layer-mounting`).
+- The User upsert side-effect (separate step `user-upsert`).
+- The end-to-end mock-IdP test (separate step `integration-test`).
+
+This step's tests use hardcoded fake creds + a tiny in-process `openidconnect`-mock fixture, NOT the real Zitadel deployment.
+"""
+
+[steps.testPlan]
+file = "crates/{{api_crate}}/tests/transport/oidc_layer.rs"
+cases = 5
+coverage = "valid token attaches Extension<AuthenticatedSubject>; expired token returns 401; invalid signature returns 401; missing Authorization header returns 401; malformed Bearer prefix returns 401"
+
+# =============================================================================
+# User upsert (control-plane User record materialization on first token hit)
+# =============================================================================
+
+[[steps]]
+id = "user-upsert"
+title = "{{idp_provider}}: upsert control-plane User on first verified subject"
+type = "feature"
+priority = 2
+needs = ["oidc-verifier-middleware"]
+files = [
+  "crates/{{api_crate}}/src/adapters/identity/upsert.rs",
+  "crates/{{api_crate}}/src/adapters/identity/mod.rs",
+]
+description = """
+When a verified subject hits any authenticated route, upsert the `{{user_table}}` row matching `zitadel_subject = $sub`. First-time hits create the row (Phase-1 directive item 8 from ADR 0002: the upsert is the only place User records get created — no separate signup endpoint). Subsequent hits update `last_seen_at`.
+
+**Architecture:**
+- Function: `pub async fn upsert_user_from_subject(pool: &PgPool, subject: &AuthenticatedSubject) -> Result<UserId, UpsertError>`.
+- SQL via sqlx compile-time-checked `query!`:
+  ```sql
+  INSERT INTO {{user_table}} (id, email, zitadel_subject, last_seen_at, created_at)
+  VALUES ($1, $2, $3, now(), now())
+  ON CONFLICT (zitadel_subject) DO UPDATE SET last_seen_at = now()
+  RETURNING id
+  ```
+- Generates ULID via `ulid` crate; treats subject's `email` claim as authoritative on first insert; subsequent runs do not update email (Phase 3 will handle email-change events explicitly).
+- Wired into the verifier middleware as a follow-up extension: after the OIDC layer attaches `AuthenticatedSubject`, a thin `from_request_parts` extractor `CurrentUser` calls `upsert_user_from_subject` once per request (cached via request-local `OnceCell` so it doesn't fire twice if multiple handlers extract it).
+
+**Acceptance:**
+- `crates/{{api_crate}}/src/adapters/identity/upsert.rs` exports `pub async fn upsert_user_from_subject(...)` and `pub struct CurrentUser { pub id: UserId, pub email: Option<String> }`.
+- `impl<S> FromRequestParts<S> for CurrentUser where S: Send + Sync` looks up `Extension<AuthenticatedSubject>` and calls upsert.
+- sqlx query macro compiles against the live test DB (`cargo sqlx prepare --check` clean).
+- `.sqlx/` cache regenerated and committed.
+- Unit test: missing `Extension<AuthenticatedSubject>` -> 500-shaped error (this is a developer bug, not user input).
+
+**Out of scope:**
+- Membership / tenant-scoping (that's a Phase-1 directive on the Membership entity, separate bead).
+- Email-change reconciliation (Phase 3).
+"""
+
+[steps.testPlan]
+file = "crates/{{api_crate}}/tests/adapters/identity/upsert.rs"
+cases = 4
+coverage = "first hit creates user row with sub + email + created_at + last_seen_at; second hit updates last_seen_at only; CurrentUser extractor returns the upserted user; missing AuthenticatedSubject extension returns InternalServerError"
+
+# =============================================================================
+# Passkey registration endpoint (WebAuthn via webauthn-rs)
+# =============================================================================
+
+[[steps]]
+id = "passkey-registration-endpoint"
+title = "{{idp_provider}}: POST /auth/passkey/register/{start,finish} (WebAuthn)"
+type = "feature"
+priority = 2
+needs = ["user-upsert"]
+files = [
+  "crates/{{api_crate}}/src/transport/passkey.rs",
+  "crates/{{api_crate}}/src/transport/mod.rs",
+  "db/migrations/*_user_passkeys.up.sql",
+  "db/migrations/*_user_passkeys.down.sql",
+]
+description = """
+WebAuthn passkey registration via `webauthn-rs` 0.5+. Per ADR 0003 §Decision 5, the operator persona is on a phone (T-4 mobile-first) so passkeys are the primary authentication method.
+
+**Two-phase flow:**
+1. `POST /auth/passkey/register/start` — handler calls `webauthn.start_passkey_registration(user_unique_id, user_name, user_display_name, exclude_credentials)`. Returns `CreationChallengeResponse` JSON. Stores `PasskeyRegistration` state in a short-lived server-side cache keyed by a generated challenge_id cookie (TTL 5 min).
+2. `POST /auth/passkey/register/finish` — handler calls `webauthn.finish_passkey_registration(&RegisterPublicKeyCredential, &PasskeyRegistration)`. On success, persists the credential ID + public key + sign-count to a new `user_passkeys` table.
+
+**Migration delivered with this step:**
+```sql
+CREATE TABLE user_passkeys (
+  id            UUID PRIMARY KEY,
+  user_id       UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  credential_id BYTEA NOT NULL UNIQUE,
+  public_key    BYTEA NOT NULL,
+  sign_count    BIGINT NOT NULL DEFAULT 0,
+  aaguid        UUID,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_used_at  TIMESTAMPTZ
+);
+CREATE INDEX idx_user_passkeys_user ON user_passkeys (user_id);
+```
+
+**Acceptance:**
+- Two POST handlers registered under `/auth/passkey/register/`.
+- Both routes are EXCLUDED from the OIDC verifier layer (see tower-layer-mounting) because the user is not yet OIDC-authenticated at registration time — they prove identity via the magic-link flow OR a pre-existing OIDC session against Zitadel.
+- `webauthn-rs::Webauthn` instance built at boot from `rp_id`, `rp_origin` configured via env (defaults from secret-handling step).
+- sqlx migration up/down for `user_passkeys` shipped in this bead, runs cleanly against fresh DB.
+- `cargo clippy` clean, `cargo sqlx prepare --check` clean.
+
+**Documented choice:** Phase 1 implements WebAuthn directly in our Rust code (passkey is "the user's local device proves possession of a private key whose public key we hold"). This is independent of Zitadel — passkey assertions never touch Zitadel. After a successful passkey assertion, we mint a server-issued session token via the same JWT shape the OIDC verifier expects (signed with a server key whose `iss` matches our backend, validated by the same `OidcVerifyLayer` configured with multiple acceptable issuers). This is more standard than redirecting to Zitadel's passkey flow because Zitadel's passkey support is still maturing (as of 2026-05); the in-house path is the boring default per T-12 and is swappable to Zitadel passkeys later if Zitadel's UX surpasses ours.
+"""
+
+[steps.testPlan]
+file = "crates/{{api_crate}}/tests/transport/passkey_register.rs"
+cases = 4
+coverage = "POST /auth/passkey/register/start returns CreationChallengeResponse JSON with challenge_id cookie; POST /auth/passkey/register/finish persists credential_id + public_key on valid attestation; finish rejects tampered attestation with 400; finish rejects expired challenge with 410"
+
+# =============================================================================
+# Passkey authentication endpoint
+# =============================================================================
+
+[[steps]]
+id = "passkey-auth-endpoint"
+title = "{{idp_provider}}: POST /auth/passkey/login/{start,finish} (WebAuthn assertion)"
+type = "feature"
+priority = 2
+needs = ["passkey-registration-endpoint"]
+files = [
+  "crates/{{api_crate}}/src/transport/passkey.rs",
+  "crates/{{api_crate}}/src/adapters/identity/session_mint.rs",
+]
+description = """
+WebAuthn passkey login via `webauthn-rs` assertion flow.
+
+**Two-phase flow:**
+1. `POST /auth/passkey/login/start` with `{email}` -> handler looks up user, calls `webauthn.start_passkey_authentication(&[passkey])` with the user's stored passkeys, returns `RequestChallengeResponse` JSON.
+2. `POST /auth/passkey/login/finish` with the assertion -> handler calls `webauthn.finish_passkey_authentication(...)`. On success: update `user_passkeys.sign_count` + `last_used_at`, mint a session token, set as httpOnly cookie.
+
+**Session token shape:**
+- We mint a self-signed JWT with `iss = <backend's own issuer URL>`, `sub = <user_id ULID>`, `aud = "smbuild-api"`, `exp = now + 8h`, `email = <user email>`.
+- Signed with a server private key loaded from secret-handling step (separate ES256 keypair, NOT shared with Zitadel).
+- The `OidcVerifyLayer` is configured at boot with BOTH issuers (Zitadel + our own) — both produce equivalent `AuthenticatedSubject` extensions. Downstream handlers cannot tell which flow authenticated the user.
+
+**Acceptance:**
+- POST handlers for `/auth/passkey/login/{start,finish}` wired into the router under the OIDC-exempt route group.
+- `session_mint::mint_session_token(user_id, email) -> Result<String, MintError>` produces a JWT validated by `OidcVerifyLayer` configured with our issuer.
+- `user_passkeys.sign_count` increments on each successful assertion; `last_used_at` updates.
+- Failed assertion -> 401, no token issued.
+- Rate limit (10 attempts per IP per 60s) on `/auth/passkey/login/start` (basic, in-memory token bucket — Phase 2 promotes to Redis or PG-backed).
+
+**Out of scope:**
+- Email magic-link fallback. That's the secondary auth method per ADR 0003 §Decision 5. Separate formula `auth-magic-link-rust` ships in Phase 1 #16's parent epic, NOT here.
+"""
+
+[steps.testPlan]
+file = "crates/{{api_crate}}/tests/transport/passkey_login.rs"
+cases = 5
+coverage = "POST /auth/passkey/login/start returns RequestChallengeResponse for known user; finish accepts valid assertion and returns httpOnly cookie containing OIDC-shaped JWT; finish increments sign_count on the matched passkey row; finish rejects assertion from wrong credential with 401; minted token validates cleanly through OidcVerifyLayer with our backend's issuer configured"
+
+# =============================================================================
+# Secret handling (INDEPENDENT BRANCH — touches-secrets escalation)
+# =============================================================================
+
+[[steps]]
+id = "secret-handling"
+title = "{{idp_provider}}: wire IdP + WebAuthn secrets from secret store"
+type = "feature"
+priority = 1
+labels = ["touches-secrets"]
+files = [
+  "crates/{{api_crate}}/src/adapters/secrets/oidc.rs",
+  "crates/{{api_crate}}/src/adapters/secrets/mod.rs",
+  "infra/terraform/modules/secrets/oidc.tf",
+]
+description = """
+Wire {{idp_provider}} OIDC + WebAuthn credentials from the chosen secret store (AWS Secrets Manager per ADR 0003) into boot-time configuration consumed by the verifier middleware, passkey endpoints, and session minting.
+
+**Why this is a separate step on its own branch (per integration-http convention):**
+- Every other step ships using hardcoded fake creds + a small in-process mock IdP fixture for tests.
+- This step blocks for human decision on the secret store + provisioning + access-control (`touches-secrets` escalation per docs/ESCALATION_RULES.md).
+- Putting it on its own dep branch means the verifier + endpoints + frontend + tests all ship in parallel while the human provisions Zitadel.
+
+**Escalation: /build-next BLOCKS on `touches-secrets`. The human must:**
+
+1. **Provision the Zitadel deployment** (or chosen OIDC IdP). For Phase 1 per ADR 0003: Zitadel sidecar on the same ECS cluster as the Rust API. Document the chosen issuer URL.
+2. **Register the SMBuild application** in Zitadel as a confidential client. Capture:
+   - `OIDC_ISSUER_URL` (e.g. `https://auth.smbuild.example.com`)
+   - `OIDC_CLIENT_ID` (Zitadel-assigned)
+   - `OIDC_CLIENT_SECRET` (Zitadel-assigned — confidential client)
+   - `OIDC_REDIRECT_URI` (e.g. `https://app.smbuild.example.com/auth/callback`) — needed only if we add Phase-1.5 server-side OIDC flow; the in-house passkey flow doesn't use it
+   - `OIDC_AUDIENCE` (the resource server identifier — by Zitadel convention the client_id)
+3. **Generate WebAuthn relying-party config:**
+   - `WEBAUTHN_RP_ID` (effective domain — e.g. `smbuild.example.com`)
+   - `WEBAUTHN_RP_ORIGIN` (full origin — e.g. `https://app.smbuild.example.com`)
+   - `WEBAUTHN_RP_NAME` (display name — `SMBuild`)
+4. **Generate session-mint ES256 keypair** (P-256 ECDSA):
+   - `SESSION_MINT_PRIVATE_KEY_PEM` — stored in Secrets Manager
+   - `SESSION_MINT_PUBLIC_JWK` — published at `/.well-known/jwks.json` on the backend itself (the backend is its own OIDC issuer for in-house-minted tokens)
+   - `SESSION_MINT_ISSUER_URL` — the backend's own URL (e.g. `https://api.smbuild.example.com`)
+5. **Decide on secret rotation policy:** Zitadel client_secret rotation cadence; session-mint key rotation strategy (Phase-1 default: manual, documented runbook; Phase 2 adds automated rotation).
+6. **Decide on failure mode when secrets are missing at boot:** fail-closed crash (the boring default per T-12), or fall back to a maintenance page? Phase 1 default: fail-closed crash with clear log message.
+
+**Acceptance (after the human unblocks):**
+- `crates/{{api_crate}}/src/adapters/secrets/oidc.rs` exports `pub async fn load_oidc_config(client: &SecretsManagerClient) -> Result<OidcConfig, SecretError>` and similar for WebAuthn + session-mint.
+- Loader is invoked once at `main.rs` startup; the typed `OidcConfig` is passed into `OidcVerifyLayer::new(config)`.
+- Credentials NEVER appear in logs, trace spans, error messages, or telemetry — grep the test output and audit every Display + Debug impl for secret-bearing types (use `secrecy::SecretString` newtypes).
+- Missing-secret path: fail-closed crash with a single structured log line `secret_load_failed{ name = "OIDC_CLIENT_SECRET" }` and exit code 78 (EX_CONFIG).
+- Terraform module `infra/terraform/modules/secrets/oidc.tf` declares the Secrets Manager entries (names only — values written out-of-band by the human, never committed).
+- No test in this repo exercises a real credential value. Tests use a fake `SecretsManagerClient` returning canned fake creds.
+"""
+
+# =============================================================================
+# Tower-layer mounting (wires OidcVerifyLayer into the Axum router)
+# =============================================================================
+
+[[steps]]
+id = "tower-layer-mounting"
+title = "{{idp_provider}}: mount OidcVerifyLayer on protected route groups"
+type = "feature"
+priority = 2
+needs = ["oidc-verifier-middleware"]
+files = [
+  "crates/{{api_crate}}/src/main.rs",
+  "crates/{{api_crate}}/src/transport/router.rs",
+]
+description = """
+Wire `OidcVerifyLayer` into `crates/{{api_crate}}/src/main.rs` so it runs on every authenticated route. Public routes (health, OIDC discovery proxy, passkey login start) are explicitly excluded via Axum route grouping.
+
+**Architecture:**
+```rust
+// Axum 0.7 nested-router pattern
+let public = Router::new()
+    .route("/healthz", get(health))
+    .route("/.well-known/jwks.json", get(jwks))
+    .route("/auth/passkey/login/start", post(passkey_login_start))
+    .route("/auth/passkey/login/finish", post(passkey_login_finish))
+    .route("/auth/passkey/register/start", post(passkey_register_start))
+    .route("/auth/passkey/register/finish", post(passkey_register_finish));
+
+let protected = Router::new()
+    .merge(tonic_services())  // all tonic CRUD services
+    .route("/auth/me", get(current_user))
+    .layer(OidcVerifyLayer::new(oidc_config));
+
+let app = Router::new()
+    .merge(public)
+    .merge(protected)
+    .layer(TraceLayer::new_for_http());
+```
+
+**Acceptance:**
+- `crates/{{api_crate}}/src/transport/router.rs` exports `pub fn build_router(state: AppState) -> Router` with the public/protected split above.
+- Health endpoint reachable without Authorization header (HTTP 200).
+- Tonic service endpoint reachable WITH valid Bearer token (HTTP 200) and rejected WITHOUT (HTTP 401).
+- The passkey register/login routes are reachable without Authorization (HTTP 200/400/401 from the handler, NEVER from the layer — verify by constructing the request without a Bearer header and confirming the layer doesn't short-circuit).
+- `cargo nextest run -p {{api_crate}}` clean.
+
+**Out of scope:**
+- Per-route OpenFGA Check calls — that's the `openfga-model` formula's `authorized-handler-trait` step.
+"""
+
+[steps.testPlan]
+file = "crates/{{api_crate}}/tests/transport/router.rs"
+cases = 4
+coverage = "GET /healthz returns 200 without Bearer; protected route returns 401 without Bearer; protected route returns 200 with valid Bearer; passkey login/start returns 200 without Bearer (layer is bypassed)"
+
+# =============================================================================
+# Frontend auth context (React + TanStack Query)
+# =============================================================================
+
+[[steps]]
+id = "frontend-auth-context"
+title = "{{idp_provider}}: React Context + TanStack Query hooks for auth flow"
+type = "feature"
+priority = 2
+labels = ["ui"]
+files = [
+  "{{frontend_dir}}/src/lib/auth.tsx",
+  "{{frontend_dir}}/src/lib/auth-client.ts",
+  "{{frontend_dir}}/src/routes/auth/callback.tsx",
+]
+description = """
+React Context + TanStack Query hooks for the auth flow on the SPA side.
+
+**Architecture:**
+- `AuthProvider` wraps the app at `routes/__root.tsx`. Exposes `useAuth()` returning `{ user: User | null, status: 'pending' | 'authenticated' | 'anonymous', signInWithPasskey, signOut }`.
+- On mount: TanStack Query `auth.me` calls `GET /auth/me` (proxied through `@connectrpc/connect-web` or plain fetch — auth endpoints are NOT tonic, they're plain Axum routes). 200 -> `authenticated`; 401 -> `anonymous`.
+- `signInWithPasskey(email)`:
+  1. POST `/auth/passkey/login/start` with `{email}`. Receives `PublicKeyCredentialRequestOptions`.
+  2. Call `navigator.credentials.get({ publicKey })` — browser prompts for passkey.
+  3. POST `/auth/passkey/login/finish` with the assertion. Server sets httpOnly session cookie.
+  4. Invalidate the `auth.me` query -> re-fetch -> status flips to `authenticated`.
+- `signOut()`: POST `/auth/logout` (separate Axum route — out of scope for this bead but stub-called), clear local cache, status flips to `anonymous`.
+- **Fallback to Zitadel hosted UI:** if `navigator.credentials.get` throws `NotAllowedError` or the user explicitly clicks "Use other method", redirect to Zitadel's hosted login URL (built from the issuer URL + client_id + redirect_uri stored in `import.meta.env.VITE_OIDC_*`). The callback route `routes/auth/callback.tsx` handles the OIDC code exchange via `openid-client` browser bundle OR forwards the code to a backend `POST /auth/oidc/callback` endpoint.
+
+**Per ADR 0003 §Decision 5 / Phase 4 note:**
+Phase 4 composer will skin Zitadel's hosted login per tenant (custom CSS + per-vertical copy). Phase 1 ships the default Zitadel skin — the fallback path exists today and is improved later, not rewritten.
+
+**Acceptance:**
+- `{{frontend_dir}}/src/lib/auth.tsx` exports `AuthProvider` + `useAuth()` + `useRequireAuth()` (a hook that redirects to the login route if `status === 'anonymous'`).
+- TanStack Router integration: a `beforeLoad` guard on protected routes calls `useRequireAuth()`.
+- Vitest tests render the provider, mock the fetch responses, and assert state transitions.
+- `tsc --noEmit` clean; `biome check` clean (per ADR 0003's frontend lint config).
+- Mobile-first per T-4: the login form is single-screen, single-thumb-reachable, no modal stacking. Loader uses skeleton (not spinner) on the hot path per T-20.
+
+**Out of scope:**
+- Per-tenant theming (Phase 4).
+- Email magic-link UI (separate formula).
+- Signup flow (control-plane User is created by `user-upsert` on first verified token — there is no separate signup UI in Phase 1).
+"""
+
+[steps.testPlan]
+file = "{{frontend_dir}}/src/lib/auth.test.tsx"
+cases = 5
+coverage = "AuthProvider renders children; useAuth returns anonymous when /auth/me returns 401; useAuth flips to authenticated after passkey login success; useRequireAuth redirects when anonymous; signOut flips back to anonymous"
+
+# =============================================================================
+# Integration test (end-to-end against testcontainers + mock IdP discovery)
+# =============================================================================
+
+[[steps]]
+id = "integration-test"
+title = "{{idp_provider}}: end-to-end auth integration test"
+type = "feature"
+priority = 3
+needs = ["oidc-verifier-middleware", "user-upsert", "passkey-registration-endpoint", "passkey-auth-endpoint", "tower-layer-mounting"]
+files = [
+  "crates/{{api_crate}}/tests/integration/auth_flow.rs",
+  "crates/{{api_crate}}/tests/fixtures/mock_idp.rs",
+]
+description = """
+End-to-end test of the entire auth flow against real components:
+
+**Fixtures:**
+- `testcontainers-rs` Postgres 16 with the SMBuild migrations applied.
+- A small in-process mock OIDC IdP (`fixtures/mock_idp.rs`): a tiny `axum::Router` that serves a hand-crafted `/.well-known/openid-configuration` + a JWKS endpoint + a JWT-minting helper. This is our OWN fixture (T-14 does NOT forbid mocks of fixtures we author for our own tests of our own verifier — it forbids mocking the third-party APIs themselves when we're testing OUR integration with them. Here, we're testing our verifier's logic, and a tiny fixture lets us produce the canonical valid/expired/tampered token cases without standing up a real Zitadel).
+- `webauthn-rs::WebauthnBuilder::new("localhost", &Url::parse("http://localhost").unwrap())` test instance.
+
+**Assertions:**
+1. Valid OIDC token from the mock IdP -> request reaches the protected handler with `Extension<AuthenticatedSubject>` populated AND the User row materializes in PG.
+2. Expired token -> 401, no User row created (the upsert is gated on a successful verify).
+3. Token with invalid signature -> 401, no User row.
+4. Missing Authorization header on a protected route -> 401.
+5. Passkey registration round-trip: start -> JS-WebAuthn-mock attestation -> finish -> row in `user_passkeys`.
+6. Passkey login round-trip: register a passkey -> start login -> JS-WebAuthn-mock assertion -> finish -> httpOnly Set-Cookie with a JWT minted by session_mint -> that JWT validates against the OidcVerifyLayer (which is configured with both the mock IdP issuer AND our backend's own issuer).
+7. Cross-tenant guarantee placeholder: this test asserts only that the OIDC layer attaches the subject; tenant-scoping is a separate invariant tested in the `openfga-model` formula's integration-test step.
+
+**Acceptance:**
+- All 7 assertions above pass.
+- `cargo nextest run -p {{api_crate}} --test integration` exits 0.
+- Runtime under 30s on a developer laptop (testcontainers Postgres reuse helps; nextest parallel).
+- No flakiness over 100 consecutive runs.
+"""
+
+[steps.testPlan]
+file = "crates/{{api_crate}}/tests/integration/auth_flow.rs"
+cases = 7
+coverage = "valid mock-IdP token reaches handler with AuthenticatedSubject AND upserts User row; expired token returns 401 with no User row; tampered token returns 401; missing Authorization returns 401; passkey registration persists credential; passkey login round-trip mints valid session JWT; session JWT validates through OidcVerifyLayer"

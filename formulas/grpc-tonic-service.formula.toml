@@ -1,0 +1,248 @@
+# grpc-tonic-service: add a new tonic gRPC service that is NOT a CRUD slice.
+#
+# Use for services with a non-CRUD surface: SchedulingService (assign, unassign,
+# list-by-day, drag-drop reorders), NotificationService (dispatch, schedule,
+# template-render), AuditQueryService (read-only audit chain queries), etc.
+#
+# For full CRUD vertical slices (Create/Get/List/Update/Delete + UI), use
+# crud-feature-rust instead — it is the higher-leverage shape for entity
+# surfaces.
+#
+# Out of scope for v1 — each is a separate follow-on formula:
+# - Streaming RPCs (server-stream, bidi): grpc-tonic-streaming
+# - Service-internal pub/sub fan-out (events bus): events-fanout-rust
+# - Webhook receivers (HTTP, not gRPC): webhook-receiver-rust
+#
+# Dependency-graph design:
+#   proto-def ── buf-codegen-verify ── tonic-service-impl ── tonic-web-mount
+#                                                        └── integration-test
+#
+# Codegen-verify gates the impl because typechecking the tonic trait against
+# generated Rust requires the generated stubs to exist on disk. tonic-web-mount
+# is what makes the React client reach the service over gRPC-Web without an
+# envoy proxy (T-12 boring).
+
+formula = "grpc-tonic-service"
+description = """
+Add a tonic gRPC service that is NOT a CRUD vertical slice (e.g. SchedulingService, NotificationService, AuditQueryService): proto, buf codegen verify, tonic impl with tower middleware stack, tonic-web mount, integration test against testcontainers + real HTTP transport.
+"""
+type = "workflow"
+version = 1
+
+[vars.service_name]
+description = "Service name in PascalCase (e.g. Scheduling, Notification, AuditQuery). Used in proto `service {{service_name}}Service` declaration, the generated tonic trait name, and the impl struct name."
+required = true
+
+[vars.service_snake]
+description = "Service in snake_case (e.g. scheduling, notification, audit_query). Used in proto filename, generated Rust module name, and transport module filename. Pre-transformed at pour time."
+required = true
+
+[vars.rpc_methods]
+description = """
+Comma-separated triples `method:request:response`, one per RPC. Example: `ListJobsByDay:ListJobsByDayRequest:ListJobsByDayResponse,Assign:AssignRequest:AssignResponse`. Request and response are message names defined in the same proto file by this formula. The builder generates the message types alongside the service block.
+"""
+required = true
+
+[vars.protos_path]
+description = "Directory the .proto file lives in (relative to repo root). Default matches the SMBuild layout from ADR 0003."
+default = "contracts/proto/smbuild/v1"
+
+# =============================================================================
+# Proto definition
+# =============================================================================
+
+[[steps]]
+id = "proto-def"
+title = "{{service_name}}Service: proto service + messages"
+type = "feature"
+priority = 1
+files = [
+  "{{protos_path}}/{{service_snake}}.proto",
+]
+description = """
+Author the protobuf service + message types for {{service_name}}Service.
+
+**Service shape:** for each entry `M:R:S` in `{{rpc_methods}}`, the service
+declares `rpc M(R) returns (S);`.
+
+**Message shape:**
+- Define every request/response message named in `{{rpc_methods}}` in this same .proto file (proto3 `message R { ... }` blocks)
+- Field types come from the bead description; the builder selects them based on the service's domain (e.g. ListJobsByDay request: `string date = 1; string tenant_view = 2;`)
+- Pagination on List* RPCs: `int32 page_size = N; string page_token = N+1;`
+- Mutating requests MUST NOT carry tenant_id (server-side from TenantCtx — T-8 invariant; if the wire carries tenant_id the bead BLOCKS as a security floor violation)
+- For services that return entity references, use the `string id` form, not embedded entity messages, to avoid duplicating the entity contract (entity messages live in the entity-owned .proto file from crud-feature-rust)
+
+**Acceptance:**
+- File written at `{{protos_path}}/{{service_snake}}.proto`
+- `syntax = "proto3";` and `package smbuild.v1;` at the top
+- Imports `google/protobuf/timestamp.proto` if any field is a timestamp; imports the entity protos for the entity ids the service references (proto3 `import "smbuild/v1/<entity>.proto";`)
+- Service block declares every RPC from `{{rpc_methods}}` exactly once
+- No request message carries `tenant_id` (verified by grep — `tenant_id` appears only in entity protos, not in service request protos)
+- `buf lint contracts/` passes
+- `buf breaking --against '.git#branch=main' contracts/` passes
+"""
+
+# =============================================================================
+# Codegen verification (gates the impl)
+# =============================================================================
+
+[[steps]]
+id = "buf-codegen-verify"
+title = "{{service_name}}Service: buf generates Rust + TS stubs cleanly"
+type = "chore"
+priority = 1
+needs = ["proto-def"]
+files = [
+  "crates/smbuild-proto/src/gen/smbuild/v1/{{service_snake}}.rs",
+  "frontend/src/gen/smbuild/v1/{{service_snake}}_pb.ts",
+  "frontend/src/gen/smbuild/v1/{{service_snake}}_connect.ts",
+]
+description = """
+Run `buf generate` and verify the generated zones are produced for both Rust
+(protoc-gen-prost + protoc-gen-tonic) and TS (protoc-gen-es + protoc-gen-connect-es).
+
+Generated zones declared in `agent/generated-zones.toml`; this step does NOT
+hand-edit them — that would trip HLT-002-GENERATED-MUTATION (per Jankurai
+discipline; ADR 0003). This step verifies regeneration.
+
+**Acceptance:**
+- `buf generate` exits 0
+- `crates/smbuild-proto/src/gen/smbuild/v1/{{service_snake}}.rs` exists (prost message types + tonic trait + client + server stubs)
+- `frontend/src/gen/smbuild/v1/{{service_snake}}_pb.ts` and `{{service_snake}}_connect.ts` exist (protoc-gen-es + protoc-gen-connect-es output)
+- `cargo check -p smbuild-proto` passes (generated Rust compiles)
+- `cd frontend && pnpm tsc --noEmit` passes (generated TS typechecks)
+- Generated files are tracked in git (HLT-002 declared as a generated zone but committed for hermetic builds per T-11 — no codegen step in `cargo build`)
+- No hand edits to any file in `crates/smbuild-proto/src/gen/` or `frontend/src/gen/` (verified by git diff against the buf-generated content; any hand edit BLOCKS)
+"""
+
+# =============================================================================
+# Tonic service impl with full tower middleware stack
+# =============================================================================
+
+[[steps]]
+id = "tonic-service-impl"
+title = "{{service_name}}Service: tonic impl with middleware stack"
+type = "feature"
+priority = 2
+needs = ["buf-codegen-verify"]
+files = [
+  "crates/smbuild-api/src/transport/{{service_snake}}.rs",
+  "crates/smbuild-api/src/transport/mod.rs",
+]
+description = """
+Implement the generated tonic trait
+`smbuild_proto::v1::{{service_snake}}_service_server::{{service_name}}Service`.
+
+**Tower middleware stack** (applied per-service via `tonic::transport::Server::builder().layer(...)` or via Axum `Router::layer` if mounted via tonic-web):
+
+1. `TraceLayer` (from tower-http) — OpenTelemetry span per request; reads the
+   `traceparent` header and emits child spans. Wired by smbuild-obs crate.
+
+2. `TenantCtxLayer` (custom; from crates/smbuild-api/src/transport/middleware/tenant_ctx.rs)
+   — reads the validated JWT from the OIDC layer below, extracts the tenant
+   claim, and injects `TenantCtx` as an Axum extension. Every handler reads
+   `TenantCtx` via `Extension<TenantCtx>` and runs the standard
+   `SET LOCAL app.current_tenant_id = $1` at the start of each transaction
+   (so RLS is active for that tx).
+
+3. `OidcVerifyLayer` (custom; wraps the `openidconnect` crate's verifier) —
+   validates the Bearer JWT against the Zitadel issuer's JWKS; rejects with
+   `Status::unauthenticated` on failure. Layer order: OIDC verify runs BEFORE
+   TenantCtx (TenantCtx reads from the verified claims).
+
+4. `AuthorizedHandler` trait — every MUTATING RPC in this service implements
+   AuthorizedHandler. Read-only RPCs (the L in CRUD) call `fga.list_objects`
+   to scope but do not implement the write-trait. Calling `pool.execute(...)`
+   outside of `.write()` for a mutating RPC trips cargo-deny's path-ban
+   (compile-time error effectively).
+
+**Service-specific shape:**
+- Impl struct holds whatever dependencies the service needs (`PgPool`, `FgaClient`, `NotificationDispatcher`, etc.). Constructor takes them as arguments; no globals.
+- Each RPC method reads `Extension<TenantCtx>` and `Extension<AuthenticatedUser>` from the request extensions and threads them through the use-case layer (application/).
+- Errors map to tonic Status codes per the same convention as crud-feature-rust's tonic-service-impl step (NotFound, PermissionDenied, InvalidArgument, Internal).
+
+**Acceptance:**
+- File written at `crates/smbuild-api/src/transport/{{service_snake}}.rs` with `impl {{service_name}}Service for {{service_name}}Impl`
+- Every RPC method from `{{rpc_methods}}` is implemented (no `unimplemented!()` panics in shipped code)
+- Mutating RPCs visibly call `.write(user, action, resource, || async { ... })` — the AuthorizedHandler gate
+- `crates/smbuild-api/src/transport/mod.rs` registers the service on the router with the four middleware layers above attached
+- `cargo clippy -p smbuild-api --all-targets -- -D warnings` passes
+- `cargo check -p smbuild-api` passes
+- No raw INSERT/UPDATE/DELETE outside of `.write()` closures (cargo-deny path-ban)
+"""
+
+[steps.testPlan]
+file = "crates/smbuild-api/src/transport/{{service_snake}}.rs"
+cases = 0
+coverage = "Behavioral coverage lives in the integration-test step; this is the impl, not the test."
+
+# =============================================================================
+# tonic-web mount (browser reach without envoy)
+# =============================================================================
+
+[[steps]]
+id = "tonic-web-mount"
+title = "{{service_name}}Service: mount behind tonic_web::GrpcWebLayer"
+type = "feature"
+priority = 2
+needs = ["tonic-service-impl"]
+files = [
+  "crates/smbuild-api/src/main.rs",
+  "crates/smbuild-api/src/transport/mod.rs",
+]
+description = """
+Mount the service on the Axum router behind `tonic_web::GrpcWebLayer` so the
+React frontend (which uses `@connectrpc/connect-web` with gRPC-Web transport)
+reaches it without an envoy proxy.
+
+Per ADR 0003 Bet 1: tonic-web is the chosen gRPC-Web bridge. If connect-rs
+matures, the swap is per-crate.
+
+**Acceptance:**
+- `crates/smbuild-api/src/transport/mod.rs` adds the service via
+  `.add_service(tonic_web::enable({{service_snake}}_service_server::{{service_name}}ServiceServer::new(impl)))`
+  OR via `.layer(tonic_web::GrpcWebLayer::new())` applied at the router level
+  (whichever the existing pattern uses — match what other services do)
+- CORS configured to allow the SPA origin (CloudFront in prod, localhost:5173 in dev) for the gRPC-Web headers (`Content-Type: application/grpc-web+proto`, `X-Grpc-Web: 1`, etc.) — verified by an existing CORS test or by an OPTIONS preflight assertion in the integration test
+- `cargo run -p smbuild-api` starts and binds; a `curl -X OPTIONS http://localhost:8080/smbuild.v1.{{service_name}}Service/<MethodName>` preflight returns 204 with the expected gRPC-Web CORS headers
+"""
+
+# =============================================================================
+# Integration test (real HTTP, real DB, real OpenFGA)
+# =============================================================================
+
+[[steps]]
+id = "integration-test"
+title = "{{service_name}}Service: integration test (real HTTP via tonic client)"
+type = "feature"
+priority = 2
+needs = ["tonic-web-mount"]
+files = [
+  "crates/smbuild-api/tests/{{service_snake}}_service.rs",
+]
+description = """
+Integration test that:
+1. Spins testcontainers Postgres 16 with the standard extensions
+2. Runs all migrations via `sqlx::migrate!`
+3. Spawns the full Axum server (with all middleware layers) on a random port
+4. Uses the GENERATED tonic client (`{{service_name}}ServiceClient::connect(...)`) to call every RPC over real HTTP (NOT an in-process tower::ServiceExt::oneshot — real network round-trip per T-14)
+5. For each RPC in `{{rpc_methods}}`: asserts the happy path AND at least one error path (most commonly: missing auth -> Status::unauthenticated; missing required field -> Status::invalid_argument; cross-tenant access -> Status::not_found per RLS)
+
+**No-mock requirements (T-14, tiebreaker #1):**
+- Postgres is real (testcontainers)
+- OpenFGA is real (testcontainers openfga/openfga image, or in-memory FGA store from openfga-rs if it has a test fixture)
+- JWT verification is real (use a test-only Zitadel mock issuer that signs JWTs the openidconnect crate will accept — this is acceptable per T-14 because we own the verifier, not because we are mocking the IdP's authorization decisions; document this in the test file's header comment)
+- No mocked sqlx, no mocked FgaClient, no mocked Dispatch
+
+**Acceptance:**
+- File written at `crates/smbuild-api/tests/{{service_snake}}_service.rs`
+- `cargo nextest run -p smbuild-api --test {{service_snake}}_service` passes
+- Every RPC in `{{rpc_methods}}` has at least 2 test cases (1 happy, 1 error)
+- Container reuse: marked compatible with the `testcontainers-reuse` nextest feature so a single Postgres container serves the whole nextest run
+- Test takes <30s on the workspace's standard CI runner (slow tests are marked with the `slow` nextest filter; this one should not be slow unless `{{rpc_methods}}` is very large — if it is, the bead should `/split` per T-15)
+"""
+
+[steps.testPlan]
+file = "crates/smbuild-api/tests/{{service_snake}}_service.rs"
+cases = 0
+coverage = "case count = 2 x number of methods in {{rpc_methods}} (1 happy + 1 error each); the builder enumerates from {{rpc_methods}} at pour time and writes the per-RPC test fns"

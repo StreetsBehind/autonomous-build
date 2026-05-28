@@ -1,0 +1,368 @@
+# otel-bootstrap-rust: OpenTelemetry observability bootstrap for a Rust + frontend stack.
+#
+# Scaffolds crates/smbuild-obs (or {{obs_crate_name}}) and wires OTel across the entire
+# Rust workspace + the React SPA, per ADR 0003 §Decision Observability:
+#   tracing + tracing-opentelemetry + opentelemetry-otlp  ->  ADOT collector sidecar
+#   on ECS  ->  CloudWatch Logs + Metrics (via EMF) + X-Ray (via OTLP->X-Ray translator)
+#
+# Vendor-neutral by construction (T-12 boring infrastructure): the OTLP exporter
+# is the only place that knows about the collector. Swap the exporter in one place
+# to route to a different backend.
+#
+# Dependency-graph design:
+#   obs-crate ── obs-init-fn ──┬── axum-instrumentation
+#                              ├── tonic-instrumentation
+#                              ├── sqlx-instrumentation
+#                              ├── wire-into-mains
+#                              └── obs-integration-test
+#   frontend-otel               (independent — touches frontend/ only)
+#   adot-collector-container-def (independent — touches infra/terraform/modules/ecs-adot/)
+#
+# Out of scope for v1 (separate follow-on formulas):
+# - Per-handler metric emission: otel-bootstrap-rust-custom-metrics
+# - Profile-data continuous profiling: otel-bootstrap-rust-pyroscope
+# - Frontend session-replay instrumentation: otel-bootstrap-rust-replay
+# - Backend log shipping outside CloudWatch (Datadog, Honeycomb): swap exporter target
+#
+# Real-OTel testing (no mocks, per T-14): the integration test stands up a real ADOT
+# collector via testcontainers, points the API at it, fires a request, and asserts a
+# span lands in the collector's stdout (debug exporter).
+
+formula = "otel-bootstrap-rust"
+description = """
+OpenTelemetry observability bootstrap for a Rust workspace + React frontend: scaffolds an obs crate (tracing + tracing-opentelemetry + opentelemetry-otlp), instrumentation helpers for Axum/tonic/sqlx, ADOT collector ECS sidecar Terraform module, frontend SDK setup, wires init() into all binary main()s, and a real-OTel integration test (testcontainers ADOT). Vendor-neutral; swap the exporter target in one place.
+"""
+type = "workflow"
+version = 1
+
+[vars.obs_crate_name]
+description = "Name of the observability crate to scaffold (e.g. smbuild-obs). Used as the crate dir under crates/ and the module identifier."
+default = "smbuild-obs"
+
+[vars.service_names]
+description = "Comma-separated list of service.name values that will call init() — one per binary crate (e.g. 'smbuild-api,smbuild-worker'). Drives wire-into-mains."
+default = "smbuild-api,smbuild-worker"
+
+[vars.default_otlp_endpoint]
+description = "Default OTLP gRPC endpoint the obs crate dials when OTEL_EXPORTER_OTLP_ENDPOINT is unset. Production points at the ADOT sidecar; dev points at localhost:4317."
+default = "http://adot:4317"
+
+[vars.exporter_targets]
+description = "Comma-separated downstream exporters the ADOT collector forwards to (cloudwatch-logs, cloudwatch-emf, xray, otlphttp/<backend>)."
+default = "cloudwatch-logs,cloudwatch-emf,xray"
+
+[vars.frontend_dir]
+description = "Frontend SPA directory (relative to repo root). Receives the @opentelemetry/sdk-web setup."
+default = "frontend"
+
+# =============================================================================
+# Obs crate scaffolding
+# =============================================================================
+
+[[steps]]
+id = "obs-crate"
+title = "{{obs_crate_name}}: scaffold OpenTelemetry observability crate"
+type = "chore"
+priority = 1
+files = [
+  "crates/{{obs_crate_name}}/Cargo.toml",
+  "crates/{{obs_crate_name}}/src/lib.rs",
+  "crates/{{obs_crate_name}}/README.md",
+]
+description = """
+Create `crates/{{obs_crate_name}}/` as a Cargo workspace member for OpenTelemetry bootstrap.
+
+**Cargo.toml [package.metadata.agent]:**
+- `purpose = "OpenTelemetry bootstrap for all {{service_names}} binaries"`
+- `owned_paths = ["crates/{{obs_crate_name}}/"]`
+- `invariants = ["init() returns a Drop guard; dropping the guard flushes pending spans", "no global state outside the otel global tracer provider"]`
+- `local_validate = ["cargo fmt --check -p {{obs_crate_name}}", "cargo clippy -p {{obs_crate_name}} -- -D warnings", "cargo nextest run -p {{obs_crate_name}}"]`
+- `risk = "medium"`
+
+**Dependencies:**
+- `tracing = "0.1"`
+- `tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }`
+- `tracing-opentelemetry = "0.27"`
+- `opentelemetry = { version = "0.26", features = ["trace"] }`
+- `opentelemetry_sdk = { version = "0.26", features = ["rt-tokio"] }`
+- `opentelemetry-otlp = { version = "0.26", features = ["tonic", "grpc-tonic", "trace"] }`
+
+**Acceptance:**
+- `cargo check -p {{obs_crate_name}}` succeeds
+- `[package.metadata.agent]` block present in Cargo.toml
+- Workspace root Cargo.toml lists `crates/{{obs_crate_name}}` in `members`
+"""
+
+# =============================================================================
+# init() — the public bootstrap entry point
+# =============================================================================
+
+[[steps]]
+id = "obs-init-fn"
+title = "{{obs_crate_name}}::init — public bootstrap fn returning Drop guard"
+type = "feature"
+priority = 1
+needs = ["obs-crate"]
+files = [
+  "crates/{{obs_crate_name}}/src/lib.rs",
+]
+description = """
+Implement `pub fn init(service_name: &str) -> ObsGuard` returning a guard struct whose `Drop` impl calls `opentelemetry::global::shutdown_tracer_provider()`.
+
+**Body:**
+1. Build an OTLP exporter via `opentelemetry_otlp::new_exporter().tonic().with_endpoint(std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").unwrap_or_else(|_| "{{default_otlp_endpoint}}".into()))`.
+2. Build a tracer via `opentelemetry_otlp::new_pipeline().tracing().with_exporter(exporter).with_trace_config(trace::config().with_resource(Resource::new(vec![KeyValue::new("service.name", service_name.to_string())]))).install_batch(opentelemetry_sdk::runtime::Tokio)`.
+3. Build a `tracing_subscriber::Registry::default().with(tracing_subscriber::fmt::layer().json()).with(tracing_subscriber::EnvFilter::from_default_env()).with(tracing_opentelemetry::layer().with_tracer(tracer))` and call `.try_init()`.
+4. Return guard.
+
+**Acceptance:**
+- `pub fn init(service_name: &str) -> ObsGuard` exists with the body above
+- Doctest demonstrates the guard pattern with a small example
+- Calling `init("test")` twice in different tests is safe (subscriber install is idempotent via `try_init` returning `Result`)
+- Setting `OTEL_EXPORTER_OTLP_ENDPOINT` env var overrides the default endpoint (verified by a unit test that reads the configured endpoint via a helper accessor)
+- `cargo build -p {{obs_crate_name}}` succeeds
+"""
+
+[steps.testPlan]
+file = "crates/{{obs_crate_name}}/src/lib.rs"
+cases = 3
+coverage = "init returns a guard; dropping the guard flushes spans without panic; setting OTEL_EXPORTER_OTLP_ENDPOINT overrides the default endpoint"
+
+# =============================================================================
+# Axum instrumentation
+# =============================================================================
+
+[[steps]]
+id = "axum-instrumentation"
+title = "{{obs_crate_name}}::axum: TraceLayer helper for Axum routers"
+type = "feature"
+priority = 2
+needs = ["obs-init-fn"]
+files = [
+  "crates/{{obs_crate_name}}/src/axum.rs",
+  "crates/{{obs_crate_name}}/Cargo.toml",
+]
+description = """
+Add `tower-http` (with `trace` feature) and `axum` to deps. Export `pub fn trace_layer() -> tower_http::trace::TraceLayer<...>` returning a configured TraceLayer that auto-creates a span per HTTP request with route, method, status.
+
+**Body sketch:**
+- `make_span_with` closure emits `tracing::info_span!("http.request", method = %req.method(), uri = %req.uri(), route = %route, status = tracing::field::Empty)`
+- `on_response` closure records `status`
+
+Document the usage pattern in a module-level doc comment: `axum::Router::new()...layer({{obs_crate_name}}::axum::trace_layer())`.
+
+**Acceptance:**
+- `cargo build -p {{obs_crate_name}} --features axum` succeeds
+- Doctest demonstrates wiring into an Axum router
+- A test using `tower::ServiceExt::oneshot` verifies a span carrying method+uri+status is emitted for one request
+"""
+
+[steps.testPlan]
+file = "crates/{{obs_crate_name}}/src/axum.rs"
+cases = 2
+coverage = "trace_layer attaches to an axum Router without compile error; a span carrying method+uri+status is emitted for one request via a tower::ServiceExt::oneshot call"
+
+# =============================================================================
+# Tonic instrumentation verification
+# =============================================================================
+
+[[steps]]
+id = "tonic-instrumentation"
+title = "{{obs_crate_name}}: verify tonic's built-in tracing spans"
+type = "feature"
+priority = 2
+needs = ["obs-init-fn"]
+files = [
+  "crates/{{obs_crate_name}}/tests/tonic_spans.rs",
+  "crates/{{obs_crate_name}}/Cargo.toml",
+]
+description = """
+Adds `tonic 0.11+` to dev-deps. Verifies tonic's built-in tracing integration (tonic emits a span per gRPC request automatically when `tracing` is in scope).
+
+**Test:**
+- Stand up a trivial in-process tonic server (using a generated proto stub or a hand-written one for the test)
+- Wire `{{obs_crate_name}}::init` with a test-mode exporter (debug exporter that writes spans to a `Vec<SpanData>`)
+- Invoke one method
+- Assert the captured span has `rpc.method` matching the invoked method name and `rpc.service` set
+
+**Acceptance:**
+- `cargo nextest run -p {{obs_crate_name}} tonic_spans` passes
+- The captured span includes `rpc.method` and `rpc.service` attributes
+"""
+
+[steps.testPlan]
+file = "crates/{{obs_crate_name}}/tests/tonic_spans.rs"
+cases = 1
+coverage = "tonic's auto-generated span carries the gRPC method and service names; span is captured by the obs init's tracer"
+
+# =============================================================================
+# Sqlx instrumentation helper
+# =============================================================================
+
+[[steps]]
+id = "sqlx-instrumentation"
+title = "{{obs_crate_name}}::sqlx: instrumented_connect_options helper"
+type = "feature"
+priority = 2
+needs = ["obs-init-fn"]
+files = [
+  "crates/{{obs_crate_name}}/src/sqlx.rs",
+  "crates/{{obs_crate_name}}/Cargo.toml",
+]
+description = """
+Adds `sqlx` (with `postgres`, `runtime-tokio`, `tls-rustls` features) and `log` (for `LevelFilter`) to deps.
+
+**Body:**
+Export `pub fn instrumented_connect_options(url: &str) -> Result<PgConnectOptions, sqlx::Error>` that parses the URL and applies `.log_statements(log::LevelFilter::Debug).log_slow_statements(log::LevelFilter::Warn, std::time::Duration::from_millis(500))`.
+
+Document: sqlx with the `tracing` feature emits a span per query; this helper centralizes the log level wiring so every binary uses the same defaults.
+
+**Acceptance:**
+- `cargo build -p {{obs_crate_name}}` succeeds
+- Doctest demonstrates wiring `PgPoolOptions::new().connect_with(instrumented_connect_options(&url)?)`
+- Tests verify parse succeeds for a valid postgres URL and that the log-level filter is correctly applied
+"""
+
+[steps.testPlan]
+file = "crates/{{obs_crate_name}}/src/sqlx.rs"
+cases = 2
+coverage = "instrumented_connect_options parses a valid postgres URL; log levels are set to Debug for statements and Warn for slow statements"
+
+# =============================================================================
+# Frontend OTel SDK setup
+# =============================================================================
+
+[[steps]]
+id = "frontend-otel"
+title = "Frontend: @opentelemetry/sdk-web setup via initOtel()"
+type = "feature"
+priority = 1
+files = [
+  "{{frontend_dir}}/src/lib/otel.ts",
+  "{{frontend_dir}}/package.json",
+  "{{frontend_dir}}/src/main.tsx",
+]
+description = """
+Install `@opentelemetry/api`, `@opentelemetry/sdk-trace-web`, `@opentelemetry/sdk-trace-base`, `@opentelemetry/exporter-trace-otlp-http`, `@opentelemetry/instrumentation-fetch`, `@opentelemetry/context-zone`, `@opentelemetry/resources`, `@opentelemetry/semantic-conventions`.
+
+**Body:**
+Implement `export function initOtel(serviceName: string): void` that:
+1. Builds a `WebTracerProvider` with a `Resource({ [SemanticResourceAttributes.SERVICE_NAME]: serviceName })`.
+2. Attaches an `OTLPTraceExporter({ url: "/otel/v1/traces" })` via `BatchSpanProcessor`.
+3. Registers `ZoneContextManager`.
+4. Registers `FetchInstrumentation` (with `propagateTraceHeaderCorsUrls` set to the app's origin).
+5. Call from `main.tsx` before React mounts.
+
+**Acceptance:**
+- `pnpm build` succeeds in `{{frontend_dir}}`
+- `tsc --noEmit` clean
+- One fetch from the dev build shows trace headers in network inspector (documented in README, manual verification only)
+"""
+
+[steps.testPlan]
+file = "{{frontend_dir}}/src/lib/otel.test.ts"
+cases = 2
+coverage = "initOtel registers a global tracer provider; fetch instrumentation hooks into window.fetch (verified by spying on the registered provider)"
+
+# =============================================================================
+# ADOT collector container definition (Terraform)
+# =============================================================================
+
+[[steps]]
+id = "adot-collector-container-def"
+title = "ECS ADOT collector sidecar Terraform module"
+type = "feature"
+priority = 1
+files = [
+  "infra/terraform/modules/ecs-adot/main.tf",
+  "infra/terraform/modules/ecs-adot/variables.tf",
+  "infra/terraform/modules/ecs-adot/outputs.tf",
+  "infra/terraform/modules/ecs-adot/agent.yaml",
+  "infra/terraform/modules/ecs-adot/config/adot-config.yaml",
+]
+description = """
+Terraform module that exports an ECS container definition fragment for an ADOT collector sidecar.
+
+**Inputs:** cluster name, log group ARN, X-Ray IAM role ARN.
+
+**Collector config (`config/adot-config.yaml`):**
+- OTLP receivers: gRPC :4317 + HTTP :4318
+- Processors: batch, resource-detection-aws
+- Exporters per `{{exporter_targets}}`: `awscloudwatchlogs`, `awsemf`, `awsxray`
+
+**Per-module `agent.yaml`** (Jankurai HLT-022):
+- `purpose = "ADOT collector sidecar — receives OTLP from same-task siblings, exports to CloudWatch Logs/EMF + X-Ray"`
+- `owned_paths = ["infra/terraform/modules/ecs-adot/"]`
+- `invariants = ["collector exposes 4317/grpc + 4318/http to siblings in the task only", "no AWS credentials baked in — IAM role only"]`
+- `local_validate = ["terraform fmt -check", "terraform validate", "tflint"]`
+- `risk = "medium"`
+
+**Acceptance:**
+- `terraform validate` in `infra/terraform/modules/ecs-adot/` succeeds
+- `tflint` clean
+- The collector container definition is a `local` value exporting a JSON-encoded fragment ready to be embedded in `aws_ecs_task_definition.container_definitions`
+"""
+
+# =============================================================================
+# Wire init() into each service binary main
+# =============================================================================
+
+[[steps]]
+id = "wire-into-mains"
+title = "Wire {{obs_crate_name}}::init into every binary main()"
+type = "feature"
+priority = 3
+needs = ["obs-init-fn"]
+files = [
+  "crates/smbuild-api/src/main.rs",
+  "crates/smbuild-worker/src/main.rs",
+]
+description = """
+For each name in `{{service_names}}` (comma-split — builder iterates), patch the binary main file.
+
+**Patch (applied to each service's main.rs):**
+- First line of `main()`: `let _obs_guard = {{obs_crate_name}}::init("<service>");`
+- The guard binding (`_obs_guard`, not `_`) keeps it alive for the full process lifetime
+- Add `{{obs_crate_name}}` to the crate's `[dependencies]`
+
+Document the rule: every binary in the workspace must call `init` first, before any other work, so the global tracer captures startup spans. Wired into each crate's `[package.metadata.agent].invariants`.
+
+**Acceptance:**
+- For each service in `{{service_names}}`: `cargo build -p <service>` succeeds
+- The first non-binding statement in each `main()` is `let _obs_guard = ...`
+- `cargo nextest run -p <service>` passes (existing tests don't break)
+"""
+
+# =============================================================================
+# Real-OTel integration test
+# =============================================================================
+
+[[steps]]
+id = "obs-integration-test"
+title = "{{obs_crate_name}}: real-OTel integration test via testcontainers ADOT"
+type = "feature"
+priority = 3
+needs = ["obs-init-fn", "axum-instrumentation", "wire-into-mains"]
+files = [
+  "crates/{{obs_crate_name}}/tests/adot_collector.rs",
+]
+description = """
+Real-OTel integration test, no mocks (T-14).
+
+**Setup:**
+- Uses `testcontainers-rs` to spawn the AWS ADOT collector image (`public.ecr.aws/aws-observability/aws-otel-collector:latest`) with a config that enables the `debug` exporter (writes JSON-encoded spans to stdout)
+- Starts a minimal Axum app instrumented via `axum-instrumentation::trace_layer()`
+- Calls `init` pointed at the testcontainer's mapped 4317 port
+- Sends one HTTP request to the test app
+- Reads the collector container's stdout via the testcontainers log API
+- Greps for the request's expected trace fragment (route + method + status)
+
+**Acceptance:**
+- `cargo nextest run -p {{obs_crate_name}} adot_collector` passes in a single retry-free run
+- Collector stdout contains a span with `service.name = "<test-service-name>"`, `http.method = "GET"`, and `http.status_code = 200`
+"""
+
+[steps.testPlan]
+file = "crates/{{obs_crate_name}}/tests/adot_collector.rs"
+cases = 1
+coverage = "real ADOT collector receives a span emitted by the instrumented axum app and writes it to its stdout debug exporter (no mocks; T-14 proof)"

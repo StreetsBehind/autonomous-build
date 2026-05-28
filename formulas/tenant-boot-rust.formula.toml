@@ -1,0 +1,454 @@
+# tenant-boot-rust: the tenant-boot chokepoint for SMBuild's Rust runtime.
+#
+# Per ADR 0002 directives #5, #8, #9 + ADR 0003 §Decision: this scaffolds the
+# `boot_tenant` function whose signature is LOCKED across Phases 1->3->4. The
+# composer (Phase 4) extends boot_tenant's body when new grammar versions ship,
+# but it does not change the signature. Phase 1 must ship this chokepoint with
+# the locked contract so Phase 4's composer lands without retrofit (T-25).
+#
+# What this formula produces:
+# - crates/smbuild-tenantctx with a non-Clone, non-leaky TenantCtx newtype
+# - crates/smbuild-api/src/domain/approved_config.rs (the privacy chokepoint —
+#   no public constructor; only composer::must_validate returns one)
+# - crates/smbuild-api/src/composer/must_validate.rs (JSON Schema validation)
+# - crates/smbuild-api/src/tenant/{boot,runtime}.rs (the boot fn + runtime struct)
+# - crates/smbuild-api/src/transport/tenant_layer.rs (tower::Layer that runs
+#   boot_tenant per request, attaches Extension<TenantCtx>+Extension<Arc<TenantRuntime>>,
+#   and SET LOCAL app.current_tenant_id for RLS)
+# - A doc-test that snapshots the boot_tenant signature so Phase 4 cannot
+#   silently drift the contract
+# - testcontainers Postgres integration test
+#
+# Out of scope (separate formulas / phase):
+# - The migration that creates the metadata tables — that's `migration` formula
+#   with up_outline covering Phase-1 directive #3 entities. boot_tenant assumes
+#   those tables exist; the migration step is sequenced before this in plan.md.
+# - The composer's LLM-driven config emission — Phase 4 only (T-25).
+# - Per-grammar-version body extension — Phase 4 reopens boot.rs to add a
+#   match on grammar_version; the SIGNATURE does not move.
+#
+# Pour-time note: this formula is poured ONCE per app (in Phase 1 of SMBuild).
+# Re-pours create duplicate epics — use `bd dep add` to attach Phase-4 grammar
+# evolution work to the same epic instead of re-pouring.
+
+formula = "tenant-boot-rust"
+description = """
+Scaffold SMBuild's tenant-boot chokepoint in Rust: non-leaky TenantCtx newtype crate, ApprovedConfig privacy chokepoint, composer::must_validate JSON Schema validator, boot_tenant async fn that loads grammar + metadata tables and returns a TenantRuntime, an Axum tower::Layer that runs boot per request and sets the RLS GUC, plus a doc-test locking boot_tenant's signature across Phase 1->3->4 and a testcontainers integration test. One pour per app in Phase 1; Phase 4 extends bodies, not signatures.
+"""
+type = "workflow"
+version = 1
+
+[vars.grammar_version]
+description = "Closed-grammar version this scaffold targets (composer/grammar/v{N}/ directory). Phase 1 ships v1; Phase 4 reopens boot.rs to add additional version arms inside the same locked-signature fn. Integer only — appears in paths and in match arms."
+required = true
+default = "1"
+
+[vars.cache_ttl_secs]
+description = "Per-(tenant_id, grammar_version) TenantRuntime cache TTL in seconds. Short by default — the boot path reads metadata tables that the composer may mutate; staleness here defeats T-6 (metadata-driven runtime). Phase 4 will lower this further when live tenant edits become a flow."
+default = "300"
+
+# =============================================================================
+# crates/smbuild-tenantctx — the TenantCtx newtype crate
+# =============================================================================
+
+[[steps]]
+id = "tenantctx-crate"
+title = "smbuild-tenantctx: TenantCtx newtype crate (non-Clone, non-leaky)"
+type = "feature"
+priority = 1
+files = [
+  "crates/smbuild-tenantctx/Cargo.toml",
+  "crates/smbuild-tenantctx/src/lib.rs",
+  "crates/smbuild-tenantctx/src/tenant_id.rs",
+  "crates/smbuild-tenantctx/README.md",
+]
+description = """
+Create crates/smbuild-tenantctx as a Cargo workspace member. This crate is the only place TenantCtx is defined; every other crate imports it.
+
+**The compile-time chokepoint invariant (T-8):**
+- `pub struct TenantCtx` MUST NOT derive `Clone`. The only constructor is `pub(crate) fn new(...)`, called only by `boot_tenant`. Calling code receives a `&TenantCtx` from the Axum extension layer; it cannot construct one out of thin air, and it cannot clone the borrowed one across tenant boundaries.
+- A private `_marker: PhantomData<*const ()>` field makes TenantCtx neither Send nor Sync by default. Handler code that spawns must explicitly choose to move it (which requires a wrapper) — accidental smuggling across .await points into another tenant's task is a compile error.
+- `pub struct TenantId(ulid::Ulid)` is the typed wrapper; `impl TenantId { pub fn new(u: ulid::Ulid) -> Self ... }` is the only constructor. Sqlx adapters live in this crate.
+
+**Cargo.toml [package.metadata.agent]:**
+```toml
+[package.metadata.agent]
+purpose = "Defines TenantCtx and TenantId — the compile-time tenant-isolation chokepoint. Non-Clone, non-Send-by-default. Only boot_tenant constructs one."
+owned_paths = ["crates/smbuild-tenantctx/"]
+invariants = [
+  "TenantCtx has no public constructor; only pub(crate) new()",
+  "TenantCtx does NOT derive Clone",
+  "TenantCtx is !Send by default via PhantomData<*const ()>",
+]
+local_validate = [
+  "cargo fmt --check -p smbuild-tenantctx",
+  "cargo clippy -p smbuild-tenantctx --all-targets -- -D warnings",
+  "cargo nextest run -p smbuild-tenantctx",
+  "cargo test -p smbuild-tenantctx --doc",
+]
+public_api = ["crates/smbuild-tenantctx/src/lib.rs"]
+risk = "high"
+consumers = ["smbuild-api", "smbuild-worker", "smbuild-audit"]
+```
+
+**Acceptance:**
+- `crates/smbuild-tenantctx/Cargo.toml` exists with the metadata.agent block above
+- `crates/smbuild-tenantctx/src/lib.rs` declares `pub struct TenantCtx { _marker: PhantomData<*const ()>, tenant_id: TenantId, grammar_version: u32 }` with NO `#[derive(Clone)]` and NO public constructor
+- The workspace root Cargo.toml lists `crates/smbuild-tenantctx` in `members`
+- `cargo check -p smbuild-tenantctx` succeeds against a fresh checkout
+- A doc-test in lib.rs asserts: `// fails to compile: let _ = ctx.clone();` (compile_fail block) — proves the !Clone invariant is enforced by the compiler, not just intent
+"""
+
+[steps.testPlan]
+file = "crates/smbuild-tenantctx/src/lib.rs"
+cases = 2
+coverage = "compile_fail doc-test rejects TenantCtx::clone() (invariant: non-Clone); compile_fail doc-test rejects sending TenantCtx across an await boundary into another task (invariant: !Send-by-default)"
+
+# =============================================================================
+# crates/smbuild-api/src/domain/approved_config.rs — ApprovedConfig newtype
+# =============================================================================
+
+[[steps]]
+id = "approved-config-newtype"
+title = "ApprovedConfig newtype with no public constructor"
+type = "feature"
+priority = 1
+needs = ["tenantctx-crate"]
+files = [
+  "crates/smbuild-api/src/domain/approved_config.rs",
+  "crates/smbuild-api/src/domain/mod.rs",
+]
+description = """
+Create the ApprovedConfig newtype in crates/smbuild-api/src/domain/approved_config.rs. This is the runtime-side proof that a tenant config has passed the closed-grammar validator (T-7).
+
+**The privacy chokepoint:**
+```rust
+// crates/smbuild-api/src/domain/approved_config.rs
+use smbuild_grammar::v1::TenantConfig;  // typify-generated zone
+
+pub struct ApprovedConfig {
+    inner: TenantConfig,
+    grammar_version: u32,
+    config_hash: [u8; 32],  // sha256(canonical_json); used by audit chain
+}
+
+impl ApprovedConfig {
+    // Only composer::must_validate may construct one.
+    pub(crate) fn from_validated(inner: TenantConfig, grammar_version: u32, config_hash: [u8; 32]) -> Self {
+        Self { inner, grammar_version, config_hash }
+    }
+    pub fn inner(&self) -> &TenantConfig { &self.inner }
+    pub fn grammar_version(&self) -> u32 { self.grammar_version }
+    pub fn config_hash(&self) -> &[u8; 32] { &self.config_hash }
+}
+```
+
+- NO `pub fn new`. NO `Deserialize` derive that bypasses validation. NO `From<TenantConfig>` impl.
+- Calling code accepts `&ApprovedConfig` parameters only. Passing raw bytes is a compile error — there is no `From<&[u8]>` or `TryFrom<&[u8]>` impl.
+- `pub(crate)` constructor means only code inside `smbuild-api` can call it; only `composer::must_validate` does call it.
+
+**Acceptance:**
+- `crates/smbuild-api/src/domain/approved_config.rs` exists with the shape above; `domain/mod.rs` re-exports `pub use approved_config::ApprovedConfig;`
+- The file has NO `pub fn new(...)`, NO `impl From<TenantConfig> for ApprovedConfig`, NO `impl Default`, NO `#[derive(Deserialize)]`
+- A doc-test asserts: outside the crate, `let _ = ApprovedConfig::from_validated(...);` is a `compile_fail` (proves the `pub(crate)` boundary)
+- `cargo clippy -p smbuild-api --all-targets -- -D warnings` passes
+"""
+
+[steps.testPlan]
+file = "crates/smbuild-api/src/domain/approved_config.rs"
+cases = 1
+coverage = "compile_fail doc-test confirms external code cannot construct ApprovedConfig (proves the pub(crate) chokepoint is real, not aspirational)"
+
+# =============================================================================
+# crates/smbuild-api/src/composer/must_validate.rs — the validator
+# =============================================================================
+
+[[steps]]
+id = "composer-must-validate"
+title = "composer::must_validate — closed-grammar JSON Schema chokepoint"
+type = "feature"
+priority = 2
+needs = ["approved-config-newtype"]
+files = [
+  "crates/smbuild-api/src/composer/must_validate.rs",
+  "crates/smbuild-api/src/composer/mod.rs",
+  "crates/smbuild-api/src/composer/error.rs",
+]
+description = """
+Implement the `must_validate` function — the ONLY way to obtain an ApprovedConfig.
+
+**Signature:**
+```rust
+pub fn must_validate(raw: &[u8]) -> Result<ApprovedConfig, ValidationError>;
+```
+
+**Behavior:**
+1. Parse `raw` as JSON. On parse error -> `ValidationError::Malformed { line, col, msg }`.
+2. Read the top-level `grammar_version` string (per ADR 0002 §Concrete tenant config: `"grammar_version": "1.0.0"`). Map the major version (`1`) to the schema directory `composer/grammar/v1/tenant.schema.json`. Unknown major -> `ValidationError::UnsupportedGrammar { version }`. Phase 1 supports v1 only — the match arm reads `1 => v1::TENANT_SCHEMA`, all others fall through to the error.
+3. Compile the schema using the `jsonschema` crate (draft 2020-12 mode), validate against it. Closed-grammar (T-7) means `additionalProperties: false` at every object boundary — an unknown top-level key MUST fail validation.
+4. Deserialize the validated JSON into `smbuild_grammar::v1::TenantConfig` (the typify-generated newtype zone). Deserialization can still fail on structural mismatch — return `ValidationError::Deserialize(err)` if it does.
+5. Compute `sha256(canonical_json(parsed))` for the audit chain hook (T-9 reproducibility).
+6. Return `Ok(ApprovedConfig::from_validated(typed, major_version, hash))`.
+
+**Schema reference loading:** the schema files live under `composer/grammar/v1/`. The build.rs in smbuild-api uses `include_str!` to embed them at compile time so runtime has no file-system dependency (T-11 deterministic).
+
+**Acceptance:**
+- `must_validate` exists with the exact signature above
+- Validates against `composer/grammar/v1/tenant.schema.json` for grammar_version major `1`
+- Test asserts: a config with an unknown top-level key (e.g. `"frobnicate": true`) fails with `Schema(_)` whose error path is `/frobnicate` and message mentions `additionalProperties` — this PROVES the closed-grammar invariant is wired, not aspirational
+- Test asserts: a config missing `grammar_version` fails with `Schema(_)` (required-field violation)
+- Test asserts: a config with `grammar_version: "99.0.0"` fails with `UnsupportedGrammar { version: 99 }`
+- Test asserts: the canonical HVAC config from `composer/grammar/v1/examples/hvac.tenant.json` (ADR 0002 §Concrete tenant config) validates successfully and round-trips through `config_hash`
+- `cargo nextest run -p smbuild-api composer::must_validate` passes
+"""
+
+[steps.testPlan]
+file = "crates/smbuild-api/src/composer/must_validate.rs"
+cases = 4
+coverage = "additionalProperties violation rejected (closed-grammar proof, T-7); missing grammar_version rejected; unsupported grammar major rejected; canonical HVAC example from ADR 0002 validates and returns ApprovedConfig with stable config_hash"
+
+# =============================================================================
+# crates/smbuild-api/src/tenant/runtime.rs — TenantRuntime
+# =============================================================================
+
+[[steps]]
+id = "tenant-runtime-struct"
+title = "TenantRuntime struct — per-request handle"
+type = "feature"
+priority = 2
+needs = ["approved-config-newtype"]
+files = [
+  "crates/smbuild-api/src/tenant/runtime.rs",
+  "crates/smbuild-api/src/tenant/mod.rs",
+  "crates/smbuild-api/src/tenant/validators.rs",
+  "crates/smbuild-api/src/tenant/job_state_machine.rs",
+]
+description = """
+Define the TenantRuntime struct — the per-request handle every handler reads from. This is the runtime materialization of the validated ApprovedConfig plus the per-entity validators built from `entity_field_definitions` rows.
+
+**Shape:**
+```rust
+pub struct TenantRuntime {
+    pub config: ApprovedConfig,
+    pub validators: HashMap<EntityType, FieldValidator>,   // built from entity_field_definitions
+    pub branding: BrandingTokens,                          // from branding_tokens table
+    pub job_state_machine: JobStateMachine,                // from job_statuses + job_status_transitions
+    pub notification_triggers: Vec<NotificationTrigger>,
+    pub notification_templates: HashMap<String, NotificationTemplate>,  // keyed by template_ref
+    pub pricing_rules: Vec<PricingRule>,
+    pub roles: HashMap<RoleKey, Role>,
+}
+```
+
+- `FieldValidator` is a closure-like struct (`Fn(&serde_json::Value) -> Result<(), FieldError>`) compiled at boot from the rows in `entity_field_definitions` for that tenant. This is the runtime hook for `custom_fields JSONB` validation (ADR 0002 directive #4 — "Validation at write time, generated from the tenant's config at tenant boot. No bad shape reaches the DB.").
+- `JobStateMachine` reads from `job_statuses` + `job_status_transitions` (Phase-1 directive #1 — "the table IS the state machine; no `match status` over hardcoded variants"). The struct exposes `pub fn can_transition(&self, from: JobStatusId, to: JobStatusId, actor_roles: &[RoleKey]) -> Result<(), TransitionError>`.
+
+**Acceptance:**
+- `TenantRuntime` declared in `crates/smbuild-api/src/tenant/runtime.rs` with the fields above; the file also declares `EntityType`, `BrandingTokens`, `NotificationTrigger`, `NotificationTemplate`, `PricingRule`, `RoleKey`, `Role` shapes (some re-exported from smbuild-grammar).
+- `FieldValidator` in `tenant/validators.rs` accepts a `Vec<EntityFieldDefinition>` and returns a closure-like validator that rejects missing required fields, rejects unknown keys (closed-grammar custom_fields per ADR 0002), and type-checks each field per its declared `type` (string|integer|boolean|enum|...).
+- `JobStateMachine` in `tenant/job_state_machine.rs` is built from `Vec<JobStatus>` + `Vec<JobStatusTransition>`; clippy::cognitive_complexity passes.
+- No public `new()` constructor on TenantRuntime — only `pub(crate) fn from_loaded(...)` called by boot_tenant. Same chokepoint discipline as ApprovedConfig.
+- `cargo check -p smbuild-api` succeeds
+"""
+
+[steps.testPlan]
+file = "crates/smbuild-api/src/tenant/validators.rs"
+cases = 3
+coverage = "FieldValidator built from entity_field_definitions rejects missing required fields; rejects unknown keys (closed-grammar custom_fields); type-checks per declared field type"
+
+# =============================================================================
+# crates/smbuild-api/src/tenant/boot.rs — THE chokepoint fn
+# =============================================================================
+
+[[steps]]
+id = "boot-tenant-fn"
+title = "boot_tenant: load grammar + metadata, return TenantRuntime"
+type = "feature"
+priority = 3
+needs = ["composer-must-validate", "tenant-runtime-struct"]
+files = [
+  "crates/smbuild-api/src/tenant/boot.rs",
+  "crates/smbuild-api/src/tenant/cache.rs",
+  "crates/smbuild-api/src/tenant/error.rs",
+]
+description = """
+Implement `boot_tenant`, the single function called at process start for every tenant the API serves. Its signature is the contract for Phases 1->3->4 (ADR 0002 directive #9).
+
+**Locked signature (do not drift, ever):**
+```rust
+pub async fn boot_tenant(
+    pool: &sqlx::PgPool,
+    tenant_id: smbuild_tenantctx::TenantId,
+) -> Result<std::sync::Arc<TenantRuntime>, BootError>;
+```
+
+(The lock is enforced by the `phase4-stability-test` step.)
+
+**Phase-1 body:**
+1. Check the per-(tenant_id, grammar_version) cache. Cache TTL = {{cache_ttl_secs}}s. Hit -> return cached `Arc<TenantRuntime>`.
+2. Load the bootstrap tenant config. Phase 1: read from `composer/grammar/v1/examples/hvac.tenant.json` (the canonical HVAC example in ADR 0002). Phase 3 will swap this read to come from the control-plane `tenants` table via `connection_secret_ref`. Phase 4 lets the composer write the row. The READ source changes; the SHAPE does not (always raw bytes -> `must_validate`).
+3. Call `composer::must_validate(raw)` -> `ApprovedConfig`. On error -> `BootError::Validation(e)`. (Note: this is the WRITE-side chokepoint. The composer cannot bypass.)
+4. With the pool, fetch rows for this tenant from these metadata tables (all RLS-protected, all set up by `db/migrations/000001_init.up.sql`):
+   - `entity_field_definitions` -> build per-EntityType FieldValidator
+   - `job_statuses` + `job_status_transitions` -> JobStateMachine
+   - `notification_triggers` + `notification_templates` -> notification dispatch tables
+   - `pricing_rules` -> pricing config
+   - `roles` (+ implied `role_permissions`) -> role lookup
+   - `branding_tokens` -> BrandingTokens
+   The connection acquired for this load MUST `SET LOCAL app.current_tenant_id = $1` before any select so RLS is active. Use a transaction.
+5. Construct `TenantRuntime::from_loaded(approved_config, validators, branding, job_state_machine, ...)`. Wrap in `Arc`.
+6. Insert into cache. Return.
+
+**BootError shape:**
+```rust
+pub enum BootError {
+    Validation(crate::composer::ValidationError),
+    MetadataLoad(sqlx::Error),
+    TenantNotFound { tenant_id: TenantId },
+    GrammarMismatch { config_says: u32, db_says: u32 },  // tenant row's grammar_version differs from config's
+}
+```
+
+**Acceptance:**
+- `crates/smbuild-api/src/tenant/boot.rs` exports `pub async fn boot_tenant(pool: &sqlx::PgPool, tenant_id: TenantId) -> Result<Arc<TenantRuntime>, BootError>` — exact signature
+- Phase 1 reads `composer/grammar/v1/examples/hvac.tenant.json` via `include_str!` (deterministic, no runtime FS dependency)
+- The loader transaction issues `SET LOCAL app.current_tenant_id = $1` before any SELECT against tenant-scoped tables
+- Cache is a `tokio::sync::RwLock<HashMap<(TenantId, u32), (Instant, Arc<TenantRuntime>)>>` with {{cache_ttl_secs}}s TTL; cache module exposes a sync `pub(crate) fn invalidate(tenant_id: TenantId)` for Phase-4 composer pokes (declared but unused in Phase 1)
+- `cargo check -p smbuild-api` succeeds
+"""
+
+# =============================================================================
+# Axum tower middleware: per-request boot + Extension wiring
+# =============================================================================
+
+[[steps]]
+id = "tenant-axum-middleware"
+title = "Axum tower::Layer that runs boot_tenant per request + sets RLS GUC"
+type = "feature"
+priority = 3
+needs = ["boot-tenant-fn"]
+files = [
+  "crates/smbuild-api/src/transport/tenant_layer.rs",
+  "crates/smbuild-api/src/transport/mod.rs",
+]
+description = """
+Implement `TenantLayer` (a `tower::Layer`) and its `Service` so every request runs through tenant boot before the handler sees it.
+
+**Behavior:**
+1. The layer extracts the tenant_id from the request (Phase 1: from the Zitadel OIDC claim's `tenant_id` extension, or a header `X-Smbuild-Tenant` in dev mode; the source is encapsulated in a `TenantIdExtractor` trait so Phase 3 can swap).
+2. Calls `boot_tenant(&pool, tenant_id).await`. On `BootError` -> respond `503 Service Unavailable` for transient (MetadataLoad), `404 Not Found` for TenantNotFound, `500 Internal Server Error` for Validation/GrammarMismatch (these are config-time bugs, not request-time).
+3. Acquires a connection from the pool for the request, runs `SET LOCAL app.current_tenant_id = $1` on it inside a transaction, and stashes the connection in a request extension so downstream handlers reuse the same RLS-scoped connection (otherwise RLS resets between checkouts — this is the load-bearing trick).
+4. Attaches `Extension<TenantCtx>` and `Extension<Arc<TenantRuntime>>` to the request.
+5. Calls the inner service.
+
+**Why this matters (T-8 invariant):** every handler downstream of this layer reads `Extension<TenantCtx>` for the tenant identity and `Extension<Arc<TenantRuntime>>` for branding/validators/state machine. There is no alternative path. Compile-time chokepoint.
+
+**Acceptance:**
+- `crates/smbuild-api/src/transport/tenant_layer.rs` exposes `pub struct TenantLayer { pool: sqlx::PgPool, extractor: Arc<dyn TenantIdExtractor> }` and `impl<S> tower::Layer<S> for TenantLayer`
+- Per-request execution path: extract tenant_id -> boot_tenant -> acquire txn-bound conn -> SET LOCAL app.current_tenant_id -> insert request extensions -> call inner
+- Error mapping: BootError::Validation/GrammarMismatch -> 500; BootError::TenantNotFound -> 404; BootError::MetadataLoad -> 503
+- A `tower::ServiceBuilder` test wires up a trivial inner service and asserts the extensions are present and the GUC was set (read it back via `SHOW app.current_tenant_id`)
+- `cargo nextest run -p smbuild-api transport::tenant_layer` passes
+"""
+
+[steps.testPlan]
+file = "crates/smbuild-api/src/transport/tenant_layer.rs"
+cases = 3
+coverage = "happy path: TenantCtx + Arc<TenantRuntime> visible to inner service; happy path: SHOW app.current_tenant_id returns the bound id (proves RLS GUC is set on the conn the inner service reuses); BootError::TenantNotFound returns 404 without invoking inner"
+
+# =============================================================================
+# Signature lock — Phase 4 stability test
+# =============================================================================
+
+[[steps]]
+id = "phase4-stability-test"
+title = "Doc-test locking boot_tenant's public signature"
+type = "feature"
+priority = 4
+needs = ["boot-tenant-fn"]
+files = [
+  "crates/smbuild-api/src/tenant/boot.rs",
+]
+description = """
+Add a doc-test in `crates/smbuild-api/src/tenant/boot.rs` that snapshots `boot_tenant`'s public signature. If a future bead (Phase 3 BYO-DB; Phase 4 composer) drifts the signature, the doc-test fails to compile.
+
+**The doc-test:**
+```rust
+/// // Phase-4 stability lock: type-only assertion — the function pointer cast
+/// // fails to compile if the signature drifts in ANY way (arg count, arg
+/// // types, return type, asyncness).
+/// ```
+/// use smbuild_api::tenant::{boot_tenant, BootError, TenantRuntime};
+/// use std::sync::Arc;
+/// use smbuild_tenantctx::TenantId;
+/// const _: fn(&sqlx::PgPool, TenantId) -> std::pin::Pin<Box<
+///     dyn std::future::Future<Output = Result<Arc<TenantRuntime>, BootError>> + Send
+/// >> = |pool, tid| Box::pin(boot_tenant(pool, tid));
+/// ```
+```
+
+If anyone in Phase 3 or Phase 4 adds a parameter, removes async, changes the return type, or renames TenantRuntime -> BootResult, this doc-test refuses to compile. Phase 4's composer can extend the BODY (new arms inside boot.rs) freely; it cannot widen the contract without explicit human ratification (T-25 enforcement at the type level).
+
+**Acceptance:**
+- The doc-test block is present in `crates/smbuild-api/src/tenant/boot.rs` immediately above the `pub async fn boot_tenant` declaration with a comment header reading `// PHASE 4 STABILITY LOCK — DO NOT EDIT WITHOUT TENETS.md §6 AMENDMENT`
+- `cargo test -p smbuild-api --doc tenant::boot` passes against the current (Phase 1) signature
+- A negative-control bead test (run by /quality-pass, not committed code): briefly edit `boot_tenant` to add an extra `&str` arg, re-run the doc-test, confirm it fails to compile — then revert. The doc-test PROVES the lock works.
+"""
+
+[steps.testPlan]
+file = "crates/smbuild-api/src/tenant/boot.rs"
+cases = 1
+coverage = "doc-test asserts boot_tenant's exact signature (pin<box<future<output=Result<Arc<TenantRuntime>, BootError>>>>); any drift -> compile error"
+
+# =============================================================================
+# Integration test against testcontainers Postgres
+# =============================================================================
+
+[[steps]]
+id = "boot-tenant-integration-test"
+title = "boot_tenant: testcontainers Postgres round-trip"
+type = "feature"
+priority = 4
+needs = ["boot-tenant-fn", "tenant-axum-middleware"]
+files = [
+  "crates/smbuild-api/tests/tenant_boot.rs",
+  "crates/smbuild-api/tests/common/mod.rs",
+]
+description = """
+End-to-end test for `boot_tenant`. Uses testcontainers-rs to spin up a real Postgres 16, runs `db/migrations/` (the `000001_init.up.sql` produced by the universal-schema migration bead), inserts seed rows for one tenant, calls `boot_tenant`, asserts the returned TenantRuntime carries the seeded data.
+
+**Test setup (in tests/common/mod.rs):**
+- `pub async fn fresh_pg() -> (Container<Postgres>, PgPool)` — spins up Postgres 16, runs `sqlx::migrate!("../../db/migrations")`, returns container + pool
+- `pub async fn seed_trades_tenant(pool: &PgPool, tenant_id: TenantId)` — inserts:
+  - one Tenant row in the control-plane `tenants` table with `grammar_version='1.0.0'`
+  - `entity_field_definitions` rows for the HVAC vertical: `properties.build_year:integer`, `properties.system_type:enum`, `jobs.equipment_model:string` (matches ADR 0002 canonical example)
+  - `job_statuses` rows: scheduled / en_route / on_site / completed / no_show
+  - `job_status_transitions`: the four transitions from ADR 0002 canonical example
+  - `notification_triggers` rows: 3 entries (job.state.changed_to.en_route SMS; invoice.sent email; invoice.overdue.day_3 SMS)
+  - `notification_templates` rows: 3 entries with the refs above
+  - `pricing_rules`: flat_rate_with_estimate row
+  - `roles`: owner, tech
+  - `branding_tokens`: company_name=Bayou HVAC LLC, primary_color=#0E5FA8, vertical=hvac
+
+**Assertions:**
+- `boot_tenant(&pool, tenant_id).await.is_ok()`
+- Returned `TenantRuntime.job_state_machine.can_transition(scheduled -> en_route, &[tech])` is `Ok(())`
+- Returned `TenantRuntime.job_state_machine.can_transition(scheduled -> no_show, &[tech])` is `Err(_)` (only owner allowed per the seed)
+- Returned `TenantRuntime.validators[&EntityType::Property]` rejects a custom_fields payload missing the required `system_type` key
+- Returned `TenantRuntime.validators[&EntityType::Property]` rejects a custom_fields payload with an unknown key `frobnicate` (closed-grammar custom_fields proof)
+- Returned `TenantRuntime.branding.company_name == "Bayou HVAC, LLC"`
+- Returned `TenantRuntime.notification_templates` has all 3 refs
+
+**Cross-tenant proof (defense-in-depth):**
+- Seed a second tenant; call `boot_tenant` with tenant A's id; assert the returned runtime contains ONLY tenant A's branding/templates/etc. — never tenant B's. This proves RLS is engaged via `SET LOCAL app.current_tenant_id` inside the loader transaction (T-8 invariant).
+
+**Acceptance:**
+- `cargo nextest run -p smbuild-api --test tenant_boot` passes against a fresh testcontainers Postgres
+- Total test runtime <60s (testcontainers reuse in CI keeps it tractable)
+- No mocks for Postgres, RLS, or the migration files (T-14 — real path)
+"""
+
+[steps.testPlan]
+file = "crates/smbuild-api/tests/tenant_boot.rs"
+cases = 7
+coverage = "boot succeeds for trades-seeded tenant; job state machine reads transitions from rows (not enum); transition gate denies role-restricted transitions; FieldValidator rejects missing required custom_field; FieldValidator rejects unknown custom_field key (closed-grammar proof); branding tokens load; cross-tenant RLS isolation — boot for tenant A returns ONLY tenant A's rows"

@@ -1,0 +1,545 @@
+# openfga-model: OpenFGA ReBAC model + Rust client + compile-time-enforced
+# authorization chokepoint for a Rust/Axum backend.
+#
+# Use for: SMBuild Phase 1 (#17 OpenFGA ReBAC). OpenFGA is run as an opaque Go
+# HTTP service per ADR 0003 §Decision 6; we consume it via reqwest from Rust
+# (NOT openfga-rs — not stable enough as of 2026-05).
+#
+# Out of scope for v1 — each gets a follow-on formula:
+# - Contextual tuples (request-time relationship inference): openfga-contextual
+# - Tuple subscription / change-feed: openfga-watch
+# - Per-tenant model versioning + migration runner (Phase 4 composer concern):
+#   openfga-model-migrate
+# - Cross-store federation (Phase 5+): openfga-federate
+# - openfga-rs SDK swap: openfga-rs-swap (one-bead refactor when the crate
+#   stabilizes; same trait surface)
+#
+# Dependency-graph design (critical):
+#
+#   fga-model-file ──┬── fga-rust-client ──┬── authorized-handler-trait ──┐
+#                    │                     │                              │
+#                    └── fga-tuples-seed ──┴── fga-tuple-management-cli ──┤
+#                                                                         ├── integration-test
+#   secret-handling  (INDEPENDENT — touches-secrets escalation)            │
+#
+# Per integration-http convention, secret-handling rides its own track so the
+# DSL + client + trait + CLI + tests ship in parallel while the human
+# provisions the OpenFGA deployment + store ID + API token.
+#
+# The model file is the *closed grammar* of authorization (T-7) — only relations
+# declared in fga-model.fga are valid runtime authz queries. Composer in Phase 4+
+# will write to this file (or to per-grammar-version variants fga-model-v2.fga,
+# fga-model-v3.fga) to extend the relation graph for new verticals.
+#
+# Compile-time chokepoint (per ADR 0003 §Decision 17):
+# The `authorized-handler-trait` step makes calling .write() without first
+# calling .check() a TYPE ERROR. Not a lint, not a test, not a code-review
+# convention — a refusal-to-compile. This is the Rust-specific mechanism that
+# makes "every mutating handler must check FGA first" a provable invariant per
+# T-8 + T-9 + the tiebreaker hierarchy's security floor.
+
+formula = "openfga-model"
+description = """
+OpenFGA ReBAC model file (closed grammar), Rust reqwest-based client, AuthorizedHandler trait that makes mutating without check() a compile error, tenant-tuple seed + CLI, and integration test against real OpenFGA via testcontainers. Secret-handling rides its own escalation track per integration-http convention.
+"""
+type = "workflow"
+version = 1
+
+[vars.default_base_url]
+description = "Default OpenFGA HTTP base URL. Phase 1 default is the sidecar URL on the same ECS task; real value comes from the secret-handling step."
+default = "http://openfga:8080"
+
+[vars.model_path]
+description = "Path to the canonical OpenFGA DSL model file. Single grammar per version per ADR 0002 / T-7."
+default = "auth/fga-model.fga"
+
+[vars.seed_path]
+description = "Path to the JSON file containing starter tuples for the Phase-1 single tenant."
+default = "auth/fga-tuples-seed.json"
+
+[vars.api_crate]
+description = "The Cargo crate that hosts the FGA client + AuthorizedHandler trait. Same crate as the API server."
+default = "smbuild-api"
+
+[vars.fga_store_id_env]
+description = "Environment variable name the runtime reads to get the OpenFGA store ID. Real value provisioned in secret-handling."
+default = "OPENFGA_STORE_ID"
+
+# =============================================================================
+# FGA model file (the closed grammar of authorization)
+# =============================================================================
+
+[[steps]]
+id = "fga-model-file"
+title = "OpenFGA: canonical DSL model for trades grammar v1"
+type = "feature"
+priority = 1
+files = [
+  "auth/fga-model.fga",
+  "auth/README.md",
+]
+description = """
+Write the canonical OpenFGA DSL file at `{{model_path}}`. This is the single tenant authorization grammar for SMBuild grammar v1 (trades). Composer in Phase 4 writes to this file (or to per-grammar-version variants for new verticals).
+
+**Canonical model (mirrors ADR 0001's example, expanded for the Phase 1 entity set):**
+```
+model
+  schema 1.1
+
+type tenant
+  relations
+    define admin: [user]
+    define member: [user]
+
+type user
+
+type customer
+  relations
+    define tenant: [tenant]
+    define owner: admin from tenant
+    define viewer: [user] or owner or member from tenant
+
+type property
+  relations
+    define tenant: [tenant]
+    define customer: [customer]
+    define viewer: viewer from customer
+
+type job
+  relations
+    define tenant: [tenant]
+    define customer: [customer]
+    define assigned_tech: [user]
+    define viewer: assigned_tech or admin from tenant
+    define can_assign: admin from tenant
+    define can_complete: assigned_tech or admin from tenant
+
+type invoice
+  relations
+    define tenant: [tenant]
+    define customer: [customer]
+    define viewer: admin from tenant
+    define can_send: admin from tenant
+    define can_pay: admin from tenant
+```
+
+**Why this exact shape:**
+- `tenant` is the root container. `admin` = owner role; `member` = tech role. (The Phase 1 trades seed has 1 admin + 0 members; growth happens at tenant-scale.)
+- `customer/property/job/invoice` all carry `tenant: [tenant]` — this is the FGA-side mirror of the Postgres `tenant_id` column (T-8 defense-in-depth: RLS at DB layer, FGA at app layer).
+- `job.can_complete: assigned_tech or admin from tenant` — the exact relation from ADR 0001's example. Trades workflow: assigned tech can mark complete; owner (admin) can always.
+- `invoice` does NOT have a `tech` relation — invoicing is owner-only in trades grammar v1 (per Phase 1 vision: techs don't see money).
+- Only relations declared here are queryable. Calling `fga.check(user, "imaginary_relation", ...)` returns an FGA error, not silently false. T-7 closure.
+
+**Acceptance:**
+- `{{model_path}}` exists with the model above.
+- `fga model validate --file {{model_path}}` exits 0 (run via the openfga CLI installed in CI).
+- `auth/README.md` documents the relation semantics with a paragraph per type explaining who has what in the trades vertical (so the loop + composer have a reference when extending for new verticals in Phase 5).
+
+**Out of scope:**
+- Loading the model into a running OpenFGA instance (that's `fga-tuple-management-cli`).
+- Per-tenant relation tuples (that's `fga-tuples-seed`).
+- Per-vertical extension (Phase 5 + composer).
+"""
+
+# =============================================================================
+# FGA tuples seed (starter relationships for the Phase 1 single tenant)
+# =============================================================================
+
+[[steps]]
+id = "fga-tuples-seed"
+title = "OpenFGA: starter tuples for the Phase-1 single tenant (trades walkthrough)"
+type = "feature"
+priority = 1
+needs = ["fga-model-file"]
+files = [
+  "auth/fga-tuples-seed.json",
+]
+description = """
+Write starter tuples for the Phase 1 single tenant at `{{seed_path}}`. Per ADR 0002 Phase-1 directive item 3, the seed is DATA not CODE — it lives as JSON so the composer (Phase 4) can read/write it without touching Rust.
+
+**Schema:**
+```json
+[
+  { "user": "user:01HZTENANT1_OWNER", "relation": "admin", "object": "tenant:01HZTENANT1" },
+  { "user": "user:01HZTENANT1_OWNER", "relation": "owner", "object": "customer:01HZCUSTOMER1" },
+  { "user": "tenant:01HZTENANT1", "relation": "tenant", "object": "customer:01HZCUSTOMER1" },
+  { "user": "tenant:01HZTENANT1", "relation": "tenant", "object": "property:01HZPROPERTY1" },
+  { "user": "customer:01HZCUSTOMER1", "relation": "customer", "object": "property:01HZPROPERTY1" },
+  { "user": "tenant:01HZTENANT1", "relation": "tenant", "object": "job:01HZJOB1" },
+  { "user": "customer:01HZCUSTOMER1", "relation": "customer", "object": "job:01HZJOB1" }
+]
+```
+
+(The exact ULIDs are placeholders the migration / fixture replaces; the file's role is the *shape* + the *relationship graph*.)
+
+**For the walkthrough E2E (Phase 1 #21):**
+- 1 tenant (`01HZTENANT1`)
+- 1 owner user (`01HZTENANT1_OWNER`) with `admin` relation on the tenant
+- 0 tech users in the seed (the walkthrough creates one via the assignment step)
+- 1 customer / 1 property / 1 job — covers the entire walkthrough graph
+- 0 invoices in the seed (walkthrough creates the invoice)
+
+**Acceptance:**
+- `{{seed_path}}` parses as valid JSON.
+- Every tuple references a type + relation defined in `{{model_path}}` (the CLI step verifies this against a running OpenFGA).
+- The seed is sufficient to make the E2E walkthrough's authz checks pass without ANY runtime tuple creation up to the point of `JOB -> COMPLETED`.
+
+**Out of scope:**
+- Multi-tenant seeds (Phase 3 problem; composer writes per-tenant seeds in Phase 4).
+- The CLI that loads these into OpenFGA (separate step `fga-tuple-management-cli`).
+"""
+
+# =============================================================================
+# FGA Rust client (reqwest-based, no openfga-rs)
+# =============================================================================
+
+[[steps]]
+id = "fga-rust-client"
+title = "OpenFGA: Rust HTTP client (reqwest, no SDK)"
+type = "feature"
+priority = 2
+needs = ["fga-model-file"]
+files = [
+  "crates/{{api_crate}}/src/adapters/fga/client.rs",
+  "crates/{{api_crate}}/src/adapters/fga/mod.rs",
+  "crates/{{api_crate}}/src/adapters/fga/errors.rs",
+  "crates/{{api_crate}}/Cargo.toml",
+]
+description = """
+Thin reqwest-based client for OpenFGA's HTTP API. Per ADR 0003 §Decision 6, openfga-rs is not stable enough as of 2026-05; we write a small hand-maintained client (T-12 boring: HTTP is HTTP).
+
+**Surface:**
+```rust
+pub struct FgaClient {
+    base_url: Url,
+    store_id: String,
+    api_token: SecretString,  // secrecy crate
+    http: reqwest::Client,
+}
+
+impl FgaClient {
+    pub fn new(base_url: Url, store_id: String, api_token: SecretString) -> Self { ... }
+
+    /// POST /stores/{store_id}/check
+    /// Body: { "tuple_key": { "user": "...", "relation": "...", "object": "..." } }
+    /// Returns: { "allowed": bool, "resolution": "..." }
+    pub async fn check(
+        &self,
+        user: &str,
+        relation: &str,
+        object: &str,
+    ) -> Result<bool, FgaError>;
+
+    /// POST /stores/{store_id}/list-objects
+    /// Returns the IDs of objects of `object_type` where `user` has `relation`.
+    /// Used by list endpoints to scope queries — replaces the naive "fetch all
+    /// then filter" pattern.
+    pub async fn list_objects(
+        &self,
+        user: &str,
+        relation: &str,
+        object_type: &str,
+    ) -> Result<Vec<String>, FgaError>;
+
+    /// POST /stores/{store_id}/write (writes tuples)
+    /// Used by tenant boot + composer to materialize relationships.
+    pub async fn write_tuples(
+        &self,
+        writes: &[TupleKey],
+        deletes: &[TupleKey],
+    ) -> Result<(), FgaError>;
+
+    /// POST /stores/{store_id}/read (queries tuples for debugging + audit)
+    pub async fn read_tuples(
+        &self,
+        filter: TupleKeyFilter,
+    ) -> Result<Vec<Tuple>, FgaError>;
+}
+```
+
+**Error type (per the T-12 typed-error pattern):**
+```rust
+pub enum FgaError {
+    Network(reqwest::Error),
+    Http { status: StatusCode, body: String },
+    InvalidTuple { detail: String },
+    StoreNotFound,
+    Timeout,
+    InvalidResponse(serde_json::Error),
+}
+```
+
+**Acceptance:**
+- `crates/{{api_crate}}/src/adapters/fga/client.rs` exports `FgaClient` with the methods above.
+- Cargo.toml dependencies: `reqwest = { version = "0.12", features = ["json", "rustls-tls"] }`, `serde = "1"`, `serde_json = "1"`, `url = "2"`, `secrecy = "0.10"`, `thiserror = "1"`.
+- Per-request timeout: 5s (FGA checks are on the hot path of every mutating handler; 5s is the hard ceiling; failures fall through to FgaError::Timeout and the handler decides — usually 503).
+- Retries: NONE on /check (authz answers must be consistent within a request; retries can mask split-brain bugs). YES on /write_tuples with exponential backoff up to 3 attempts (write is idempotent at the FGA layer when we send `(write, delete)` deltas).
+- `cargo clippy -p {{api_crate}} -- -D warnings` clean.
+- `cargo deny check` clean (no banned crates added).
+
+**Why no `openfga-rs`:** Per ADR 0003 §Decision 6, openfga-rs (as of 2026-05) hasn't reached 1.0, has fewer than 20 contributors, and lacks first-class support for the latest FGA API (`list_objects` is unstable). Hand-written client is ~250 LOC, fully understood, and the swap-when-stable refactor is one bead. T-10 + T-12 win.
+"""
+
+[steps.testPlan]
+file = "crates/{{api_crate}}/tests/adapters/fga/client.rs"
+cases = 5
+coverage = "client constructs with fake creds; check returns true for known allowed tuple (against wiremock-served fixture); check returns false for known disallowed; list_objects returns the expected IDs from fixture; timeout surfaces FgaError::Timeout"
+
+# =============================================================================
+# AuthorizedHandler trait (THE compile-time chokepoint)
+# =============================================================================
+
+[[steps]]
+id = "authorized-handler-trait"
+title = "OpenFGA: AuthorizedHandler trait makes .write() without .check() a compile error"
+type = "feature"
+priority = 2
+needs = ["fga-rust-client"]
+files = [
+  "crates/{{api_crate}}/src/application/authz.rs",
+  "crates/{{api_crate}}/src/application/mod.rs",
+  "deny.toml",
+]
+description = """
+Per ADR 0003 §Decision 17 + tenets.md §3 tiebreaker #1 (security floor), this step makes "every mutating handler must check FGA before writing" a *compile-time* invariant — not a lint, not a test, not a code-review rule. Calling `.write()` on a non-`AuthorizedHandle` is a type error.
+
+**Architecture (the type-state pattern):**
+```rust
+use std::marker::PhantomData;
+
+// Marker type — has no constructor outside this module.
+pub struct Authorized;
+pub struct Unauthorized;
+
+/// A handle to a resource carrying a phantom type-state proving authz succeeded.
+/// Constructed ONLY by `check()`. Cannot be forged outside this module
+/// (pub(crate)-fenced constructor).
+pub struct AuthorizedHandle<R, State = Unauthorized> {
+    resource: R,
+    _state: PhantomData<State>,
+}
+
+/// Sealed trait — only types in this crate can implement it.
+pub trait FgaResource: private::Sealed {
+    fn fga_object(&self) -> String;  // e.g. "job:01HZJOB1"
+}
+
+/// Sealed action enum keyed to FGA relations.
+pub trait FgaAction: private::Sealed {
+    fn fga_relation(&self) -> &'static str;
+}
+
+mod private {
+    pub trait Sealed {}
+}
+
+impl<R: FgaResource> AuthorizedHandle<R, Unauthorized> {
+    /// The ONLY constructor for AuthorizedHandle<R, Authorized>.
+    /// Calls FGA check; on allowed, returns a handle in Authorized state.
+    pub async fn check<A: FgaAction>(
+        resource: R,
+        action: A,
+        ctx: &AuthCtx,
+    ) -> Result<AuthorizedHandle<R, Authorized>, AuthzError> {
+        let user = format!("user:{}", ctx.user_id);
+        let object = resource.fga_object();
+        let relation = action.fga_relation();
+        if ctx.fga.check(&user, relation, &object).await? {
+            Ok(AuthorizedHandle { resource, _state: PhantomData })
+        } else {
+            Err(AuthzError::Denied)
+        }
+    }
+}
+
+impl<R: FgaResource> AuthorizedHandle<R, Authorized> {
+    /// Mutating operations accept &mut AuthorizedHandle<R, Authorized>.
+    /// Handlers that try to call this with the wrong state get a type error.
+    pub fn write<F, T>(self, f: F) -> T
+    where F: FnOnce(R) -> T {
+        f(self.resource)
+    }
+}
+```
+
+**How handlers use it:**
+```rust
+// BEFORE (no compile-time gate):
+//   let mut job = repo.load(id).await?;
+//   job.status = Status::Completed;          // <- could ship without auth check!
+//   repo.save(job).await?;
+
+// AFTER (compile-time gate):
+async fn complete_job(ctx: AuthCtx, id: JobId) -> Result<Job, ApiError> {
+    let job = repo.load(id).await?;
+    let handle = AuthorizedHandle::<Job>::check(job, JobAction::Complete, &ctx).await?;
+    let updated = handle.write(|mut job| {
+        job.status = Status::Completed;
+        job
+    });
+    repo.save(updated).await?;
+    Ok(updated)
+}
+```
+
+**Defense-in-depth via cargo-deny (added in this step):**
+Append to `deny.toml` a comment block pointing at a custom xtask that greps for INSERT/UPDATE/DELETE SQL strings in handler files that don't import AuthorizedHandle. The xtask is a backstop; the type system is the load-bearing enforcement.
+
+**Acceptance:**
+- `crates/{{api_crate}}/src/application/authz.rs` exports `AuthorizedHandle<R, State>`, `Authorized`, `Unauthorized`, sealed `FgaResource` + `FgaAction` traits, `AuthCtx`, `AuthzError`.
+- The `Authorized` marker type has NO public constructor — only `AuthorizedHandle::<R, Unauthorized>::check(...)` can produce `AuthorizedHandle<R, Authorized>`.
+- The `write(...)` method exists ONLY on `AuthorizedHandle<R, Authorized>` (impl block constrained by the state parameter).
+- A compile-fail doctest demonstrates: `// FAIL: cannot call write() without check()` — verified via `cargo test --doc` failing as expected.
+- `FgaResource` is implemented for `Customer`, `Property`, `Job`, `Invoice`, `Inventory`, `Crew` (the trades grammar v1 entities) — each returning the correct FGA object identifier.
+- `FgaAction` is implemented for an action enum per resource (`JobAction::Complete`, `JobAction::Assign`, `InvoiceAction::Send`, etc.) — each returning the FGA relation declared in `{{model_path}}`.
+- `cargo nextest run -p {{api_crate}}` clean.
+- `cargo test -p {{api_crate}} --doc` includes the compile-fail demonstration.
+
+**Out of scope:**
+- Wiring AuthorizedHandle into existing handlers (per-handler beads under each CRUD epic).
+- Per-tenant relation mutations (the composer-era Phase 4 problem).
+"""
+
+[steps.testPlan]
+file = "crates/{{api_crate}}/tests/application/authz.rs"
+cases = 6
+coverage = "check returns AuthorizedHandle<Authorized> when FGA allows; check returns AuthzError::Denied when FGA denies; AuthorizedHandle<Authorized>::write executes the closure; calling write on raw resource is a compile error (compile-fail trybuild); FgaAction::fga_relation returns the canonical relation string; xtask check_authz fails when a handler has raw SQL mutation outside AuthorizedHandle"
+
+# =============================================================================
+# Tuple management CLI (loads the seed at tenant boot)
+# =============================================================================
+
+[[steps]]
+id = "fga-tuple-management-cli"
+title = "OpenFGA: tuple-management CLI binary (fga_seed)"
+type = "feature"
+priority = 2
+needs = ["fga-rust-client", "fga-tuples-seed"]
+files = [
+  "crates/{{api_crate}}/src/bin/fga_seed.rs",
+  "crates/{{api_crate}}/Cargo.toml",
+]
+description = """
+A small CLI binary `fga_seed` that:
+1. Reads `{{seed_path}}` (or another path passed via `--seed`).
+2. Connects to OpenFGA at `--base-url` (default `{{default_base_url}}`) with `--store-id` (default from `{{fga_store_id_env}}` env var) and `--api-token` (default from `OPENFGA_API_TOKEN` env var).
+3. Loads `{{model_path}}` into the store via `POST /stores/{store_id}/authorization-models` (capturing the returned `authorization_model_id`).
+4. Writes the tuples from the seed JSON via `FgaClient::write_tuples`.
+5. Verifies via `check` that the canonical Phase-1 expectations hold (owner can admin tenant; owner can see the seeded customer; etc.).
+6. Prints the new `authorization_model_id` to stdout for the operator to record.
+
+**Usage:**
+```
+cargo run --bin fga_seed -- \\
+  --seed auth/fga-tuples-seed.json \\
+  --model auth/fga-model.fga \\
+  --base-url http://openfga:8080 \\
+  --store-id $OPENFGA_STORE_ID \\
+  --api-token $OPENFGA_API_TOKEN
+```
+
+**Phase progression (documented in the bead's description for the loop):**
+- Phase 1: run once at first deploy + once per `auth/` edit during dev.
+- Phase 3: the per-tenant provisioning job invokes this binary as a subprocess.
+- Phase 4: the composer emits per-tenant seed JSONs and runs the CLI per emitted tenant.
+
+**Acceptance:**
+- `cargo build --bin fga_seed` succeeds.
+- Run against testcontainers OpenFGA + a fresh store: model loads, tuples write, verify checks pass, exit code 0.
+- `--dry-run` flag prints planned writes without applying them.
+- Idempotent: running twice produces zero net change (the FGA `write` API accepts already-existing tuples as no-ops per its spec; we tolerate `tuple already exists` errors silently in this CLI).
+- Output respects `--quiet` for CI-friendly mode; default is human-readable progress.
+- `crates/{{api_crate}}/Cargo.toml` declares the bin target: `[[bin]] name = "fga_seed" path = "src/bin/fga_seed.rs"`.
+"""
+
+[steps.testPlan]
+file = "crates/{{api_crate}}/tests/bin/fga_seed.rs"
+cases = 4
+coverage = "binary loads model + seed against testcontainers OpenFGA; second run is idempotent; --dry-run does not call write_tuples; --quiet suppresses progress output"
+
+# =============================================================================
+# Secret handling (INDEPENDENT BRANCH — touches-secrets escalation)
+# =============================================================================
+
+[[steps]]
+id = "secret-handling"
+title = "OpenFGA: provision deployment + wire store_id + api_token from secret store"
+type = "feature"
+priority = 1
+labels = ["touches-secrets"]
+files = [
+  "crates/{{api_crate}}/src/adapters/secrets/fga.rs",
+  "infra/terraform/modules/ecs-openfga/main.tf",
+  "infra/terraform/modules/secrets/fga.tf",
+]
+description = """
+Wire OpenFGA store ID + API token from the chosen secret store (AWS Secrets Manager per ADR 0003) into the FgaClient at boot. Provision the OpenFGA sidecar deployment on the same ECS cluster as the Rust API per ADR 0003 §Decision 6 (Phase 1 topology).
+
+**Why this is a separate step on its own branch (per integration-http convention):**
+- Every other step ships using a hardcoded test store_id + token against a local OpenFGA from testcontainers.
+- This step blocks for human decision on the OpenFGA deployment topology + secret provisioning (`touches-secrets` escalation per docs/ESCALATION_RULES.md).
+- Putting it on its own dep branch means the model + client + trait + CLI + integration tests all ship in parallel while the human deploys OpenFGA.
+
+**Escalation: /build-next BLOCKS on `touches-secrets`. The human must:**
+
+1. **Provision the OpenFGA deployment.** Phase 1 default per ADR 0003: sidecar container on the same ECS task as the Rust API. The Terraform module `infra/terraform/modules/ecs-openfga/main.tf` declares this. Alternatively (operator's call): OpenFGA Cloud — change the base_url; topology is otherwise the same.
+2. **Create the OpenFGA store** (via `openfga store create --name smbuild-phase-1`) — capture the returned `OPENFGA_STORE_ID`.
+3. **Generate an API token** (Phase 1: pre-shared key; Phase 3+: per-tenant API tokens). Capture as `OPENFGA_API_TOKEN`.
+4. **Run the `fga_seed` binary** (from the `fga-tuple-management-cli` step) once against the new store to load the model + initial tuples. Capture the returned `OPENFGA_AUTHORIZATION_MODEL_ID` — the runtime sends this on every check to pin the model version.
+5. **Decide rotation policy:** API token rotation cadence (Phase 1 default: manual quarterly + documented runbook; Phase 2 automates).
+6. **Decide failure mode** when OpenFGA is unreachable at runtime: fail-closed (return 503 on every authenticated request) vs fail-static (return 503 only on mutating requests; allow read-only via a cached "owner can read everything" allowlist). Phase 1 default: fail-closed always. Per tiebreaker #1 security floor.
+
+**Acceptance (after the human unblocks):**
+- `crates/{{api_crate}}/src/adapters/secrets/fga.rs` exports `pub async fn load_fga_config(client: &SecretsManagerClient) -> Result<FgaConfig, SecretError>` returning `{ base_url, store_id, api_token: SecretString, authorization_model_id }`.
+- `FgaClient::new(...)` reads from the loaded config at boot.
+- `infra/terraform/modules/ecs-openfga/main.tf` defines the sidecar container, its container port, a PG database backing FGA's tuple store (Phase 1 shares the application RDS; Phase 3 splits).
+- `infra/terraform/modules/secrets/fga.tf` declares the Secrets Manager entries for `OPENFGA_STORE_ID`, `OPENFGA_API_TOKEN`, `OPENFGA_AUTHORIZATION_MODEL_ID`, `OPENFGA_BASE_URL`.
+- The api_token NEVER appears in logs, traces, error messages, or telemetry — verified by audit of `Display`/`Debug` impls (`secrecy::SecretString`).
+- Missing-secret path: fail-closed crash with exit code 78 (EX_CONFIG) and a single structured log line `secret_load_failed{ name = "OPENFGA_API_TOKEN" }`.
+- No test in this repo uses a real production token; tests use a fake `SecretsManagerClient` returning canned fake values.
+"""
+
+# =============================================================================
+# Integration test (real testcontainers OpenFGA + real Postgres + real model)
+# =============================================================================
+
+[[steps]]
+id = "integration-test"
+title = "OpenFGA: end-to-end ReBAC integration test (real OpenFGA via testcontainers)"
+type = "feature"
+priority = 3
+needs = ["fga-model-file", "fga-rust-client", "authorized-handler-trait", "fga-tuple-management-cli"]
+files = [
+  "crates/{{api_crate}}/tests/integration/fga_authz.rs",
+]
+description = """
+End-to-end test of the ReBAC chokepoint against REAL components — no mocks. T-14 forbids mocking OpenFGA when we are testing our OPENFGA integration.
+
+**Fixtures:**
+- `testcontainers-rs` Postgres 16 with SMBuild migrations applied.
+- `testcontainers-rs` OpenFGA (the official `openfga/openfga:latest` image) wired to the test PG.
+- The `fga_seed` binary loaded with `{{model_path}}` and a multi-tenant test seed (extends `{{seed_path}}` with a second tenant + a second tech, sufficient to test cross-tenant isolation + cross-tech isolation).
+
+**Assertions:**
+1. **Owner can read+write any resource in their tenant.** Owner of tenant A -> check(Customer.Create) = allow -> AuthorizedHandle constructs -> write executes.
+2. **Tech can read job assigned to them.** Tech1 assigned to job1 in tenant A -> check(JobAction::View, job1) = allow.
+3. **Tech CANNOT write to a job assigned to a different tech.** Tech1 not assigned to job2 -> check(JobAction::Complete, job2) = deny -> `AuthzError::Denied`, AuthorizedHandle does NOT construct, `.write()` never runs.
+4. **Cross-tenant attempts return 404, not 403** (no auth leak via 403-vs-404 distinction — leaking "this resource exists but you can't see it" is itself an information disclosure per OWASP). User from tenant A -> check(JobAction::View, job_from_tenant_B) -> the handler returns 404 (resource not found in the user's tenant scope), never 403.
+5. **`list_objects` correctly scopes:** owner of tenant A querying customers -> returns only tenant A's customer IDs.
+6. **Invoice is owner-only:** Tech1 -> check(InvoiceAction::Send, invoice1) = deny, even when assigned to the same job that produced the invoice.
+7. **Tuple deletion works through the CLI:** delete an assignment tuple -> tech1 -> check(JobAction::View, job1) flips to deny.
+
+**Why a full OpenFGA in CI (per T-14):**
+The whole point of OpenFGA is the relation-resolution engine — that's the third-party behavior we're integrating with. Mocking it would mean we're testing our test fixture, not our authz. testcontainers-rs runs the real Go binary in a container; CI runtime cost is ~5s per test invocation (the FGA container is reused across tests in a session via `Lazy`).
+
+**Acceptance:**
+- All 7 assertions above pass against the real OpenFGA + Postgres testcontainers.
+- `cargo nextest run -p {{api_crate}} --test fga_authz` exits 0.
+- Runtime under 30s on a developer laptop after first container start.
+- No flakiness over 100 consecutive runs.
+"""
+
+[steps.testPlan]
+file = "crates/{{api_crate}}/tests/integration/fga_authz.rs"
+cases = 7
+coverage = "owner can write any tenant-A resource; tech can read job assigned to them; tech cannot write to job assigned to other tech (AuthorizedHandle construction fails); cross-tenant access returns 404 not 403; list_objects scopes to user's tenant; invoice send is owner-only; deleting assignment tuple flips check from allow to deny"

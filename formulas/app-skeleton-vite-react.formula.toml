@@ -1,0 +1,486 @@
+# app-skeleton-vite-react: the frontend half of the SMBuild repo standard.
+#
+# Lives under frontend/ (NOT at repo root). The Cargo workspace owns the root;
+# this formula populates the React SPA that is served by the Rust API behind
+# CloudFront. Stack pinned to ADR 0003 (Titanium):
+#   Vite + React 19 + strict TS + TanStack Router + TanStack Query +
+#   @connectrpc/connect-web + @connectrpc/connect-query + RHF + Zod +
+#   shadcn/ui (copy-in) + Tailwind v4 + Vitest + Playwright + Biome.
+#
+# Use case: pour AFTER app-skeleton-rust-cargo (the workspace + frontend/ dir
+# must exist) and BEFORE any frontend feature beads (crud-feature with
+# include_ui=true, page formula).
+#
+# Out of scope:
+# - The generated TS Connect client (frontend/src/gen/) — that's the
+#   grpc-tonic-service formula's job; this skeleton creates the directory and
+#   the transport-config boilerplate, but the actual generated code lands when
+#   the .proto files are written and buf generate runs.
+# - Auth UI — the Zitadel OIDC redirect flow lands in the oidc-client-rust /
+#   integration-http (zitadel) beads, not here.
+# - Routing for specific features — TanStack Router file-based routing scaffold
+#   is set up, but feature routes are added by their own beads.
+#
+# Dependency-graph note:
+# - init-frontend-dir creates the frontend/ tree (assumes app-skeleton-rust-cargo
+#   already put the placeholder there).
+# - vite-react-bootstrap runs `pnpm create vite` into frontend/.
+# - install-deps adds every ADR-0003-pinned package in one shot.
+# - tailwind-v4-config / shadcn-copy-in / tanstack-router-setup / connect-query-setup
+#   / biome-config / vitest-config / playwright-config all depend on install-deps
+#   and run in parallel.
+# - ci-frontend is the join point.
+
+formula = "app-skeleton-vite-react"
+description = """
+Initialize the React + Vite + TanStack + Connect-Web + shadcn/ui + Tailwind v4 +
+Vitest + Playwright + Biome frontend under frontend/ inside an existing Cargo
+workspace. Pins ADR 0003 Titanium stack exactly.
+"""
+type = "workflow"
+version = 1
+
+[vars.app_name]
+description = "App name (kebab-case; used in frontend/package.json name field and in window.document.title)."
+required = true
+
+[vars.node_version]
+description = "Node major version pinned in .nvmrc and package.json engines (e.g. '22')."
+default = "22"
+
+[vars.package_manager]
+description = "Package manager (pnpm | npm | yarn). pnpm is the default per Titanium ADR."
+default = "pnpm"
+
+# =============================================================================
+# Frontend directory init
+# =============================================================================
+
+[[steps]]
+id = "init-frontend-dir"
+title = "Initialize frontend/ subdirectory for {{app_name}}"
+type = "chore"
+priority = 1
+files = [
+  "frontend/.nvmrc",
+  "frontend/.gitignore",
+]
+description = """
+The Cargo workspace's app-skeleton-rust-cargo formula already placed a frontend/
+placeholder (.gitkeep). This step replaces the placeholder with real files: an
+.nvmrc pinning Node {{node_version}}, and a frontend-local .gitignore covering
+node_modules/, dist/, .vite/, coverage/, playwright-report/, test-results/.
+
+**Acceptance:**
+- `frontend/.nvmrc` contains `{{node_version}}` and nothing else
+- `frontend/.gitignore` covers node_modules/, dist/, .vite/, coverage/,
+  playwright-report/, test-results/, *.log, .env.local
+- The placeholder `frontend/.gitkeep` is removed if it existed
+- `node --version` matches frontend/.nvmrc once nvm/fnm/volta is told to read it
+"""
+
+# =============================================================================
+# Vite + React + TS bootstrap
+# =============================================================================
+
+[[steps]]
+id = "vite-react-bootstrap"
+title = "Bootstrap Vite + React 19 + strict TS into frontend/"
+type = "chore"
+priority = 1
+needs = ["init-frontend-dir"]
+files = [
+  "frontend/package.json",
+  "frontend/tsconfig.json",
+  "frontend/tsconfig.node.json",
+  "frontend/vite.config.ts",
+  "frontend/index.html",
+  "frontend/src/main.tsx",
+  "frontend/src/App.tsx",
+  "frontend/src/vite-env.d.ts",
+]
+description = """
+Run `{{package_manager}} create vite@latest frontend -- --template react-ts` (or
+equivalent invocation that places files into the existing frontend/ dir without
+clobbering .nvmrc and .gitignore). Then upgrade React + TS to strict mode.
+
+**Modifications after Vite template lands:**
+- `package.json` name set to `"{{app_name}}-web"`; engines.node = `">={{node_version}}"`; engines.{{package_manager}} = the relevant minimum
+- `package.json` scripts include: `dev`, `build`, `preview`, `lint`, `test`, `e2e`, `typecheck` (where `typecheck` runs `tsc --noEmit`)
+- `tsconfig.json` strict = true; noUncheckedIndexedAccess = true; exactOptionalPropertyTypes = true; moduleResolution = "bundler"; target = "ES2022"
+- React version pinned to `^19` in package.json (the template may default to 18)
+- `vite.config.ts` includes @vitejs/plugin-react and a `server.proxy` block stub
+  (commented; later filled when Connect-Web client lands)
+
+**Acceptance:**
+- `{{package_manager}} install --frozen-lockfile` succeeds from frontend/
+- `{{package_manager}} run typecheck` exits 0
+- `{{package_manager}} run build` produces frontend/dist/index.html
+- `{{package_manager}} run dev` starts a server on port 5173 and serves index.html (smoke: GET / returns 200 in < 2s, then Ctrl-C)
+- React is version >= 19.0.0 per `{{package_manager}} list react`
+"""
+
+# =============================================================================
+# Install ADR-0003-pinned dependencies (all in one shot)
+# =============================================================================
+
+[[steps]]
+id = "install-deps"
+title = "Install Titanium-stack pinned deps (TanStack + Connect + RHF + Zod + Tailwind v4 + Biome + Vitest + Playwright)"
+type = "chore"
+priority = 1
+needs = ["vite-react-bootstrap"]
+files = [
+  "frontend/package.json",
+  "frontend/pnpm-lock.yaml",
+  "frontend/package-lock.json",
+  "frontend/yarn.lock",
+]
+description = """
+Install every package ADR 0003 pins, in one `{{package_manager}} add` invocation per category to keep the lockfile churn predictable.
+
+**Runtime deps:**
+- `@tanstack/react-router`, `@tanstack/router-devtools`, `@tanstack/router-vite-plugin`
+- `@tanstack/react-query`, `@tanstack/react-query-devtools`
+- `@connectrpc/connect`, `@connectrpc/connect-web`, `@connectrpc/connect-query`
+- `@bufbuild/protobuf`
+- `react-hook-form`, `@hookform/resolvers`
+- `zod`
+- `tailwindcss@^4`, `@tailwindcss/vite`
+- `class-variance-authority`, `clsx`, `tailwind-merge`  (shadcn/ui prerequisites)
+- `lucide-react` (shadcn/ui icon family)
+- `@radix-ui/react-slot`, `@radix-ui/react-dialog` (shadcn primitives used by the starter components)
+
+**Dev deps:**
+- `@biomejs/biome`
+- `vitest`, `@vitest/ui`, `jsdom`, `@testing-library/react`, `@testing-library/jest-dom`, `@testing-library/user-event`
+- `@playwright/test`
+- `@types/node`, `@types/react`, `@types/react-dom`
+
+**Acceptance:**
+- `{{package_manager}} install --frozen-lockfile` exits 0 from frontend/
+- `{{package_manager}} list @tanstack/react-router @connectrpc/connect-web tailwindcss zod react-hook-form @biomejs/biome vitest @playwright/test` reports all installed and resolves a single version per package
+- Lockfile is committed (pnpm-lock.yaml | package-lock.json | yarn.lock)
+- frontend/package.json devDependencies + dependencies are split correctly (runtime in deps, test/lint in devDeps)
+"""
+
+# =============================================================================
+# Tailwind v4 — CSS-first config (no tailwind.config.js)
+# =============================================================================
+
+[[steps]]
+id = "tailwind-v4-config"
+title = "Configure Tailwind v4 (CSS-first; no tailwind.config.js)"
+type = "chore"
+priority = 2
+needs = ["install-deps"]
+files = [
+  "frontend/src/index.css",
+  "frontend/vite.config.ts",
+  "frontend/postcss.config.js",
+]
+description = """
+Tailwind v4 uses the new CSS-first config — no tailwind.config.js. The plugin
+goes in vite.config.ts and the theme tokens live in src/index.css.
+
+**frontend/src/index.css must:**
+- Start with `@import "tailwindcss";`
+- Declare a `@theme` block with the shadcn/ui-compatible CSS variables (--background, --foreground, --card, --border, --primary, --primary-foreground, --secondary, --muted, --accent, --destructive, --ring, --radius). Pick neutral defaults matching T-22 (professional, warm, not enterprise — Jobber / Housecall Pro register, not Salesforce, not glassmorphism).
+- Include `@layer base { :root { ...same vars in HSL... } }` for shadcn's runtime token reads.
+
+**frontend/vite.config.ts must:**
+- Import `tailwindcss from "@tailwindcss/vite"` and add it to the plugins array
+
+**No tailwind.config.js / no tailwind.config.ts** — v4 abolishes the JS config in favor of CSS-first. If `tailwind.config.*` exists at this step's start, the builder deletes it.
+
+**Acceptance:**
+- `{{package_manager}} run build` succeeds and `dist/assets/*.css` contains the expected Tailwind utilities (smoke: `grep "color-scheme" dist/assets/*.css`)
+- `{{package_manager}} run dev` serves with hot-reloaded Tailwind classes (apply `class="bg-primary text-primary-foreground"` to a dev-only div, save, see the color change)
+- No `tailwind.config.js` or `tailwind.config.ts` exists at repo paths
+"""
+
+# =============================================================================
+# shadcn/ui copy-in (Button + Dialog starter)
+# =============================================================================
+
+[[steps]]
+id = "shadcn-copy-in"
+title = "Initialize shadcn/ui (copy-in) and add starter Button + Dialog components"
+type = "chore"
+priority = 2
+needs = ["install-deps", "tailwind-v4-config"]
+files = [
+  "frontend/components.json",
+  "frontend/src/components/ui/button.tsx",
+  "frontend/src/components/ui/dialog.tsx",
+  "frontend/src/lib/utils.ts",
+]
+description = """
+shadcn/ui is copy-in, not a library dependency (T-5 longevity per ADR 0003).
+Run the CLI to write components.json, then add a starter Button + Dialog so the
+pattern is established for follow-on feature beads.
+
+**Step actions:**
+- Run `{{package_manager}} dlx shadcn@latest init --yes` (or equivalent) targeting
+  frontend/. Accept defaults; component style = "new-york" (default), tailwind
+  CSS variables = true.
+- After init, run `{{package_manager}} dlx shadcn@latest add button dialog`.
+- Verify the CLI wrote `frontend/src/lib/utils.ts` (cn helper) and the two
+  component files.
+
+**components.json must:**
+- `style: "new-york"`
+- `tsx: true`
+- `tailwind.config: ""` (v4 — no JS config)
+- `tailwind.css: "src/index.css"`
+- `tailwind.cssVariables: true`
+- `aliases.components: "@/components"`
+- `aliases.utils: "@/lib/utils"`
+
+**Acceptance:**
+- frontend/src/components/ui/button.tsx exports a `Button` component
+- frontend/src/components/ui/dialog.tsx exports `Dialog`, `DialogTrigger`, `DialogContent`, `DialogHeader`, `DialogTitle`, `DialogDescription`, `DialogFooter`, `DialogClose`
+- frontend/src/lib/utils.ts exports `cn(...inputs: ClassValue[]): string`
+- `{{package_manager}} run typecheck` exits 0
+- `{{package_manager}} run build` exits 0
+"""
+
+# =============================================================================
+# TanStack Router (file-based routing scaffold)
+# =============================================================================
+
+[[steps]]
+id = "tanstack-router-setup"
+title = "Wire TanStack Router (file-based routing, devtools, root layout)"
+type = "chore"
+priority = 2
+needs = ["install-deps"]
+files = [
+  "frontend/src/main.tsx",
+  "frontend/src/routes/__root.tsx",
+  "frontend/src/routes/index.tsx",
+  "frontend/src/routeTree.gen.ts",
+  "frontend/vite.config.ts",
+]
+description = """
+Configure TanStack Router's file-based routing for {{app_name}}.
+
+**Step actions:**
+- Add `TanStackRouterVite` plugin to vite.config.ts plugins array (BEFORE the react plugin)
+- Create `src/routes/__root.tsx` exporting a `Route` from `createRootRoute` that
+  renders an `<Outlet />` inside a placeholder root layout. Include
+  `<TanStackRouterDevtools />` gated on `import.meta.env.DEV`.
+- Create `src/routes/index.tsx` as the home route, with a placeholder "Hello,
+  {{app_name}}" component.
+- Update `src/main.tsx` to:
+  - import the generated `routeTree` from `./routeTree.gen.ts`
+  - create the router via `createRouter({ routeTree })`
+  - render `<RouterProvider router={router} />` instead of `<App />`
+  - keep the StrictMode wrapper
+- After the file edits, run `{{package_manager}} run build` so the
+  TanStackRouterVite plugin generates `routeTree.gen.ts` from the routes/ dir.
+
+**Acceptance:**
+- `frontend/src/routeTree.gen.ts` exists and is auto-generated (committed; .gitignore must NOT include it because TanStack Router commits the gen file)
+- `{{package_manager}} run typecheck` exits 0 (the generated routeTree has full type info)
+- `{{package_manager}} run dev` serves `/` returning the home route's content
+- Devtools panel appears in dev mode (smoke check: `console.log` from devtools is reachable)
+"""
+
+# =============================================================================
+# Connect-Query transport stub (real client lands when .proto files exist)
+# =============================================================================
+
+[[steps]]
+id = "connect-query-setup"
+title = "Wire @connectrpc/connect-web transport + QueryClientProvider (placeholder; real client lands with grpc-tonic-service)"
+type = "chore"
+priority = 2
+needs = ["install-deps", "tanstack-router-setup"]
+files = [
+  "frontend/src/lib/transport.ts",
+  "frontend/src/lib/queryClient.ts",
+  "frontend/src/main.tsx",
+  "frontend/src/gen/.gitkeep",
+]
+description = """
+Set up the @connectrpc/connect-web transport + TanStack Query client so feature
+beads can start consuming generated service stubs the moment they land. The
+actual generated TS lives in `frontend/src/gen/` — populated by buf generate
+runs scheduled by the grpc-tonic-service formula. This step creates the
+directory placeholder, not the generated code.
+
+**Step actions:**
+- Create `src/lib/transport.ts` that exports a `transport` built via
+  `createGrpcWebTransport({ baseUrl: import.meta.env.VITE_API_BASE_URL ?? "/api" })`.
+- Create `src/lib/queryClient.ts` that exports a new `QueryClient` with sensible
+  defaults: `{ defaultOptions: { queries: { staleTime: 30_000, refetchOnWindowFocus: false } } }`.
+- Update `src/main.tsx` to wrap `<RouterProvider />` with
+  `<QueryClientProvider client={queryClient}>` and `<TransportProvider transport={transport}>`
+  from `@connectrpc/connect-query`.
+- Create `frontend/src/gen/.gitkeep` so the generated-output directory exists for
+  the buf-generate target.
+
+**Acceptance:**
+- `{{package_manager}} run typecheck` exits 0
+- `{{package_manager}} run build` exits 0
+- `frontend/src/gen/` exists and tracks a `.gitkeep` (so buf generate has somewhere to write)
+- A `// TODO(grpc-tonic-service): import service hooks from src/gen` comment is
+  present in src/main.tsx near the QueryClientProvider so the follow-on bead's
+  edit point is obvious
+"""
+
+# =============================================================================
+# Biome config (lint + format; replaces ESLint + Prettier)
+# =============================================================================
+
+[[steps]]
+id = "biome-config"
+title = "Configure Biome (lint + format)"
+type = "chore"
+priority = 2
+needs = ["install-deps"]
+files = [
+  "frontend/biome.json",
+  "frontend/package.json",
+]
+description = """
+Biome replaces ESLint + Prettier in one tool for {{app_name}}'s frontend.
+
+**frontend/biome.json must:**
+- `$schema`: "./node_modules/@biomejs/biome/configuration_schema.json"
+- `vcs.enabled`: true, `vcs.clientKind`: "git", `vcs.useIgnoreFile`: true
+- `files.ignore`: ["dist", "node_modules", "src/gen", "src/routeTree.gen.ts", "coverage", "playwright-report"]
+- `formatter`: enabled, indentStyle "space", indentWidth 2, lineWidth 100
+- `linter`: enabled, recommended rules on, `correctness.noUnusedVariables` error, `style.useImportType` error, `suspicious.noExplicitAny` error
+- `javascript.formatter.quoteStyle`: "double", `trailingCommas`: "all", `semicolons`: "always"
+
+**frontend/package.json scripts must add (or update):**
+- `"lint": "biome check ."`
+- `"format": "biome format --write ."`
+- `"lint:ci": "biome ci ."`
+
+**Acceptance:**
+- `{{package_manager}} run lint` exits 0 on the current tree (or non-zero with documented findings if pre-existing files violate; if non-zero, fix the findings as part of this step)
+- `{{package_manager}} run lint:ci` is suitable for CI (non-interactive, exits non-zero on any finding)
+- Generated zones (src/gen, src/routeTree.gen.ts) are excluded from Biome (T-7 closed-grammar: generated code is not lint-able)
+"""
+
+# =============================================================================
+# Vitest config
+# =============================================================================
+
+[[steps]]
+id = "vitest-config"
+title = "Configure Vitest with jsdom + Testing Library + smoke test"
+type = "chore"
+priority = 2
+needs = ["install-deps"]
+files = [
+  "frontend/vitest.config.ts",
+  "frontend/vitest.setup.ts",
+  "frontend/src/__tests__/smoke.test.tsx",
+]
+description = """
+Wire Vitest with jsdom environment, React Testing Library, and one smoke test.
+
+**frontend/vitest.config.ts must:**
+- `test.environment`: "jsdom"
+- `test.setupFiles`: ["./vitest.setup.ts"]
+- `test.globals`: true
+- `test.css`: true
+- `resolve.alias`: { "@": "./src" } so @/ imports work in tests as in app code
+
+**frontend/vitest.setup.ts must:**
+- import `@testing-library/jest-dom/vitest`
+
+**frontend/src/__tests__/smoke.test.tsx must:**
+- One test: `renders without crashing` — mounts `<Button>Hi</Button>` (the shadcn Button), asserts the text is in the document.
+
+**Acceptance:**
+- `{{package_manager}} run test` exits 0 with 1 test passing
+- `{{package_manager}} run test -- --coverage` produces a coverage report (smoke; threshold not enforced yet)
+- The smoke test references the shadcn Button so it would FAIL if shadcn-copy-in
+  was poured without running (acts as a downstream verification of shadcn-copy-in)
+"""
+
+[steps.testPlan]
+file = "frontend/src/__tests__/smoke.test.tsx"
+cases = 1
+coverage = "Button renders with provided children text"
+
+# =============================================================================
+# Playwright config
+# =============================================================================
+
+[[steps]]
+id = "playwright-config"
+title = "Configure Playwright with one home-route smoke test"
+type = "chore"
+priority = 2
+needs = ["install-deps", "tanstack-router-setup"]
+files = [
+  "frontend/playwright.config.ts",
+  "frontend/e2e/home.spec.ts",
+]
+description = """
+Set up Playwright with one E2E smoke test against the home route.
+
+**Step actions:**
+- Run `{{package_manager}} exec playwright install chromium` to download the browser
+- Write `playwright.config.ts` with:
+  - `testDir`: "./e2e"
+  - `webServer`: { command: "{{package_manager}} run dev", url: "http://localhost:5173", reuseExistingServer: !process.env.CI, timeout: 30_000 }
+  - `use.baseURL`: "http://localhost:5173"
+  - `projects`: [{ name: "chromium", use: devices["Desktop Chrome"] }, { name: "mobile", use: devices["Pixel 7"] }]
+- Write `e2e/home.spec.ts`: navigate to `/`, assert the page contains "Hello, {{app_name}}" (the placeholder text from tanstack-router-setup)
+
+**Acceptance:**
+- `{{package_manager}} run e2e` (defined as `playwright test`) exits 0 with 2 passing tests (one chromium, one mobile)
+- Playwright HTML report is written under playwright-report/ (in .gitignore)
+- The mobile project uses Pixel 7 viewport — confirms T-4 (mobile-first) discipline is built into the skeleton's E2E
+"""
+
+# =============================================================================
+# Frontend CI workflow
+# =============================================================================
+
+[[steps]]
+id = "ci-frontend"
+title = "Add frontend CI workflow (typecheck + lint + test + build + e2e)"
+type = "chore"
+priority = 3
+needs = [
+  "biome-config",
+  "vitest-config",
+  "playwright-config",
+  "tailwind-v4-config",
+  "shadcn-copy-in",
+  "connect-query-setup",
+]
+files = [
+  ".github/workflows/ci-frontend.yml",
+]
+description = """
+GitHub Actions workflow for {{app_name}}'s frontend. Separate from the Rust ci.yml because the trigger paths differ (frontend changes shouldn't trigger Rust CI and vice versa).
+
+**.github/workflows/ci-frontend.yml must:**
+- Trigger on push to main and pull_request, with `paths: ["frontend/**", ".github/workflows/ci-frontend.yml"]`
+- Set up Node {{node_version}} via `actions/setup-node@v4` with `cache: "{{package_manager}}"` and `cache-dependency-path: frontend/{{package_manager}}-lock.yaml` (or the equivalent lockfile name)
+- For pnpm: install via `pnpm/action-setup@v3`
+- Run jobs in this order from frontend/:
+  1. `{{package_manager}} install --frozen-lockfile`
+  2. `{{package_manager}} run typecheck`
+  3. `{{package_manager}} run lint:ci`
+  4. `{{package_manager}} run test`
+  5. `{{package_manager}} run build`
+  6. `{{package_manager}} exec playwright install --with-deps chromium`
+  7. `{{package_manager}} run e2e`
+- Upload `playwright-report/` as an artifact on failure
+- Add a "(keep in sync with frontend/package.json scripts)" comment at the top
+
+**Acceptance:**
+- The yaml parses; `act -W .github/workflows/ci-frontend.yml -j build` reports the job graph cleanly
+- Path filters exclude crates/, contracts/, db/, etc. — pushing a Rust-only change does not trigger this workflow
+- Step ordering matches the typical fail-fast Jankurai inner-loop order (typecheck and lint fail before tests run)
+"""

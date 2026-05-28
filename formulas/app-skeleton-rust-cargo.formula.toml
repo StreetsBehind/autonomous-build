@@ -1,0 +1,378 @@
+# app-skeleton-rust-cargo: the first formula poured for any Rust + Cargo-workspace app.
+#
+# Sets up the Jankurai-native Cargo workspace skeleton: workspace.toml with
+# default-members + workspace.metadata.agent, crates/ placeholder, agent/ directory
+# (workspace.yaml, boundaries.toml, proof-lanes.toml, generated-zones.toml,
+# baselines/main.repo-score.json), rust-toolchain.toml, .config/nextest.toml,
+# rustfmt.toml, clippy.toml, deny.toml (banned crates: diesel, sea-orm, actix-web,
+# rocket, warp, async-std), CI workflow (fmt + clippy + deny + nextest + buf lint),
+# CLAUDE.md + AGENTS.md, README, .gitignore (Rust + Vite + Terraform).
+#
+# Use case: pour this BEFORE app-skeleton-vite-react (frontend lives in frontend/
+# inside the workspace) and BEFORE any crud-feature / grpc-tonic-service / migration
+# beads (those depend on the crates/, contracts/, db/, agent/ skeleton existing).
+#
+# Out of scope:
+# - Individual crates (smbuild-api, smbuild-audit, smbuild-money, etc.) — those are
+#   created by their own beads / formulas. This skeleton creates an empty crates/
+#   directory with a .gitkeep so the workspace member list is editable.
+# - sqlx configuration — db/migrations/ exists but sqlx-cli wiring belongs in the
+#   migration / first-crate beads.
+# - buf.yaml / buf.gen.yaml — contracts/proto/ exists but buf configuration lives
+#   in the grpc-tonic-service formula.
+# - Frontend — see app-skeleton-vite-react.
+#
+# Dependency-graph note:
+# - init-repo blocks every other step (creates the root).
+# - workspace-config + lint-deny + nextest-config + agent-metadata + readme +
+#   claude-md run in parallel after init-repo.
+# - ci is the join point: needs workspace-config + lint-deny + nextest-config so
+#   the CI yaml references real tools.
+
+formula = "app-skeleton-rust-cargo"
+description = """
+Initialize a Rust + Cargo-workspace app with Jankurai-native conventions:
+workspace.metadata.agent, crates/, agent/ directory, rust-toolchain, nextest,
+rustfmt, clippy, cargo-deny (banned crates), CI (fmt + clippy + deny + nextest +
+buf lint), CLAUDE.md, README. Frontend (frontend/) and individual crates land via
+follow-on formulas.
+"""
+type = "workflow"
+version = 1
+
+[vars.app_name]
+description = "Application name (kebab-case, e.g. smbuild). Used in Cargo.toml workspace, README, CLAUDE.md."
+required = true
+
+[vars.rust_toolchain_channel]
+description = "Rust toolchain channel pinned in rust-toolchain.toml (e.g. 'stable', 'stable-2026-05-15', '1.85.0'). T-11 deterministic builds."
+default = "stable"
+
+[vars.rust_edition]
+description = "Rust edition for workspace.package (e.g. '2024', '2021')."
+default = "2024"
+
+# =============================================================================
+# Repo skeleton — root files + empty directory tree
+# =============================================================================
+
+[[steps]]
+id = "init-repo"
+title = "Initialize {{app_name}} Cargo-workspace repo structure"
+type = "chore"
+priority = 1
+files = [
+  ".gitignore",
+  "crates/.gitkeep",
+  "contracts/proto/.gitkeep",
+  "db/migrations/.gitkeep",
+  "db/queries/.gitkeep",
+  "composer/grammar/v1/.gitkeep",
+  "frontend/.gitkeep",
+  "auth/.gitkeep",
+  "infra/terraform/.gitkeep",
+  "agent/.gitkeep",
+  "ops/.gitkeep",
+  "docs/decisions/.gitkeep",
+  ".sqlx/.gitkeep",
+]
+description = """
+Create the Jankurai-native Cargo-workspace directory tree for {{app_name}}.
+
+**Directory layout (per ADR 0003 in any consuming project):**
+- `crates/` — ARC units; empty placeholder (individual crates poured by later beads)
+- `contracts/proto/` — Protobuf source of truth; placeholder
+- `db/migrations/` + `db/queries/` — sqlx-cli forward-only migrations; placeholders
+- `composer/grammar/v1/` — closed-grammar JSON Schema; placeholder
+- `frontend/` — Vite + React SPA (filled by app-skeleton-vite-react); placeholder
+- `auth/` — Zitadel + OpenFGA config; placeholder
+- `infra/terraform/` — IaC; placeholder
+- `agent/` — agent metadata (workspace.yaml, boundaries.toml, etc.); filled by `agent-metadata` step
+- `.sqlx/` — sqlx offline query metadata cache; placeholder
+
+**.gitignore must cover:**
+- Rust: `/target`, `**/*.rs.bk`, `Cargo.lock` is NOT ignored (T-11)
+- Vite/Node: `node_modules/`, `dist/`, `.vite/`, `*.log`
+- Terraform: `.terraform/`, `*.tfstate`, `*.tfstate.backup`, `.terraform.lock.hcl` is NOT ignored
+- Editors: `.idea/`, `.vscode/`, `*.swp`, `.DS_Store`
+
+**Acceptance:**
+- All listed directories exist with `.gitkeep` files so git tracks them
+- `.gitignore` covers Rust + Vite + Terraform patterns above
+- `git status` shows a clean tree after initial commit
+- `git ls-files` lists every directory's .gitkeep
+"""
+
+# =============================================================================
+# Workspace Cargo.toml + Cargo.lock + rust-toolchain
+# =============================================================================
+
+[[steps]]
+id = "workspace-config"
+title = "Author Cargo workspace root for {{app_name}}"
+type = "chore"
+priority = 1
+needs = ["init-repo"]
+files = [
+  "Cargo.toml",
+  "Cargo.lock",
+  "rust-toolchain.toml",
+]
+description = """
+Write the workspace-root Cargo.toml + rust-toolchain.toml, then run `cargo generate-lockfile` so Cargo.lock is committed from day one (T-11).
+
+**Cargo.toml must contain:**
+- `[workspace]` with `resolver = "2"`, `default-members = []` (empty until crates land), `members = []`
+- `[workspace.package]` with `edition = "{{rust_edition}}"`, `rust-version = "1.85"`, `license = "Proprietary"`
+- `[workspace.metadata.agent]` block carrying the Jankurai validation order, slow_members, shared_contracts, ci_profiles, instruction_roots — exactly as ADR 0003 shows. Use empty arrays where there's nothing yet (slow_members, members). Populate validation_order with:
+  - "cargo fmt --check"
+  - "cargo clippy --workspace --all-targets -- -D warnings"
+  - "cargo deny check"
+  - "cargo nextest run --workspace"
+  - "cargo test --workspace --doc"
+  - "buf lint contracts/"
+  - "buf breaking --against '.git#branch=main' contracts/"
+- shared_contracts = ["contracts/proto/", "composer/grammar/v1/"]
+- ci_profiles = ["pr-fast", "main-full"]
+- instruction_roots = ["AGENTS.md", "CLAUDE.md", ".github/copilot-instructions.md"]
+
+**rust-toolchain.toml must contain:**
+- `[toolchain]` with `channel = "{{rust_toolchain_channel}}"`, `components = ["rustfmt", "clippy", "rust-src"]`, `profile = "default"`
+
+**Acceptance:**
+- `cargo --version` runs the channel pinned in rust-toolchain.toml (rustup auto-installs if needed)
+- `cargo metadata --format-version 1 --no-deps` exits 0 and reports the workspace
+- `cargo generate-lockfile` produces Cargo.lock; both Cargo.toml and Cargo.lock are committed
+- `Cargo.lock` is NOT in .gitignore (T-11 reproducibility)
+"""
+
+# =============================================================================
+# agent/ metadata directory (Jankurai HLT-002, HLT-003, HLT-022)
+# =============================================================================
+
+[[steps]]
+id = "agent-metadata"
+title = "Write agent/ metadata files (workspace.yaml, boundaries, proof-lanes, generated-zones, baseline)"
+type = "chore"
+priority = 1
+needs = ["init-repo"]
+files = [
+  "agent/workspace.yaml",
+  "agent/boundaries.toml",
+  "agent/proof-lanes.toml",
+  "agent/generated-zones.toml",
+  "agent/baselines/main.repo-score.json",
+]
+description = """
+Author Jankurai's agent/ metadata files for {{app_name}}.
+
+**agent/workspace.yaml** — mirrors workspace.metadata.agent in human-editable YAML, plus app-name + phase tracking:
+- app_name: {{app_name}}
+- phase: 1
+- validation_order: (same list as Cargo.toml)
+- slow_members: []
+- shared_contracts: [contracts/proto/, composer/grammar/v1/]
+
+**agent/boundaries.toml** — Jankurai HLT-003/HLT-022 layer-boundary declarations:
+- `[boundary.crates-to-frontend]` shared = ["contracts/proto/"], rule = "wire-only; no Rust types cross"
+- `[boundary.crates-to-infra]` shared = [], rule = "Terraform reads ECR image tags only"
+- `[boundary.audit-write]` allowed_callers = ["crates/smbuild-audit"], rule = "no direct INSERT INTO audit_chain outside this crate" (T-9; enforced by cargo-deny path-ban in deny.toml)
+
+**agent/proof-lanes.toml** — Jankurai proof-lane declarations:
+- `[lane.fast]` order = ["cargo fmt --check", "cargo clippy", "cargo nextest run"]
+- `[lane.boundary]` order = ["buf lint", "buf breaking --against .git#branch=main", "cargo sqlx prepare --check"]
+- `[lane.witness]` order = ["jankurai audit . --changed-fast", "jankurai witness"]
+
+**agent/generated-zones.toml** — Jankurai HLT-002 generated-zone declarations (sets up the table; specific entries land when grammar + proto formulas pour):
+- `[zones]` zones = []  (empty array; later beads append)
+
+**agent/baselines/main.repo-score.json** — initial Jankurai baseline:
+- `{}` (empty object; first `jankurai witness` populates it)
+
+**Acceptance:**
+- All five files exist and parse as their declared format (YAML / TOML / JSON)
+- `python -c "import yaml; yaml.safe_load(open('agent/workspace.yaml'))"` exits 0 (or equivalent yamllint pass)
+- `cat agent/boundaries.toml | python -c "import sys, tomllib; tomllib.loads(sys.stdin.read())"` exits 0
+- `jq . agent/baselines/main.repo-score.json` exits 0
+"""
+
+# =============================================================================
+# Lint, format, deny (Jankurai negative-space at compile time)
+# =============================================================================
+
+[[steps]]
+id = "lint-deny"
+title = "Configure rustfmt + clippy + cargo-deny (banned crates + license posture)"
+type = "chore"
+priority = 1
+needs = ["init-repo"]
+files = [
+  "rustfmt.toml",
+  "clippy.toml",
+  "deny.toml",
+]
+description = """
+Wire up the Rust lint chain for {{app_name}}.
+
+**rustfmt.toml** — opinionated defaults:
+- edition = "{{rust_edition}}"
+- max_width = 100
+- use_small_heuristics = "Max"
+- group_imports = "StdExternalCrate"
+- imports_granularity = "Crate"
+
+**clippy.toml** — Jankurai complexity budget:
+- cognitive-complexity-threshold = 25
+- too-many-arguments-threshold = 6
+- type-complexity-threshold = 250
+
+**deny.toml** — Jankurai negative-space enforcement (per ADR 0003 §deny.toml):
+- `[graph]` all-features = true
+- `[advisories]` vulnerability = "deny", unmaintained = "warn", yanked = "deny"
+- `[licenses]` allow = ["MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-3-Clause", "BSD-2-Clause", "ISC", "Unicode-DFS-2016", "Zlib"]; copyleft = "deny"; confidence-threshold = 0.92
+- `[bans]` multiple-versions = "warn"; deny = [
+    { name = "diesel", version = "*" },
+    { name = "sea-orm", version = "*" },
+    { name = "actix-web", version = "*" },
+    { name = "rocket", version = "*" },
+    { name = "warp", version = "*" },
+    { name = "async-std", version = "*" },
+  ]
+- `[sources]` unknown-registry = "deny", unknown-git = "deny", allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+**Acceptance:**
+- `cargo fmt --check` exits 0 against the empty workspace
+- `cargo clippy --workspace --all-targets -- -D warnings` exits 0 against the empty workspace
+- `cargo deny check` exits 0 against the empty workspace (no advisories, no banned crates yet)
+- Adding `diesel = "*"` as a dependency in a test crate makes `cargo deny check` exit non-zero (smoke-verify the ban rule on a throwaway branch, then revert)
+"""
+
+# =============================================================================
+# Nextest config
+# =============================================================================
+
+[[steps]]
+id = "nextest-config"
+title = "Configure cargo-nextest (.config/nextest.toml)"
+type = "chore"
+priority = 2
+needs = ["init-repo"]
+files = [
+  ".config/nextest.toml",
+]
+description = """
+Configure cargo-nextest for {{app_name}}. nextest is Rust's parallel test runner — much faster than `cargo test` for large workspaces and the de facto choice for Jankurai validation order.
+
+**.config/nextest.toml must contain:**
+- `[profile.default]` retries = 0, fail-fast = false, slow-timeout = { period = "60s", terminate-after = 3 }
+- `[profile.ci]` inherits from default, retries = 2, junit.path = "target/nextest/ci/junit.xml"
+- `[profile.pr-fast]` test-threads = "num-cpus", retries = 0, fail-fast = true
+
+**Acceptance:**
+- `cargo nextest run --workspace` exits 0 against the empty workspace (no tests, but exits clean — nextest reports "Starting 0 tests")
+- `cargo nextest run --profile ci --workspace` produces a junit.xml at the configured path
+
+**Note:** `cargo nextest` must be installable from the same toolchain as `cargo` — if it isn't on the host yet, the builder installs it via `cargo install cargo-nextest --locked` BEFORE running the acceptance check.
+"""
+
+# =============================================================================
+# CI (the join point — references real tools from prior steps)
+# =============================================================================
+
+[[steps]]
+id = "ci"
+title = "Add CI workflow (fmt + clippy + deny + nextest + buf lint)"
+type = "chore"
+priority = 2
+needs = ["workspace-config", "lint-deny", "nextest-config", "agent-metadata"]
+files = [
+  ".github/workflows/ci.yml",
+]
+description = """
+GitHub Actions workflow for {{app_name}}'s full Rust validation order on push and PR.
+
+**.github/workflows/ci.yml must:**
+- Trigger on `push` to main and `pull_request`
+- Use `dtolnay/rust-toolchain@stable` (or the channel pinned in rust-toolchain.toml — actions/setup auto-reads it)
+- Cache `~/.cargo/registry`, `~/.cargo/git`, `target/` via Swatinem/rust-cache
+- Install cargo-nextest and cargo-deny via `taiki-e/install-action`
+- Run steps in this order (matching workspace.metadata.agent.validation_order):
+  1. `cargo fmt --check`
+  2. `cargo clippy --workspace --all-targets -- -D warnings`
+  3. `cargo deny check`
+  4. `cargo nextest run --workspace --profile ci`
+  5. `cargo test --workspace --doc`
+  6. `buf lint contracts/` (only if `contracts/proto/` has any .proto files; gated by `if: hashFiles('contracts/proto/**/*.proto') != ''`)
+  7. `buf breaking --against '.git#branch=main' contracts/` (same gate)
+- Upload `target/nextest/ci/junit.xml` as an artifact
+
+**Acceptance:**
+- `.github/workflows/ci.yml` parses as valid YAML
+- `act -j build` (or equivalent local runner) reports the job graph without error
+- The job graph references the same commands that appear in workspace.metadata.agent.validation_order — drift between Cargo.toml and ci.yml is the most common Jankurai violation; comment in ci.yml MUST say "keep in sync with [workspace.metadata.agent] in Cargo.toml"
+"""
+
+# =============================================================================
+# README + CLAUDE.md + AGENTS.md (navigational; reference tenets + ADRs)
+# =============================================================================
+
+[[steps]]
+id = "readme"
+title = "Write {{app_name}} README"
+type = "chore"
+priority = 3
+needs = ["init-repo"]
+files = ["README.md"]
+description = """
+Author the project README for {{app_name}}.
+
+**README.md must include:**
+- One-line description of what {{app_name}} is
+- "## Stack" section linking to docs/decisions/0003-titanium-stack.md
+- "## Build" section: `rustup show` (reads rust-toolchain.toml), `cargo build --workspace`, `cargo nextest run --workspace`
+- "## Test" section: full validation order (mirrors workspace.metadata.agent)
+- "## Layout" section: tree of crates/, contracts/, db/, composer/, frontend/, auth/, infra/ with one-line purpose each
+- "## Tenets" section linking to tenets.md
+- No marketing copy. No emoji. T-22: professional, warm, not enterprise.
+
+**Acceptance:**
+- README.md exists at repo root
+- Markdown lints clean (`markdownlint README.md` or equivalent; OK to skip if no linter available)
+- Every internal link (`./docs/decisions/...`, `./tenets.md`) resolves to an existing file or has a "(filled in later)" annotation
+"""
+
+[[steps]]
+id = "claude-md"
+title = "Write CLAUDE.md + AGENTS.md navigational files"
+type = "chore"
+priority = 3
+needs = ["init-repo"]
+files = ["CLAUDE.md", "AGENTS.md"]
+description = """
+Author the navigational files Claude Code and the autonomous-build loop read on every session.
+
+**CLAUDE.md must:**
+- Open with "Read `tenets.md` first. It is this project's constitution."
+- Link to: tenets.md, plan.md, vision.md, docs/decisions/ (every ADR)
+- "## Project layout" section: one-line per top-level directory
+- "## Validation order" section: copy from `[workspace.metadata.agent].validation_order`
+- "## Banned" section: list deny.toml's banned crates with one-line reason each
+- "## Hot paths" section: per-crate `package.metadata.agent.purpose` (TBD — populated as crates land)
+- KEEP IT UNDER 200 LINES. CLAUDE.md is navigational, not encyclopedic.
+
+**AGENTS.md must:**
+- Be a near-symlink to CLAUDE.md (most agents read AGENTS.md as the canonical name)
+- One line at top: "See CLAUDE.md — this file mirrors it for agents that read AGENTS.md by convention."
+- Then literally include the same content (or `cat CLAUDE.md > AGENTS.md` at write time)
+
+**Acceptance:**
+- Both files exist at repo root
+- CLAUDE.md references tenets.md and at least one ADR by relative path
+- Each referenced file path exists or is annotated "(filled in later by formula X)"
+- `wc -l CLAUDE.md` reports < 200 lines (navigational, not encyclopedic)
+"""
+
+[steps.testPlan]
+file = "tests/skeleton.smoke"
+cases = 4
+coverage = "cargo fmt --check exits 0; cargo clippy --workspace --all-targets -- -D warnings exits 0; cargo deny check exits 0; cargo nextest run --workspace exits 0"

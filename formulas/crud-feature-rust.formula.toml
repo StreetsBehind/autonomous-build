@@ -1,0 +1,520 @@
+# crud-feature-rust: full CRUD vertical slice for one entity on the Titanium stack.
+#
+# End-to-end through: proto -> migration -> sqlx queries -> tonic service impl ->
+# OpenFGA tuples -> React (TanStack Router + connect-query) list + form pages ->
+# tonic integration test -> cross-tenant isolation test.
+#
+# Use AFTER:
+# - app-skeleton-rust-cargo has run (Cargo workspace + crates/* layout + agent/*)
+# - app-skeleton-vite-react has run (frontend/ Vite + connect-web + shadcn)
+# - composer-grammar-version (v=1) has run (tenant.schema.json + defs/*)
+# - migration: 000001_init has applied (universal schema + audit_chain + metadata
+#   tables; per ADR 0002 Phase-1 directive items 2/3/4/5/6)
+#
+# Out of scope for v1 — each is a separate follow-on formula:
+# - Bulk import / CSV upload of an entity: crud-feature-rust-bulk-import
+# - Soft-delete + restore semantics: crud-feature-rust-soft-delete
+# - Audit-log surface in the UI (read of audit_chain rows): audit-ui-rust
+# - Custom-field admin UI for the entity (Phase 4 composer territory)
+# - Server-side full-text search beyond the GIN on custom_fields
+#
+# Dependency-graph design (critical):
+#   proto-def ──┬── sqlx-queries ── tonic-service-impl ──┬── tonic-integration-test
+#               │                                        ├── cross-tenant-isolation-test
+#               │                                        ├── frontend-list-page
+#               │                                        └── frontend-form-page
+#               └── (migration runs in parallel with sqlx-queries on same dep)
+#   migration ── sqlx-queries
+#   openfga-tuples (independent — Phase 1 trades-seed wiring; runs in parallel)
+#
+# Phase-1 directive items (ADR 0002, non-negotiable):
+#   #4 — every extensible entity carries custom_fields JSONB from day 1 (this
+#        formula encodes that in the migration step's acceptance)
+#   #6 — every entity proto message carries `map<string, google.protobuf.Value>
+#        extensions = N;` (encoded in proto-def acceptance — Phase 1 reads none
+#        of it but it is mandatory to ship)
+#   #11 — universal physical schema across all tenants of v{N}; per-tenant
+#        DDL is a T-11 violation; no entity-conditional ALTER TABLE allowed
+#
+# Tenets engaged: T-3 (templatable), T-6 (metadata-driven), T-7 (closed
+# grammar), T-8 (multi-tenant isolation), T-11 (deterministic), T-14 (proof
+# not assertion). The cross-tenant-isolation-test step is the per-entity
+# proof of T-8.
+
+formula = "crud-feature-rust"
+description = """
+Full CRUD vertical slice for one entity on the Titanium stack (Rust + tonic + sqlx + OpenFGA + React/connect-query): proto, migration with RLS + custom_fields JSONB, sqlx queries, tonic service impl with AuthorizedHandler gate, OpenFGA tuple seed, list + form pages, integration test, cross-tenant isolation test.
+"""
+type = "workflow"
+version = 1
+
+[vars.entity]
+description = "Entity name in PascalCase (e.g. Customer, Property, Job). Used in proto service/message names, Rust type names, and React component names."
+required = true
+
+[vars.entity_plural]
+description = "Plural in PascalCase (e.g. Customers, Properties, Jobs). Used in service Verb names (ListCustomers) and React route feature names."
+required = true
+
+[vars.entity_snake]
+description = "Entity in snake_case (e.g. customer, property, job). Used in proto filename, migration filename, sqlx queries filename, transport module filename, and DB table name. Pre-transformed at pour time because bd has no string filters."
+required = true
+
+[vars.entity_snake_plural]
+description = "Plural in snake_case (e.g. customers, properties, jobs). Used in DB table name (TitaniumCRUD uses plural tables) and React feature directory name."
+required = true
+
+[vars.fields]
+description = "Comma-separated field definitions in the form name:type — same syntax as crud-feature.formula.toml. Types: string, text, citext, int, bigint, numeric, bool, timestamptz, jsonb, date. Suffix ? for nullable (e.g. notes:text?). FKs use fk:<target_snake> (e.g. customer_id:fk:customer). tenant_id, id, created_at, updated_at, custom_fields are added automatically by the migration step and MUST NOT appear here."
+required = true
+
+[vars.requires_auth]
+description = "If true, every RPC requires a verified Zitadel JWT and every mutating RPC implements AuthorizedHandler (compile-time fga.check before write). Phase 1 Customer/Property/Job/Invoice/Inventory: true. Internal-only entities: false."
+default = "true"
+
+[vars.include_ui]
+description = "If false, skip frontend-list-page and frontend-form-page (backend-only feature, e.g. an internal admin entity). Phase 1 all entities: true."
+default = "true"
+
+[vars.fga_relations]
+description = "Comma-separated OpenFGA relations seeded for this entity in auth/fga-tuples-seed.json. Default trades-seed: owner has full relations, tech has assigned relation on jobs. Override per-entity (e.g. for Invoice: 'owner_full,tech_view')."
+default = "owner_full,tech_assigned"
+
+# =============================================================================
+# Contracts layer — proto definition (the wire boundary, T-7)
+# =============================================================================
+
+[[steps]]
+id = "proto-def"
+title = "{{entity}}: proto service + messages with extensions map"
+type = "feature"
+priority = 1
+files = [
+  "contracts/proto/smbuild/v1/{{entity_snake}}.proto",
+]
+description = """
+Author the protobuf service + message types for {{entity}}.
+
+**Service shape** (must match exactly):
+```
+service {{entity}}Service {
+  rpc Create{{entity}}(Create{{entity}}Request) returns (Create{{entity}}Response);
+  rpc Get{{entity}}(Get{{entity}}Request) returns (Get{{entity}}Response);
+  rpc List{{entity_plural}}(List{{entity_plural}}Request) returns (List{{entity_plural}}Response);
+  rpc Update{{entity}}(Update{{entity}}Request) returns (Update{{entity}}Response);
+  rpc Delete{{entity}}(Delete{{entity}}Request) returns (Delete{{entity}}Response);
+}
+```
+
+**Entity message shape** (Phase-1 directive item 6 from ADR 0002 — non-negotiable):
+The `{{entity}}` message carries every field from the `fields` var as a typed
+proto field PLUS `map<string, google.protobuf.Value> extensions = N;` at the
+tail. The extensions slot is how Phase 4's composer adds custom_fields to the
+wire without a contract bump.
+
+**Acceptance:**
+- File written at `contracts/proto/smbuild/v1/{{entity_snake}}.proto`
+- `syntax = "proto3";` and `package smbuild.v1;` at the top
+- Imports `google/protobuf/struct.proto` (for `google.protobuf.Value`) and `google/protobuf/timestamp.proto` (for `created_at`/`updated_at`)
+- `{{entity}}` message declares: `string id = 1;`, `string tenant_id = 2;`, the field-typed projections of `{{fields}}`, `google.protobuf.Timestamp created_at`, `google.protobuf.Timestamp updated_at`, and `map<string, google.protobuf.Value> extensions = N;` as the LAST field (N = last index + 1)
+- `Create{{entity}}Request` carries the create-time subset (no id, no tenant_id, no created_at/updated_at — tenant_id is sourced from the JWT-derived TenantCtx server-side, NEVER from the wire)
+- `Get{{entity}}Request` carries `string id = 1;`
+- `List{{entity_plural}}Request` carries pagination: `int32 page_size = 1; string page_token = 2;`
+- `List{{entity_plural}}Response` carries `repeated {{entity}} items = 1; string next_page_token = 2;`
+- `Update{{entity}}Request` carries `string id = 1;` plus the updatable subset of fields (no tenant_id — RLS enforces it)
+- `Delete{{entity}}Request` carries `string id = 1;`; `Delete{{entity}}Response` is empty
+- `buf lint contracts/` passes
+- `buf breaking --against '.git#branch=main' contracts/` passes (new service is not a breaking change; this verifies we did not accidentally rename or narrow an existing field)
+"""
+
+# =============================================================================
+# Data layer — migration + sqlx queries
+# =============================================================================
+
+[[steps]]
+id = "migration"
+title = "{{entity}}: schema migration (tenant_id + RLS + custom_fields JSONB)"
+type = "feature"
+priority = 1
+labels = ["needs-decision"]
+files = [
+  "db/migrations/*_add_{{entity_snake}}.up.sql",
+  "db/migrations/*_add_{{entity_snake}}.down.sql",
+]
+description = """
+Author the forward-only sqlx-cli migration for `{{entity_snake_plural}}`.
+
+**Phase-1 directive items (ADR 0002, non-negotiable — every Phase 1 migration MUST include all of these or block):**
+- `tenant_id ULID NOT NULL` column (item #4 — multi-tenancy floor; T-8)
+- `custom_fields JSONB NOT NULL DEFAULT '{}'` with `CHECK (jsonb_typeof(custom_fields) = 'object')` (item #4 — composer hook; T-7)
+- RLS policy `CREATE POLICY {{entity_snake_plural}}_tenant_isolation ON {{entity_snake_plural}} USING (tenant_id = current_setting('app.current_tenant_id')::uuid)` plus `ALTER TABLE {{entity_snake_plural}} ENABLE ROW LEVEL SECURITY; ALTER TABLE {{entity_snake_plural}} FORCE ROW LEVEL SECURITY;`
+- Universal columns: `id ULID PRIMARY KEY DEFAULT gen_random_ulid()`, `tenant_id`, `created_at timestamptz NOT NULL DEFAULT now()`, `updated_at timestamptz NOT NULL DEFAULT now()`
+- Entity columns: every field from `{{fields}}` with the exact Postgres types declared in the fields-var contract (string -> text, citext -> citext, int -> integer, bigint -> bigint, numeric -> numeric, bool -> boolean, timestamptz -> timestamptz, date -> date; suffix `?` -> NOT NULL omitted; `fk:<target>` -> references `<target_plural>(id)`)
+- Indices: btree on `(tenant_id, id)`, btree on every FK column, GIN on `custom_fields` (jsonb_path_ops — enables Phase 4 queryable custom fields without re-migration)
+- Foreign keys for every `fk:` entry in `{{fields}}` with `ON DELETE RESTRICT` and a matching tenant-scoped composite FK is NOT required (RLS handles cross-tenant prevention; the FK is plain `REFERENCES customers(id)` because both rows are inside the same RLS scope)
+- `updated_at` auto-update trigger using the standard `set_updated_at()` function (which 000001_init defines)
+
+**Down migration:**
+- Drops the table, indices, RLS policy. DROP TABLE CASCADE handles indices; explicit DROP POLICY before DROP TABLE.
+- No data preservation: this is a Phase 1 fresh-DB migration. `touches_existing_data` is false.
+
+**Acceptance:**
+- `db/migrations/<NNNNNN>_add_{{entity_snake}}.up.sql` and `.down.sql` created with sequential numeric prefix continuing from 000001
+- `sqlx migrate run` against a fresh testcontainers Postgres exits 0
+- After up: `\\d+ {{entity_snake_plural}}` shows tenant_id NOT NULL, custom_fields JSONB NOT NULL DEFAULT '{}'::jsonb with the typeof check, and the RLS policy
+- After up: `SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = '{{entity_snake_plural}}'` returns (t, t)
+- After down: `\\dt {{entity_snake_plural}}` returns no rows
+- Round-trip (up -> down -> up) is idempotent
+
+**Escalation:**
+`needs-decision` label is treated as fresh-DB auto-approve (touches_existing_data=false). If the builder discovers production data exists in this environment, BLOCK and escalate per docs/ESCALATION_RULES.md.
+"""
+
+[[steps]]
+id = "sqlx-queries"
+title = "{{entity}}: sqlx named queries + offline cache"
+type = "feature"
+priority = 2
+needs = ["migration"]
+files = [
+  "db/queries/{{entity_snake}}.sql",
+  ".sqlx/**",
+]
+description = """
+Write the named queries the tonic service impl consumes via `sqlx::query_file!`
+and `sqlx::query_file_as!` macros (the macros verify these queries against a
+real Postgres at compile time — T-14 proof not assertion).
+
+**File shape** (sqlx-cli's `query.sql` convention with `-- name:` comments):
+```
+-- name: Get{{entity}}ByID :one
+SELECT id, tenant_id, <fields>, custom_fields, created_at, updated_at
+FROM {{entity_snake_plural}}
+WHERE id = $1;
+
+-- name: List{{entity_plural}} :many
+SELECT id, tenant_id, <fields>, custom_fields, created_at, updated_at
+FROM {{entity_snake_plural}}
+WHERE ($1::ulid IS NULL OR id > $1)
+ORDER BY id ASC
+LIMIT $2;
+
+-- name: Create{{entity}} :one
+INSERT INTO {{entity_snake_plural}} (id, tenant_id, <fields>, custom_fields)
+VALUES (gen_random_ulid(), current_setting('app.current_tenant_id')::uuid, <placeholders>, COALESCE($N, '{}'::jsonb))
+RETURNING id, tenant_id, <fields>, custom_fields, created_at, updated_at;
+
+-- name: Update{{entity}} :one
+UPDATE {{entity_snake_plural}}
+SET <field>=COALESCE($K, <field>), ..., updated_at = now()
+WHERE id = $1
+RETURNING id, tenant_id, <fields>, custom_fields, created_at, updated_at;
+
+-- name: Delete{{entity}} :execrows
+DELETE FROM {{entity_snake_plural}}
+WHERE id = $1;
+```
+
+Note: the queries do NOT include `AND tenant_id = $X` clauses. RLS enforces
+tenant_id = current_setting('app.current_tenant_id') automatically at the DB
+layer — adding it in the query is a T-8 violation pattern (suggests the app
+layer is the isolation boundary; it is not).
+
+**Acceptance:**
+- `db/queries/{{entity_snake}}.sql` exists with the five named queries above (Create, Get, List, Update, Delete)
+- Each query is a single statement (sqlx::query_file! is one-statement-per-file-or-name)
+- Queries reference only columns the migration defined; no SELECT *
+- `cargo sqlx prepare --workspace -- --bin smbuild-api` succeeds against a fresh testcontainers Postgres (writes `.sqlx/query-<hash>.json` per macro invocation)
+- The generated `.sqlx/query-*.json` files for these queries are committed (offline cache; CI runs `SQLX_OFFLINE=true cargo check`)
+- `cargo sqlx prepare --check` reports the cache is in sync after this step
+"""
+
+[steps.testPlan]
+file = "db/queries/{{entity_snake}}.sql"
+cases = 5
+coverage = "Get{{entity}}ByID returns row by id; List{{entity_plural}} paginates with cursor; Create{{entity}} inserts and returns; Update{{entity}} applies COALESCE partial update; Delete{{entity}} removes by id"
+
+# =============================================================================
+# Service layer — tonic impl with AuthorizedHandler gate
+# =============================================================================
+
+[[steps]]
+id = "tonic-service-impl"
+title = "{{entity}}: tonic service impl (AuthorizedHandler + RLS via TenantCtx)"
+type = "feature"
+priority = 2
+needs = ["proto-def", "sqlx-queries"]
+files = [
+  "crates/smbuild-api/src/transport/{{entity_snake}}.rs",
+  "crates/smbuild-api/src/transport/mod.rs",
+]
+description = """
+Implement the generated tonic service trait `{{entity}}Service` from
+`smbuild_proto::v1::{{entity_snake}}_service_server::{{entity}}Service`.
+
+**Wiring requirements (T-3, T-6, T-8, T-9 enforced at compile time):**
+
+1. The impl struct holds an `Arc<PgPool>` and an `Arc<FgaClient>`. No globals.
+
+2. Every method extracts `TenantCtx` from the Axum extension layer (set by
+   `TenantCtxLayer` upstream from the Zitadel JWT's tenant claim) and, inside
+   a single sqlx transaction, runs:
+   `sqlx::query!("SELECT set_config('app.current_tenant_id', $1, true)", tenant_ctx.tenant_id.to_string())`
+   BEFORE issuing the entity query. This makes RLS active for the transaction.
+
+3. Every MUTATING method (`Create*`, `Update*`, `Delete*`) implements the
+   `AuthorizedHandler` trait — a marker trait whose blanket impl requires
+   `.check(user, action, resource)` against OpenFGA BEFORE any DB write. The
+   trait shape (defined in crates/smbuild-api/src/application/authz.rs by an
+   earlier bead — depend on it):
+   ```
+   #[async_trait]
+   pub trait AuthorizedHandler {
+       async fn check(&self, user: &UserId, action: &str, resource: &str) -> Result<(), AuthzError>;
+       async fn write<F, Fut, T>(&self, user: &UserId, action: &str, resource: &str, f: F) -> Result<T, HandlerError>
+       where F: FnOnce() -> Fut + Send, Fut: Future<Output = Result<T, sqlx::Error>> + Send;
+   }
+   ```
+   Calling `pool.execute(...)` directly without going through `.write()` is a
+   cargo-deny path-banned pattern (see deny.toml in ADR 0003) — equivalent to
+   a compile-time error for the autonomous loop.
+
+4. Every LIST method calls `fga.list_objects(user, "view", "{{entity_snake}}:*")`
+   and intersects with the RLS-scoped query result before returning. The
+   intersection is server-side in Rust, not as a SQL WHERE clause (FGA's
+   object set is the source of truth for intra-tenant authz).
+
+5. `Create{{entity}}Request` does NOT carry tenant_id on the wire (per proto-def
+   acceptance); tenant_id is sourced from `tenant_ctx.tenant_id` server-side.
+   Any code that reads tenant_id from the wire is a T-8 violation and the bead
+   blocks.
+
+6. Errors map per tonic convention: `sqlx::Error::RowNotFound` -> `Status::not_found`,
+   `AuthzError::Denied` -> `Status::permission_denied`, validation error ->
+   `Status::invalid_argument`, anything else -> `Status::internal` with a
+   tracing span carrying the underlying error (T-18 plain English: the user-
+   facing message does NOT leak the internal error; the trace ID does).
+
+7. Append the service to the router in `crates/smbuild-api/src/transport/mod.rs`
+   via `add_service({{entity_snake}}_service_server::{{entity}}ServiceServer::new(impl))`.
+
+**Acceptance:**
+- File written at `crates/smbuild-api/src/transport/{{entity_snake}}.rs` implementing the generated trait
+- `crates/smbuild-api/src/transport/mod.rs` registers the service on the router
+- `cargo clippy -p smbuild-api --all-targets -- -D warnings` passes
+- `cargo check -p smbuild-api` passes (sqlx macros compile against `.sqlx/` cache from sqlx-queries step)
+- Every mutating method's body shows the `.write(user, action, resource, || async { ... })` call wrapping the DB operation (visible in code review; AuthorizedHandler trait would block compile otherwise)
+- No raw `pool.execute("INSERT INTO {{entity_snake_plural}} ...")` or `sqlx::query!("INSERT...")` outside the `.write()` closure (cargo-deny path-ban enforced; if pattern is detected, block)
+- No `tenant_id` parameter read from the request proto in any method (server-side only)
+"""
+
+[steps.testPlan]
+file = "crates/smbuild-api/src/transport/{{entity_snake}}.rs"
+cases = 0
+coverage = "Behavioral coverage lives in tonic-integration-test and cross-tenant-isolation-test steps; this is the impl, not the test."
+
+# =============================================================================
+# Authorization seed — OpenFGA tuples for the entity
+# =============================================================================
+
+[[steps]]
+id = "openfga-tuples"
+title = "{{entity}}: append trades-seed FGA tuples"
+type = "feature"
+priority = 2
+needs = ["proto-def"]
+files = [
+  "auth/fga-tuples-seed.json",
+]
+description = """
+Append starter relation tuples to `auth/fga-tuples-seed.json` so the trades
+reference tenant's owner and tech roles can reach `{{entity_snake}}:*` objects
+through the FGA model.
+
+**Trades-seed shape** (relation values come from {{fga_relations}}):
+For `fga_relations = "owner_full,tech_assigned"`:
+```
+{ "user": "role:owner",  "relation": "owner",          "object": "{{entity_snake}}:*" }
+{ "user": "role:tech",   "relation": "assigned_tech",  "object": "{{entity_snake}}:*" }  // only for entities where techs work on instances
+```
+
+The FGA model (auth/fga-model.fga, authored by openfga-model formula) defines
+which relations exist for which object types. This step seeds the TUPLES that
+let the trades reference tenant exercise the model.
+
+**Acceptance:**
+- `auth/fga-tuples-seed.json` exists (created by an earlier openfga-model bead; if not, BLOCK and escalate)
+- File is valid JSON, top-level shape `{"tuples": [...]}`
+- For each relation in `{{fga_relations}}`, one tuple is appended scoped to `{{entity_snake}}:*`
+- Append is idempotent: re-running this step produces no duplicate tuples (dedupe by exact triple match)
+- The seed loader in crates/smbuild-api/src/adapters/fga/seed.rs reads this file successfully on tenant boot (verified by an existing seed-loader test; if loader test does not exist, that is openfga-model's bug, not this step's — but flag in the bead body)
+"""
+
+# =============================================================================
+# Frontend layer — list page + form page (skipped when include_ui=false)
+# =============================================================================
+
+[[steps]]
+id = "frontend-list-page"
+title = "{{entity_plural}}: React list page (TanStack + connect-query)"
+type = "feature"
+priority = 3
+needs = ["tonic-service-impl"]
+labels = ["ui"]
+files = [
+  "frontend/src/features/{{entity_snake_plural}}/ListPage.tsx",
+  "frontend/src/features/{{entity_snake_plural}}/routes.ts",
+  "frontend/src/app/router.tsx",
+]
+description = """
+Author the list page for {{entity_plural}}, mobile-first per T-4.
+
+**Stack wiring:**
+- Uses `useList{{entity_plural}}Query` from `frontend/src/gen/smbuild/v1/{{entity_snake}}-{{entity_plural}}Service_connectquery.ts` (generated by protoc-gen-connect-query against the proto from proto-def)
+- shadcn/ui `Table` (Radix-backed; copied into frontend/src/ui/ by the frontend skeleton)
+- TanStack Router file-based route registered in `frontend/src/features/{{entity_snake_plural}}/routes.ts` and wired in `frontend/src/app/router.tsx` at path `/{{entity_snake_plural}}`
+- TanStack Query handles loading/error/empty states
+- T-2: column headers are vertical-native; for Phase 1 trades they are the literal English labels — wired via the metadata-driven `useLabels('{{entity_snake}}')` hook (reads from EntityFieldDefinition table). The list MUST NOT hardcode English label strings; it reads them from the labels hook (T-6).
+
+**Acceptance:**
+- File written at `frontend/src/features/{{entity_snake_plural}}/ListPage.tsx`
+- Route registered at `/{{entity_snake_plural}}` in TanStack Router
+- Page calls `useList{{entity_plural}}Query` with page_size = 50; supports cursor-driven "Load more"
+- Empty state, loading state, error state all rendered (per shadcn Table conventions)
+- Mobile-first: at <640px the table collapses into stacked rows (verify via Playwright viewport=360 in ui-tests step or in the E2E walkthrough)
+- `pnpm tsc --noEmit` from frontend/ passes
+- `pnpm vitest run frontend/src/features/{{entity_snake_plural}}` (if a smoke test exists) passes
+- Zero hardcoded English label strings in the JSX — every label comes from `useLabels('{{entity_snake}}')` or a generated proto field-name (T-2)
+"""
+
+[steps.testPlan]
+file = "frontend/src/features/{{entity_snake_plural}}/ListPage.test.tsx"
+cases = 4
+coverage = "list renders empty state when query returns 0 items; list renders loading state; list renders rows from successful query; list renders error state on query failure"
+
+[[steps]]
+id = "frontend-form-page"
+title = "{{entity}}: React create/edit form (RHF + Zod)"
+type = "feature"
+priority = 3
+needs = ["tonic-service-impl"]
+labels = ["ui"]
+files = [
+  "frontend/src/features/{{entity_snake_plural}}/FormPage.tsx",
+  "frontend/src/features/{{entity_snake_plural}}/{{entity_snake}}Schema.ts",
+]
+description = """
+Author the create/edit form for {{entity}}.
+
+**Stack wiring:**
+- React Hook Form (`useForm`) with Zod resolver
+- Zod schema in `frontend/src/features/{{entity_snake_plural}}/{{entity_snake}}Schema.ts` mirrors the proto's create/update request shape. For Phase 1 the schema is hand-written and kept in lockstep with the proto; a follow-on formula (proto-to-zod-codegen) will generate it once protoc-gen-es-zod stabilizes.
+- shadcn/ui `Form`, `Input`, `Select`, `Textarea` components (copied in by frontend skeleton)
+- On submit: calls `useCreate{{entity}}Mutation` or `useUpdate{{entity}}Mutation` from the generated connect-query hooks; on success navigates to ListPage
+- Field labels come from `useLabels('{{entity_snake}}')` — T-6, T-2: zero hardcoded English in JSX
+- Validation errors surface inline per RHF convention; server errors (RPC Status.invalid_argument) surface at the form level
+
+**Acceptance:**
+- File written at `frontend/src/features/{{entity_snake_plural}}/FormPage.tsx`
+- Zod schema written at `frontend/src/features/{{entity_snake_plural}}/{{entity_snake}}Schema.ts` mirroring the proto's create-request shape
+- Route registered for both `/{{entity_snake_plural}}/new` and `/{{entity_snake_plural}}/$id/edit`
+- Form validates required fields client-side via Zod before submit; submit short-circuits on validation failure
+- Successful submit navigates to `/{{entity_snake_plural}}` and the new row appears in the list (verified at the e2e level; this step's tests assert RHF/Zod wiring only)
+- `pnpm tsc --noEmit` passes
+- Zero hardcoded English label strings (T-2 enforced via build-time grep)
+"""
+
+[steps.testPlan]
+file = "frontend/src/features/{{entity_snake_plural}}/FormPage.test.tsx"
+cases = 4
+coverage = "form validates required fields client-side (submit blocked when invalid); form submits via Create mutation on valid input; form surfaces server validation errors; form surfaces transport errors with a remediation message per T-18"
+
+# =============================================================================
+# Backend test layer — tonic integration test against testcontainers Postgres
+# =============================================================================
+
+[[steps]]
+id = "tonic-integration-test"
+title = "{{entity}}: tonic integration test (Create->Get->List->Update->Delete with RLS active)"
+type = "feature"
+priority = 2
+needs = ["tonic-service-impl"]
+files = [
+  "crates/smbuild-api/tests/{{entity_snake}}_crud.rs",
+]
+description = """
+Full CRUD round-trip integration test against a real Postgres provisioned by
+testcontainers-rs (T-14 proof not assertion — no DB mocks, no sqlx stubs).
+
+**Test setup:**
+- testcontainers-rs spins Postgres 16 with `pgcrypto`, `citext`, `pg_trgm`, `pgvector` extensions enabled (matches RDS Phase 1 config in plan.md)
+- Applies all migrations via `sqlx::migrate!("./db/migrations")`
+- Boots a single test tenant: inserts a Tenant row in the control-plane equivalent and one Membership; sets `app.current_tenant_id` via the TenantCtx tower layer driven by a hand-issued test JWT
+- Spawns the Axum server on a random port; uses tonic's generated client to dial it (`{{entity}}ServiceClient::connect(...)`)
+- OpenFGA: uses a real OpenFGA container OR (if openfga-rs test-fixture exists) an in-memory FGA store. The trades-seed tuples from the openfga-tuples step are loaded; the test's user has the `role:owner` mapping so all RPCs are authorized.
+
+**Test cases:**
+1. Create: `Create{{entity}}` with valid request -> returns `{{entity}}` with non-empty id, tenant_id matching the test tenant, created_at/updated_at populated, extensions empty
+2. Get: `Get{{entity}}` with the created id -> returns the same row
+3. List: insert two more rows via Create; `List{{entity_plural}}` returns all three ordered by id
+4. List pagination: `List{{entity_plural}}` with page_size=2 -> returns 2 items + non-empty page_token; passing the token returns the third
+5. Update: `Update{{entity}}` with a partial body -> returns updated row; subsequent Get reflects the change; updated_at > created_at
+6. Delete: `Delete{{entity}}` with the id -> returns empty response; subsequent Get returns `Status::not_found`
+7. Validation: `Create{{entity}}` with a required field omitted -> returns `Status::invalid_argument`
+
+**Acceptance:**
+- File written at `crates/smbuild-api/tests/{{entity_snake}}_crud.rs`
+- `cargo nextest run -p smbuild-api --test {{entity_snake}}_crud` passes
+- Test does NOT mock the DB, the FGA client, or the JWT verifier (T-14)
+- Test container reuse: marked with `#[cfg_attr(feature = "testcontainers-reuse", reuse)]` per the workspace's nextest profile (so the container is shared across all entity tests on the same nextest run, keeping the inner loop fast)
+"""
+
+[steps.testPlan]
+file = "crates/smbuild-api/tests/{{entity_snake}}_crud.rs"
+cases = 7
+coverage = "Create returns row with server-assigned tenant_id; Get returns by id; Get returns NotFound for missing id; List returns all rows; List paginates by cursor; Update applies partial change and bumps updated_at; Delete removes row and subsequent Get is NotFound; validation rejects missing required field with InvalidArgument"
+
+# =============================================================================
+# T-8 proof — per-entity cross-tenant isolation invariant test
+# =============================================================================
+
+[[steps]]
+id = "cross-tenant-isolation-test"
+title = "{{entity}}: cross-tenant isolation invariant test (RLS proof)"
+type = "feature"
+priority = 2
+needs = ["tonic-service-impl"]
+files = [
+  "crates/smbuild-api/tests/isolation_{{entity_snake}}.rs",
+]
+description = """
+Per-entity proof that tenant A cannot read or write tenant B's
+{{entity_snake_plural}} rows. This is the T-8 invariant test, run for EVERY
+crud-feature-rust pour — tenant isolation is a per-entity proof, not a
+global one (one missed RLS policy on one new table is a leak).
+
+**Test shape (table-driven):**
+- testcontainers Postgres + all migrations applied
+- Boot TWO tenants: tenant_a (id = ULID_A), tenant_b (id = ULID_B); membership rows for one user per tenant
+- Tenant A's connection sets `app.current_tenant_id = ULID_A`; insert 3 rows of {{entity}}
+- Tenant B's connection sets `app.current_tenant_id = ULID_B`; insert 2 rows of {{entity}}
+- Assertions (all MUST pass; any failure is a T-8 violation and the bead BLOCKS):
+  a. `List{{entity_plural}}` on tenant_a's connection returns 3 rows; on tenant_b's returns 2 rows
+  b. `Get{{entity}}` on tenant_a's connection for one of tenant_b's row ids returns `Status::not_found` (NOT permission_denied — RLS makes the row invisible, not forbidden)
+  c. `Update{{entity}}` on tenant_a's connection for a tenant_b row id returns `Status::not_found` and the row in tenant_b's DB is UNCHANGED (verified by re-fetching as tenant_b)
+  d. `Delete{{entity}}` on tenant_a's connection for a tenant_b row id returns `Status::not_found` and the row in tenant_b's DB still exists
+  e. Direct sqlx query bypass attempt: `sqlx::query!("SELECT count(*) FROM {{entity_snake_plural}}")` run on tenant_a's connection returns 3, not 5. If it returns 5, RLS is not FORCE'd and the bead BLOCKS as a security floor violation per tiebreaker #1.
+  f. tenant_a attempting to INSERT a row with `tenant_id = ULID_B` is rejected by the RLS policy (the WITH CHECK clause; if migration omitted WITH CHECK, the policy is incomplete and the bead BLOCKS)
+
+**Acceptance:**
+- File written at `crates/smbuild-api/tests/isolation_{{entity_snake}}.rs`
+- `cargo nextest run -p smbuild-api --test isolation_{{entity_snake}}` passes
+- All six assertions (a-f) are individual `#[test]` or table-driven `proptest!` cases (proptest can fuzz the rows-per-tenant counts; deterministic seed for repeatability per T-11)
+- Test does NOT mock RLS, does NOT mock the DB, does NOT use a special test-only role with BYPASSRLS (those would invalidate the test per T-14)
+- The test is required by the bead's quality gate; if it fails, the bead BLOCKS per tiebreaker #1 (security floor). Do NOT relax the test to ship the bead.
+"""
+
+[steps.testPlan]
+file = "crates/smbuild-api/tests/isolation_{{entity_snake}}.rs"
+cases = 6
+coverage = "tenant A's List returns only A's rows; tenant A's Get for B's id is NotFound; tenant A's Update for B's id is NotFound and B's row unchanged; tenant A's Delete for B's id is NotFound and B's row still exists; direct sqlx SELECT on A's connection cannot see B's rows (FORCE RLS); INSERT with foreign tenant_id rejected by RLS WITH CHECK"

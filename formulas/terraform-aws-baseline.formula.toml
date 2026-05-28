@@ -1,0 +1,628 @@
+# terraform-aws-baseline: the Phase 1 Terraform baseline for AWS deployment.
+#
+# Per ADR 0003 §Decision Hosting + §Decision IaC:
+#   AWS — ECS Fargate (Rust distroless ~10MB containers, sub-second cold starts) +
+#   RDS Postgres 16 + S3 Object Lock (for invoice PDFs + audit anchors) +
+#   CloudFront in front of an S3 SPA bucket + ECR + Secrets Manager + Zitadel +
+#   OpenFGA + ADOT collector sidecars on the same ECS cluster (Phase 1 topology).
+#   OpenTofu is retained as a licensing hedge — same .tf files compile under both.
+#
+# Per-module agent.yaml (Jankurai HLT-022): every module under modules/ ships a
+# sibling agent.yaml declaring purpose, owned_paths, invariants, local_validate,
+# boundary_validate, public_api, risk, consumers, exceptions.
+#
+# Dependency-graph design (matters for /build-batch parallelism):
+#   tf-state-backend ───────────────────────────────┐
+#   tf-network-module ──┬── tf-rds-module           │
+#                       ├── tf-ecs-cluster-module   │
+#                       └── tf-cloudfront-spa       │
+#   tf-ecs-cluster-module ──┬── tf-ecs-api-module   │
+#                           ├── tf-ecs-worker-module│
+#                           ├── tf-ecs-zitadel      │
+#                           └── tf-ecs-openfga      │
+#   tf-ecr-module                                   │
+#   tf-secrets-module ──── tf-secret-handling       │
+#   tf-iam-module                                   │
+#   tf-s3-invoices                                  │
+#   tf-s3-audit-anchors                             │
+#                                                   v
+#                                              tf-env-dev ── tf-ci
+#
+# Out of scope for v1 (future formulas):
+# - Multi-region deployment / cross-region failover (Phase 3+: terraform-aws-multi-region)
+# - Dedicated Zitadel + OpenFGA clusters (Phase 3+)
+# - VPC peering / Transit Gateway (Phase 5+: terraform-aws-network-mesh)
+# - WAF + Shield Advanced (Phase 2+: terraform-aws-edge-security)
+# - Read replicas + RDS Proxy (Phase 2+ when load justifies)
+#
+# Cost-conscious defaults for dev (single NAT gateway, db.t4g.small Single-AZ,
+# Fargate Spot for non-prod tasks). Prod overrides land at env-level.
+#
+# Secret provisioning (tf-secret-handling, touches-secrets label) runs on its own
+# escalation track per integration-http convention — the rest of the Terraform DAG
+# ships in parallel.
+
+formula = "terraform-aws-baseline"
+description = """
+Phase 1 Terraform baseline for AWS: VPC + RDS Postgres 16 + ECS Fargate (api + worker + Zitadel + OpenFGA + ADOT sidecars) + S3 Object Lock (invoices + audit anchors) + CloudFront SPA + ECR + Secrets Manager + IAM + GitHub Actions CI. Per-module agent.yaml (Jankurai HLT-022). OpenTofu-compatible HCL. Single-region (us-east-2 default). Multi-region, read replicas, WAF, and dedicated Zitadel/OpenFGA clusters are out of scope — those are Phase 2+/Phase 3+ formulas.
+"""
+type = "workflow"
+version = 1
+
+[vars.region]
+description = "AWS region for the Phase 1 single-region deployment (e.g. us-east-2). Multi-region is out of scope for this formula."
+default = "us-east-2"
+
+[vars.app_name]
+description = "App slug used for resource naming (e.g. 'smbuild'). Propagates to ECR repo names, log groups, IAM role names, etc."
+default = "smbuild"
+
+[vars.env_name]
+description = "Environment slug (e.g. 'dev', 'prod'). Drives state key, resource name suffixes, and per-env overrides."
+required = true
+
+[vars.state_bucket]
+description = "S3 bucket holding Terraform state. Must be created out-of-band (bootstrap chicken-and-egg) — tf-state-backend documents this."
+required = true
+
+[vars.state_lock_table]
+description = "DynamoDB table for Terraform state locking. Must be created out-of-band with tf-state-backend."
+default = "terraform-state-lock"
+
+[vars.api_container_image]
+description = "ECR image URI the smbuild-api task pulls. Populated by the container build pipeline before each apply; this var documents the wiring."
+default = "PLACEHOLDER_API_IMAGE_URI"
+
+[vars.worker_container_image]
+description = "ECR image URI the smbuild-worker task pulls."
+default = "PLACEHOLDER_WORKER_IMAGE_URI"
+
+# =============================================================================
+# State backend (bootstrap chicken-and-egg documented)
+# =============================================================================
+
+[[steps]]
+id = "tf-state-backend"
+title = "Terraform state backend (S3 + DynamoDB lock)"
+type = "chore"
+priority = 1
+labels = ["touches-infra"]
+files = [
+  "infra/terraform/envs/{{env_name}}/backend.tf",
+  "infra/terraform/envs/{{env_name}}/README.md",
+  "infra/terraform/bootstrap/README.md",
+]
+description = """
+Declare the S3 + DynamoDB backend block:
+```hcl
+terraform {
+  backend "s3" {
+    bucket         = "{{state_bucket}}"
+    key            = "{{app_name}}/{{env_name}}/terraform.tfstate"
+    region         = "{{region}}"
+    dynamodb_table = "{{state_lock_table}}"
+    encrypt        = true
+  }
+}
+```
+
+**Bootstrap chicken-and-egg:** the human must create the state bucket (with versioning + SSE-KMS) and lock table out-of-band before the first `terraform init`. `infra/terraform/bootstrap/README.md` documents this with `aws s3api create-bucket` and `aws dynamodb create-table` snippets plus the recommended bucket policy denying non-TLS PutObject and requiring SSE.
+
+**Acceptance:**
+- `terraform fmt -check` clean
+- `terraform init` (against the real bootstrap bucket) succeeds
+- Bootstrap README explains the manual provisioning steps with verified `aws` CLI snippets
+"""
+
+# =============================================================================
+# Network module
+# =============================================================================
+
+[[steps]]
+id = "tf-network-module"
+title = "Network module (VPC, subnets, NAT, routing)"
+type = "feature"
+priority = 1
+files = [
+  "infra/terraform/modules/network/main.tf",
+  "infra/terraform/modules/network/variables.tf",
+  "infra/terraform/modules/network/outputs.tf",
+  "infra/terraform/modules/network/agent.yaml",
+  "infra/terraform/modules/network/README.md",
+]
+description = """
+VPC with `cidr_block = 10.0.0.0/16`. 2 AZs (parameterized). Per AZ: a public subnet (for ALB), a private subnet (for ECS tasks — egress via NAT), and an isolated subnet (for RDS — no NAT egress). Single shared NAT gateway in `{{env_name}} == "dev"` for cost; one-NAT-per-AZ in prod. Route tables, IGW, default security groups.
+
+**Per-module `agent.yaml`:**
+- `purpose = "VPC + subnets + NAT + routing for {{app_name}}-{{env_name}}"`
+- `owned_paths = ["infra/terraform/modules/network/"]`
+- `invariants = ["isolated subnets have no route to 0.0.0.0/0", "RDS lives in isolated subnets only", "ALB lives in public subnets only"]`
+- `local_validate = ["terraform fmt -check", "terraform validate", "tflint", "tfsec"]`
+- `risk = "high"`
+
+**Acceptance:**
+- `terraform validate` clean; `tflint` clean; `tfsec` no high-severity findings
+- Outputs `vpc_id`, `public_subnet_ids`, `private_subnet_ids`, `isolated_subnet_ids`
+"""
+
+# =============================================================================
+# RDS Postgres module
+# =============================================================================
+
+[[steps]]
+id = "tf-rds-module"
+title = "RDS Postgres 16 module (encrypted, KMS, extensions enabled)"
+type = "feature"
+priority = 2
+needs = ["tf-network-module", "tf-secrets-module"]
+files = [
+  "infra/terraform/modules/rds/main.tf",
+  "infra/terraform/modules/rds/variables.tf",
+  "infra/terraform/modules/rds/outputs.tf",
+  "infra/terraform/modules/rds/agent.yaml",
+  "infra/terraform/modules/rds/parameter-group.tf",
+]
+description = """
+`aws_db_instance` Postgres 16, instance class `db.t4g.small`, `multi_az = var.env_name == "prod"`, KMS-encrypted at rest, automated backups 7 days for dev / 30 for prod, `deletion_protection = var.env_name == "prod"`, `apply_immediately = false`.
+
+Custom `aws_db_parameter_group` enabling `pgcrypto`, `citext`, `pg_trgm`, `pgvector` extensions (via `shared_preload_libraries` for pgvector). Subnet group from `var.isolated_subnet_ids`. Security group allowing 5432 from the ECS task SG only.
+
+Master password generated by `random_password` resource and stored in Secrets Manager (`aws_secretsmanager_secret` + `aws_secretsmanager_secret_version`). Outputs the secret ARN, not the password.
+
+**Per-module `agent.yaml` invariants:** `["password lives only in Secrets Manager, never in tf state outputs", "pgvector + pgcrypto + citext + pg_trgm enabled at parameter-group level", "backups retained {{env_name == 'prod' ? 30 : 7}} days"]`.
+
+**Acceptance:**
+- `terraform validate` clean; `tflint`; `tfsec` clean for high-severity
+- Outputs `db_instance_address`, `db_secret_arn`, `db_security_group_id`
+"""
+
+# =============================================================================
+# ECS cluster module
+# =============================================================================
+
+[[steps]]
+id = "tf-ecs-cluster-module"
+title = "ECS cluster module (Fargate + Spot capacity providers)"
+type = "feature"
+priority = 2
+needs = ["tf-network-module"]
+files = [
+  "infra/terraform/modules/ecs-cluster/main.tf",
+  "infra/terraform/modules/ecs-cluster/variables.tf",
+  "infra/terraform/modules/ecs-cluster/outputs.tf",
+  "infra/terraform/modules/ecs-cluster/agent.yaml",
+]
+description = """
+`aws_ecs_cluster` with `setting { name = "containerInsights" value = "enabled" }`.
+
+`aws_ecs_cluster_capacity_providers` mixing `FARGATE` + `FARGATE_SPOT` (Spot weighted higher in dev).
+
+CloudWatch log groups (`/ecs/{{app_name}}-{{env_name}}/api`, `.../worker`, `.../adot`, `.../zitadel`, `.../openfga`) with `retention_in_days = 30 (dev) / 90 (prod)`.
+
+**Acceptance:**
+- `terraform validate`; `tflint`
+- Outputs `cluster_arn`, `log_group_names`
+"""
+
+# =============================================================================
+# ECS API task module
+# =============================================================================
+
+[[steps]]
+id = "tf-ecs-api-module"
+title = "ECS API task definition + ALB target group"
+type = "feature"
+priority = 3
+needs = ["tf-ecs-cluster-module", "tf-rds-module", "tf-secrets-module", "tf-iam-module"]
+files = [
+  "infra/terraform/modules/ecs-api/main.tf",
+  "infra/terraform/modules/ecs-api/variables.tf",
+  "infra/terraform/modules/ecs-api/outputs.tf",
+  "infra/terraform/modules/ecs-api/agent.yaml",
+  "infra/terraform/modules/ecs-api/task-definition.tf",
+]
+description = """
+`aws_ecs_task_definition` with two containers: `smbuild-api` (Rust distroless from ECR per `{{api_container_image}}`, port 8080, healthcheck `/health` via `command = ["CMD-SHELL", "curl -f http://localhost:8080/health"]`) + the ADOT sidecar (sourced from `module.ecs-adot.container_definition`).
+
+Task role + execution role from `tf-iam-module` outputs. Env from Secrets Manager (`secrets` block referencing ARNs for `DATABASE_URL`, `ZITADEL_CLIENT_SECRET`, `OPENFGA_PRESHARED_KEY`, `STRIPE_SECRET_KEY`, `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `POSTMARK_SERVER_TOKEN`).
+
+`aws_ecs_service` with `desired_count = 1` (dev) / `2+` (prod), `aws_lb_target_group` and `aws_lb_listener_rule` wiring to a shared ALB (passed in as a variable from the env-level), health check path `/health`.
+
+**Per-module `agent.yaml` invariants:** `["task role has only the permissions it needs (no AdministratorAccess)", "secrets injected via ECS secrets block, never plain env", "healthcheck path is /health"]`.
+
+**Acceptance:**
+- `terraform validate`; `tflint`; `tfsec` (no high-severity)
+- Task definition compiles against a fake ALB ARN
+"""
+
+# =============================================================================
+# ECS Worker task module
+# =============================================================================
+
+[[steps]]
+id = "tf-ecs-worker-module"
+title = "ECS Worker task definition (background jobs)"
+type = "feature"
+priority = 3
+needs = ["tf-ecs-cluster-module", "tf-rds-module", "tf-secrets-module", "tf-iam-module"]
+files = [
+  "infra/terraform/modules/ecs-worker/main.tf",
+  "infra/terraform/modules/ecs-worker/variables.tf",
+  "infra/terraform/modules/ecs-worker/outputs.tf",
+  "infra/terraform/modules/ecs-worker/agent.yaml",
+]
+description = """
+Task definition for `smbuild-worker` (no ALB target group — workers don't serve HTTP). Same secrets injection pattern as ecs-api.
+
+`aws_ecs_service` with `desired_count = 1`.
+
+Optional `aws_cloudwatch_event_rule` + `aws_cloudwatch_event_target` for scheduled invocations (the daily audit-witness job at `0 4 * * ? *` rate expression, per plan #18).
+
+Document the EventBridge wiring in the module README.
+
+**Acceptance:**
+- `terraform validate`; `tflint`
+- The EventBridge rule resource compiles
+"""
+
+# =============================================================================
+# Zitadel sidecar task
+# =============================================================================
+
+[[steps]]
+id = "tf-ecs-zitadel-module"
+title = "ECS Zitadel sidecar task (Phase 1 topology)"
+type = "feature"
+priority = 3
+needs = ["tf-ecs-cluster-module", "tf-rds-module", "tf-secrets-module"]
+files = [
+  "infra/terraform/modules/ecs-zitadel/main.tf",
+  "infra/terraform/modules/ecs-zitadel/variables.tf",
+  "infra/terraform/modules/ecs-zitadel/outputs.tf",
+  "infra/terraform/modules/ecs-zitadel/agent.yaml",
+  "infra/terraform/modules/ecs-zitadel/config/zitadel-config.yaml",
+]
+description = """
+Per ADR 0003 sidecar pattern for Phase 1 — Zitadel runs as a separate ECS task on the same cluster (not literally a sidecar inside the API task because Zitadel needs its own DB connection and lifecycle).
+
+Single task with the official `ghcr.io/zitadel/zitadel` image, environment from Secrets Manager (Zitadel master key + Postgres connection). ALB listener rule routing `/.well-known/openid-configuration` and `/oauth/v2/*` paths to Zitadel's target group.
+
+**Per-module `agent.yaml`:**
+- `invariants = ["Zitadel speaks only over HTTPS via the ALB", "Zitadel's own DB connection is a separate Secrets Manager entry, not shared with smbuild-api"]`
+- `exceptions = ["Phase 3+: migrate to dedicated cluster — see autonomous-build/formulas/terraform-aws-zitadel-dedicated (not yet written)"]`
+
+**Acceptance:**
+- `terraform validate`; `tflint`
+"""
+
+# =============================================================================
+# OpenFGA sidecar task
+# =============================================================================
+
+[[steps]]
+id = "tf-ecs-openfga-module"
+title = "ECS OpenFGA sidecar task (Phase 1 topology)"
+type = "feature"
+priority = 3
+needs = ["tf-ecs-cluster-module", "tf-rds-module", "tf-secrets-module"]
+files = [
+  "infra/terraform/modules/ecs-openfga/main.tf",
+  "infra/terraform/modules/ecs-openfga/variables.tf",
+  "infra/terraform/modules/ecs-openfga/outputs.tf",
+  "infra/terraform/modules/ecs-openfga/agent.yaml",
+]
+description = """
+OpenFGA as a separate ECS task using `openfga/openfga` image. Postgres-backed using the same RDS instance with a dedicated database (`openfga_db`) and user.
+
+Service is exposed only inside the VPC (no ALB listener rule — clients on the same cluster reach it via service discovery / private DNS / internal NLB at the Phase 1 level). Use AWS Cloud Map for service discovery (`aws_service_discovery_private_dns_namespace` + `aws_service_discovery_service`).
+
+**Per-module `agent.yaml`:**
+- `invariants = ["OpenFGA is reachable only from within the VPC private subnets", "OpenFGA preshared key lives in Secrets Manager"]`
+
+**Acceptance:**
+- `terraform validate`; `tflint`
+- Service discovery resources compile
+"""
+
+# =============================================================================
+# S3 invoices bucket (Object Lock + cross-region replication)
+# =============================================================================
+
+[[steps]]
+id = "tf-s3-invoices-module"
+title = "S3 invoices bucket (Object Lock Governance + cross-region replication)"
+type = "feature"
+priority = 2
+files = [
+  "infra/terraform/modules/s3-invoices/main.tf",
+  "infra/terraform/modules/s3-invoices/variables.tf",
+  "infra/terraform/modules/s3-invoices/outputs.tf",
+  "infra/terraform/modules/s3-invoices/agent.yaml",
+]
+description = """
+`aws_s3_bucket` with `aws_s3_bucket_object_lock_configuration` (Governance mode, default retention 7 years).
+
+`aws_s3_bucket_versioning` enabled (required for Object Lock).
+
+`aws_s3_bucket_lifecycle_configuration` transitioning to `GLACIER_IR` at 365 days.
+
+`aws_s3_bucket_replication_configuration` cross-region to a second-region bucket (region computed as `var.region == "us-east-2" ? "us-west-2" : "us-east-2"` for the dev default; prod overrides).
+
+`aws_s3_bucket_server_side_encryption_configuration` with KMS.
+
+Bucket policy denies non-TLS access and any DeleteObjectVersion outside the Object Lock retention period.
+
+**Per-module `agent.yaml`:**
+- `invariants = ["Object Lock Governance mode active", "cross-region replication enabled", "bucket policy denies non-TLS"]`
+- `risk = "high"`
+
+**Acceptance:**
+- `terraform validate`; `tflint`; `tfsec` no high-severity (Object Lock + encryption + replication satisfy the common findings)
+"""
+
+# =============================================================================
+# S3 audit anchors bucket
+# =============================================================================
+
+[[steps]]
+id = "tf-s3-audit-anchors-module"
+title = "S3 audit anchors bucket (Object Lock Compliance + cross-region)"
+type = "feature"
+priority = 2
+files = [
+  "infra/terraform/modules/s3-audit-anchors/main.tf",
+  "infra/terraform/modules/s3-audit-anchors/variables.tf",
+  "infra/terraform/modules/s3-audit-anchors/outputs.tf",
+  "infra/terraform/modules/s3-audit-anchors/agent.yaml",
+]
+description = """
+Same shape as `tf-s3-invoices-module` but tighter retention (10 years Compliance mode, no lifecycle to Glacier — daily anchors are tiny).
+
+Separate bucket because the data classification is different (audit-chain heads vs invoice PDFs) and the IAM policies that can write to each are distinct (only the audit-witness worker writes here; the api+worker write invoices).
+
+**Per-module `agent.yaml`:**
+- `invariants = ["Object Lock Compliance mode (not Governance) — no override possible", "only audit-witness IAM role has PutObject"]`
+- `risk = "high"`
+
+**Acceptance:**
+- `terraform validate`; `tflint`; `tfsec` clean for high
+"""
+
+# =============================================================================
+# CloudFront SPA distribution
+# =============================================================================
+
+[[steps]]
+id = "tf-cloudfront-spa-module"
+title = "CloudFront distribution + S3 private bucket for the SPA"
+type = "feature"
+priority = 2
+files = [
+  "infra/terraform/modules/cloudfront-spa/main.tf",
+  "infra/terraform/modules/cloudfront-spa/variables.tf",
+  "infra/terraform/modules/cloudfront-spa/outputs.tf",
+  "infra/terraform/modules/cloudfront-spa/agent.yaml",
+]
+description = """
+Private S3 bucket for the React build (`bucket_public_access_block` blocking all public access).
+
+`aws_cloudfront_distribution` with an Origin Access Control (OAC, the modern replacement for OAI) pointing at the S3 bucket.
+
+SPA-friendly error responses (`custom_error_response` mapping 403/404 -> `/index.html` with 200) so client-side routing works.
+
+Optional custom domain via `aws_acm_certificate` (in `us-east-1` regardless of `{{region}}`) + `aws_route53_record` (caller supplies the hosted zone ID).
+
+Cache policy: short TTL for `/index.html`, long TTL + immutable for hashed asset paths.
+
+Origin for `/otel/v1/traces` routed to the ALB so the frontend OTel exporter reaches the ADOT collector via the same domain.
+
+**Acceptance:**
+- `terraform validate`; `tflint`
+"""
+
+# =============================================================================
+# ECR module
+# =============================================================================
+
+[[steps]]
+id = "tf-ecr-module"
+title = "ECR repositories for smbuild-api + smbuild-worker"
+type = "feature"
+priority = 1
+files = [
+  "infra/terraform/modules/ecr/main.tf",
+  "infra/terraform/modules/ecr/variables.tf",
+  "infra/terraform/modules/ecr/outputs.tf",
+  "infra/terraform/modules/ecr/agent.yaml",
+]
+description = """
+`aws_ecr_repository` for `smbuild-api` and `smbuild-worker` (one resource each, or `for_each` over a list).
+
+`image_scanning_configuration { scan_on_push = true }`.
+
+`encryption_configuration { encryption_type = "KMS" }`.
+
+`aws_ecr_lifecycle_policy` retaining the last 30 tagged images and untagged images for 14 days.
+
+**Acceptance:**
+- `terraform validate`; `tflint`
+- Outputs the repo URIs
+"""
+
+# =============================================================================
+# Secrets Manager module (declarations only — values land in tf-secret-handling)
+# =============================================================================
+
+[[steps]]
+id = "tf-secrets-module"
+title = "Secrets Manager declarations (entries only, values in tf-secret-handling)"
+type = "feature"
+priority = 1
+files = [
+  "infra/terraform/modules/secrets/main.tf",
+  "infra/terraform/modules/secrets/variables.tf",
+  "infra/terraform/modules/secrets/outputs.tf",
+  "infra/terraform/modules/secrets/agent.yaml",
+]
+description = """
+Declare `aws_secretsmanager_secret` resources (NOT versions — versions land in `tf-secret-handling` with the touches-secrets label) for: `stripe_secret_key`, `stripe_webhook_secret`, `twilio_account_sid`, `twilio_auth_token`, `postmark_server_token`, `zitadel_client_id`, `zitadel_client_secret`, `openfga_preshared_key`, `database_url` (the master one — RDS module writes its own version).
+
+Each secret has a KMS key alias from `aws_kms_key` resource and a rotation policy stub (rotation lambda left empty — Phase 2+ wires actual rotation for Stripe/Twilio/Postmark which don't support automated rotation natively; document the manual rotation runbook).
+
+**Per-module `agent.yaml`:**
+- `invariants = ["this module declares secret SHAPES only — values land in tf-secret-handling (touches-secrets gate)", "every secret is KMS-encrypted with the app's KMS key"]`
+
+**Acceptance:**
+- `terraform validate`; `tflint`
+- Outputs each secret's ARN
+"""
+
+# =============================================================================
+# IAM module
+# =============================================================================
+
+[[steps]]
+id = "tf-iam-module"
+title = "IAM roles + policies (task execution, per-service tasks, CI OIDC)"
+type = "feature"
+priority = 2
+files = [
+  "infra/terraform/modules/iam/main.tf",
+  "infra/terraform/modules/iam/variables.tf",
+  "infra/terraform/modules/iam/outputs.tf",
+  "infra/terraform/modules/iam/agent.yaml",
+  "infra/terraform/modules/iam/policies/api-task-policy.json",
+  "infra/terraform/modules/iam/policies/worker-task-policy.json",
+  "infra/terraform/modules/iam/policies/ci-deploy-policy.json",
+]
+description = """
+ECS task execution role (assumed by ECS to pull images, write logs, decrypt secrets at task launch — minimum permissions).
+
+Per-service task roles (assumed by running containers — `smbuild-api` role can `s3:PutObject` on invoices bucket + read from Secrets Manager + write CloudWatch metrics; `smbuild-worker` role gets the audit-witness PutObject on audit-anchors bucket; OpenFGA + Zitadel get only their own log + secret reads).
+
+CI deploy role assumable via OIDC from GitHub Actions (`aws_iam_openid_connect_provider` for `token.actions.githubusercontent.com`, condition restricting to the repo + main branch + named workflows) with permissions to push to ECR + update ECS services + run `terraform plan/apply`.
+
+**Per-module `agent.yaml`:**
+- `invariants = ["no role has * action on * resource", "all roles use the AWS-managed AmazonECSTaskExecutionRolePolicy ONLY as the base, never AdministratorAccess", "CI OIDC trust policy restricts to specific repo + branch"]`
+- `risk = "high"`
+
+**Acceptance:**
+- `terraform validate`; `tflint`; `tfsec` no high-severity findings
+"""
+
+# =============================================================================
+# Env wiring (composes every module)
+# =============================================================================
+
+[[steps]]
+id = "tf-env-dev"
+title = "Env-level wiring: composes every module into a runnable deployment"
+type = "feature"
+priority = 4
+needs = [
+  "tf-state-backend",
+  "tf-network-module",
+  "tf-rds-module",
+  "tf-ecs-cluster-module",
+  "tf-ecs-api-module",
+  "tf-ecs-worker-module",
+  "tf-ecs-zitadel-module",
+  "tf-ecs-openfga-module",
+  "tf-s3-invoices-module",
+  "tf-s3-audit-anchors-module",
+  "tf-cloudfront-spa-module",
+  "tf-ecr-module",
+  "tf-secrets-module",
+  "tf-iam-module",
+]
+files = [
+  "infra/terraform/envs/{{env_name}}/main.tf",
+  "infra/terraform/envs/{{env_name}}/variables.tf",
+  "infra/terraform/envs/{{env_name}}/outputs.tf",
+  "infra/terraform/envs/{{env_name}}/versions.tf",
+  "infra/terraform/envs/{{env_name}}/terraform.tfvars.example",
+]
+description = """
+Top-level entry point that instantiates every module.
+
+Single `provider "aws" { region = "{{region}}" }`.
+
+`versions.tf` pins Terraform `>= 1.7.0`, `aws` provider `~> 5.30`, plus `random` and `tls` providers.
+
+`terraform.tfvars.example` documents every required input (state bucket, image URIs, hosted zone for the SPA domain) with placeholder values.
+
+Wire module outputs into module inputs (network -> rds/ecs; ecs-cluster -> ecs-api/worker/zitadel/openfga + ecs-adot module from the otel-bootstrap-rust formula; iam -> all ecs modules; secrets -> all ecs modules; etc.).
+
+Single `terraform apply` in this dir should bring up a working dev environment (modulo the human supplying the initial secret values via `tf-secret-handling`).
+
+**Acceptance:**
+- `terraform init -backend=false && terraform validate` clean
+- `terraform plan` against the dev backend reports no errors (may report "X to add" — that's expected on a fresh apply)
+- `tflint --recursive` clean
+- `tfsec` no high-severity
+"""
+
+# =============================================================================
+# Secret provisioning (touches-secrets escalation)
+# =============================================================================
+
+[[steps]]
+id = "tf-secret-handling"
+title = "Provision initial Secrets Manager values (touches-secrets)"
+type = "feature"
+priority = 4
+needs = ["tf-secrets-module"]
+labels = ["touches-secrets"]
+files = [
+  "infra/terraform/envs/{{env_name}}/secrets.tfvars.template",
+  "docs/runbooks/secrets-provisioning.md",
+]
+description = """
+This is the only step on the touches-secrets escalation track. Loop blocks; human fills in `secrets.tfvars` (kept out of git, ignored via `.gitignore` documented in the runbook) with:
+- Stripe test mode `sk_test_...` and webhook signing secret
+- Twilio account SID + auth token (real account, real test number — per T-14 + plan #14)
+- Postmark server token (real account — per plan #15)
+- Zitadel application client_id + client_secret (provisioned in the Zitadel console post-deploy of `tf-ecs-zitadel-module`)
+- OpenFGA preshared key (generated locally — `openssl rand -base64 32`)
+
+Runbook documents:
+1. Where each credential is obtained (account URL, console path).
+2. Who has admin access (the human; the loop never sees the raw values).
+3. Rotation cadence (Stripe quarterly; Twilio annually; Postmark annually; Zitadel + OpenFGA on personnel changes).
+4. Failure mode if a secret is missing at deploy: `terraform apply` fails fast (Secrets Manager version creation fails); ECS task fails to launch with a clear "secret not found" error in CloudWatch.
+
+**Acceptance (after human unblocks):**
+- Each Secrets Manager secret has a non-empty version
+- `terraform plan` against the dev backend shows no pending secret-version drift
+- The runbook is committed and the `secrets.tfvars` path is in `.gitignore`
+"""
+
+# =============================================================================
+# CI workflow
+# =============================================================================
+
+[[steps]]
+id = "tf-ci"
+title = "GitHub Actions workflow (fmt + validate + tflint + tfsec + plan + apply)"
+type = "feature"
+priority = 5
+needs = ["tf-env-dev"]
+files = [
+  ".github/workflows/terraform.yml",
+  ".github/workflows/terraform-plan.yml",
+]
+description = """
+GitHub Actions workflow that runs on PRs touching `infra/terraform/**`:
+- `terraform fmt -check -recursive`
+- `terraform validate` (matrix over `modules/*` and `envs/*`)
+- `tflint --recursive --format compact`
+- `tfsec --format compact --soft-fail false` (hard-fail on high-severity)
+- `terraform plan -no-color > plan.txt` against the dev backend, commented on the PR via `actions/github-script`
+
+On merge to main: gated `terraform apply` job that requires a GitHub Environment named `terraform-dev` with a required reviewer (the human). Uses the CI OIDC role from `tf-iam-module`, never long-lived AWS credentials.
+
+**Acceptance:**
+- `act` (the local GH Actions runner) or a dry-run PR demonstrates fmt/validate/tflint/tfsec pass
+- Plan step posts a comment on a test PR
+- Apply job exists but does NOT run without approval
+"""

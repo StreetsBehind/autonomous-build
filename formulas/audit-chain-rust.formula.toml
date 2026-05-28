@@ -1,0 +1,636 @@
+# audit-chain-rust: tamper-evident audit chain for SMBuild's Rust runtime.
+#
+# Per ADR 0002 directive #10 + ADR 0003 §Decision Audit chain: this scaffolds
+# crates/smbuild-audit as the ONLY blessed writer of the audit_chain table.
+# Bypass is a COMPILE-TIME error, not a lint suggestion — Rust's pub(crate)
+# privacy + an xtask ban check enforce the chokepoint.
+#
+# Mirrors Jankurai's witness/receipt pattern (Jankurai/docs/merge-witness.md +
+# Jankurai/docs/soc-ready-evidence.md): every append returns an AuditReceipt;
+# a daily witness job anchors chain heads to S3 Object Lock cross-region —
+# our external evidence trail (T-9 + SOC-ready-evidence philosophy).
+#
+# What this formula produces:
+# - crates/smbuild-audit (the only crate with pub fn append)
+# - sqlx forward migration creating audit_chain table + RLS policy + verify trigger
+# - cargo-deny ban rule (via xtask) enforcing pub-fn-append-only path
+# - crates/smbuild-worker/src/jobs/audit_witness.rs (daily anchor job)
+# - tamper-detection integration test (proves the trigger raises on retroactive edits)
+# - hash-chain round-trip integration test (proves chain is consistent across appends)
+#
+# Out of scope:
+# - The composer's audit hooks — Phase 4 reads the receipt from append() and threads
+#   it into composer.run-receipts. This formula provides the API; Phase 4 consumes it.
+# - The xtask runner itself if not already present — the cargo-deny-audit-ban step
+#   creates xtask/src/audit_chain_ban.rs and a check-audit-ban command; if a Cargo
+#   xtask harness doesn't yet exist in the workspace, that step also wires it.
+#
+# Pour-time note: this formula is poured ONCE per app. It MUST be poured BEFORE
+# any feature whose handler calls audit::append — in SMBuild Phase 1 the first
+# consumer is Invoice (feature #12 in plan.md), so this formula must merge before
+# Invoice's epic opens.
+
+formula = "audit-chain-rust"
+description = """
+Scaffold SMBuild's tamper-evident audit chain in Rust: the smbuild-audit crate as the only blessed writer, the audit_chain Postgres table with RLS + hash-verify trigger, an AuditEvent trait carrying its scope as an associated const, a daily witness job anchoring chain heads to S3 Object Lock cross-region, an xtask cargo-deny ban enforcing the pub-fn-append-only path at CI time, and round-trip + tamper-detection integration tests against testcontainers Postgres. Poured ONCE per app, BEFORE any feature whose handler calls audit::append.
+"""
+type = "workflow"
+version = 1
+
+[vars.cron_schedule]
+description = "Cron expression for the daily witness job that anchors chain heads to S3 Object Lock cross-region. Default '0 4 * * *' = 04:00 daily — quiet hour for ECS schedulers; Stripe webhooks have settled by then."
+default = "0 4 * * *"
+
+[vars.anchor_s3_bucket]
+description = "S3 bucket holding daily audit-chain anchor envelopes. Must be Object-Lock-enabled in Compliance mode and cross-region-replicated (T-9 tamper-evident). The bucket is provisioned by the terraform-aws-baseline formula; this var just names it."
+default = "smbuild-audit-anchors"
+
+[vars.anchor_region_replica]
+description = "Cross-region replica destination for the anchor bucket (T-9 defense in depth — single-region S3 outage does not destroy the only evidence of chain heads)."
+default = "us-west-2"
+
+# =============================================================================
+# crates/smbuild-audit — the only blessed writer
+# =============================================================================
+
+[[steps]]
+id = "smbuild-audit-crate"
+title = "smbuild-audit: blessed-writer crate scaffolding"
+type = "feature"
+priority = 1
+files = [
+  "crates/smbuild-audit/Cargo.toml",
+  "crates/smbuild-audit/src/lib.rs",
+  "crates/smbuild-audit/src/scope.rs",
+  "crates/smbuild-audit/README.md",
+]
+description = """
+Create `crates/smbuild-audit/` as a Cargo workspace member. This crate is the SINGLE entry point for every write to `audit_chain`. Bypass is a compile-time error.
+
+**Cargo.toml [package.metadata.agent]:**
+```toml
+[package.metadata.agent]
+purpose = "The only blessed writer of the audit_chain table. Every append() call produces an AuditReceipt; the receipt is consumed by callers (invoice send, payment received, comms dispatched) and threaded into audit context. RLS, hash-verify trigger, witness anchoring layer all sit on top of this crate's pub fn append."
+owned_paths = ["crates/smbuild-audit/", "db/migrations/*_audit_chain*"]
+invariants = [
+  "all writes to audit_chain go through pub fn append; cargo-deny ban enforces",
+  "AuditReceipt fields are private; only the inserter sees the row_hash and prev_hash",
+  "AuditEvent::SCOPE associated const prevents wrong-event-into-wrong-chain at compile time",
+]
+local_validate = [
+  "cargo fmt --check -p smbuild-audit",
+  "cargo clippy -p smbuild-audit --all-targets -- -D warnings",
+  "cargo nextest run -p smbuild-audit",
+  "cargo test -p smbuild-audit --doc",
+]
+boundary_validate = [
+  "cargo xtask check-audit-ban",
+  "cargo sqlx prepare --check",
+]
+public_api = ["crates/smbuild-audit/src/lib.rs"]
+risk = "high"
+consumers = ["smbuild-api", "smbuild-worker"]
+exceptions = []
+```
+
+**lib.rs declares (placeholder, real bodies fill in subsequent steps):**
+```rust
+pub mod scope;
+mod receipt;        // step audit-receipt-type populates
+mod event;          // step audit-event-trait populates
+mod append;         // step audit-append-fn populates
+
+pub use scope::AuditScope;
+pub use receipt::AuditReceipt;
+pub use event::AuditEvent;
+pub use append::{append, AuditError};
+```
+
+**`AuditScope` enum** (in scope.rs):
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditScope {
+    Invoice,           // Phase 1 first consumer (plan.md feature #12)
+    Payment,           // Phase 1 — Stripe webhook (feature #13)
+    Comms,             // Phase 1 — Twilio + Postmark dispatch (features #14, #15)
+    AuthEvent,         // Phase 1 — Zitadel sign-in / OpenFGA write (features #16, #17)
+    ComposerOutput,    // Phase 4 placeholder — declared NOW so adding the arm later
+                       // doesn't reshape the enum (additive-only, T-25)
+}
+```
+
+The enum is declared exhaustively in Phase 1 to honor T-25 (no retrofit). Phase 4's composer can write to its own scope without an enum reshape.
+
+**Acceptance:**
+- `crates/smbuild-audit/Cargo.toml` lists the metadata.agent block
+- Workspace root Cargo.toml lists `crates/smbuild-audit` in `members` (already declared in ADR 0003 §Project layout)
+- `crates/smbuild-audit/src/lib.rs` declares the module tree above
+- `AuditScope` enum is in scope.rs and includes the ComposerOutput placeholder
+- `cargo check -p smbuild-audit` succeeds against a fresh checkout
+"""
+
+# =============================================================================
+# AuditEvent trait — scope-as-associated-const
+# =============================================================================
+
+[[steps]]
+id = "audit-event-trait"
+title = "AuditEvent trait — scope carried as associated const"
+type = "feature"
+priority = 2
+needs = ["smbuild-audit-crate"]
+files = [
+  "crates/smbuild-audit/src/event.rs",
+]
+description = """
+Define the AuditEvent trait. Domain types implement it to be auditable; the trait carries the scope as an associated const so callers can't put the wrong event in the wrong chain by mistake — `append::<InvoiceSent>(...)` writes to the Invoice chain by construction.
+
+**Trait:**
+```rust
+pub trait AuditEvent: serde::Serialize + Send + Sync + 'static {
+    const SCOPE: crate::AuditScope;
+}
+```
+
+**Why this shape (T-7 closed-grammar + T-8 chokepoint discipline):**
+- Caller cannot pass arbitrary scope at the call site — the type parameter pins it.
+- A future event type `struct InvoiceSent { ... }` declares `const SCOPE: AuditScope = AuditScope::Invoice;` once. Every site that writes an InvoiceSent goes to the Invoice chain. Mismatch is impossible.
+- Adding a new domain event is a `impl AuditEvent for MyEvent` block + serde::Serialize derive — no audit-chain code touched. (T-6 metadata-style for code.)
+
+**Acceptance:**
+- `crates/smbuild-audit/src/event.rs` defines `pub trait AuditEvent` with the exact signature above
+- A doc-test in event.rs declares an example `#[derive(serde::Serialize)] struct ExampleEvent;` + `impl AuditEvent for ExampleEvent { const SCOPE: AuditScope = AuditScope::Invoice; }`, confirming the implementation pattern compiles
+- `cargo check -p smbuild-audit` succeeds
+"""
+
+[steps.testPlan]
+file = "crates/smbuild-audit/src/event.rs"
+cases = 1
+coverage = "doc-test confirms a domain type can impl AuditEvent and the associated const pins the scope (Invoice in the example) at the type level"
+
+# =============================================================================
+# AuditReceipt type — private-fields envelope
+# =============================================================================
+
+[[steps]]
+id = "audit-receipt-type"
+title = "AuditReceipt: private-fields receipt struct"
+type = "feature"
+priority = 2
+needs = ["smbuild-audit-crate"]
+files = [
+  "crates/smbuild-audit/src/receipt.rs",
+]
+description = """
+Define `AuditReceipt`, the value `append()` returns. All fields private — only the inserter ever sees them in full.
+
+**Shape:**
+```rust
+pub struct AuditReceipt {
+    tenant_id: smbuild_tenantctx::TenantId,
+    scope: crate::AuditScope,
+    seq: u64,
+    row_hash: [u8; 32],
+}
+
+impl AuditReceipt {
+    pub fn tenant_id(&self) -> smbuild_tenantctx::TenantId { self.tenant_id }
+    pub fn scope(&self) -> crate::AuditScope { self.scope }
+    pub fn seq(&self) -> u64 { self.seq }
+    pub fn row_hash_hex(&self) -> String { hex::encode(self.row_hash) }
+    pub(crate) fn from_appended(
+        tenant_id: smbuild_tenantctx::TenantId,
+        scope: crate::AuditScope,
+        seq: u64,
+        row_hash: [u8; 32],
+    ) -> Self { Self { tenant_id, scope, seq, row_hash } }
+}
+
+#[derive(serde::Serialize)]
+pub(crate) struct WitnessEnvelope<'a> {
+    pub tenant_id: smbuild_tenantctx::TenantId,
+    pub scope: crate::AuditScope,
+    pub head_seq: u64,
+    pub head_hash: &'a str,           // hex(row_hash)
+    pub anchored_at: chrono::DateTime<chrono::Utc>,
+}
+```
+
+- Public getters only — never expose the raw 32-byte `row_hash` (callers get a hex string).
+- `pub(crate) fn from_appended` means only `append` constructs receipts; even other modules inside smbuild-audit must go through `append`.
+- `WitnessEnvelope` is the JSON shape uploaded to S3 by the witness job; it's pub(crate) and consumed only by audit_witness.
+
+**Acceptance:**
+- `crates/smbuild-audit/src/receipt.rs` declares `AuditReceipt` with private fields and `pub(crate) fn from_appended` only
+- Public surface is exactly: tenant_id() / scope() / seq() / row_hash_hex()
+- No `Clone`, no `Default`, no `Serialize` derive on the public `AuditReceipt` (the WitnessEnvelope is the serializable shape; receipt is opaque to outside code)
+- `cargo check -p smbuild-audit` succeeds
+"""
+
+[steps.testPlan]
+file = "crates/smbuild-audit/src/receipt.rs"
+cases = 1
+coverage = "doc-test confirms external code cannot construct AuditReceipt (proves the pub(crate) chokepoint), confirms row_hash never escapes as raw bytes"
+
+# =============================================================================
+# Migration: audit_chain table + RLS + verify trigger
+# =============================================================================
+
+[[steps]]
+id = "audit-chain-migration"
+title = "audit_chain: table + RLS policy + hash-verify BEFORE INSERT trigger"
+type = "feature"
+priority = 1
+needs = ["smbuild-audit-crate"]
+labels = ["needs-decision"]
+files = [
+  "db/migrations/*_audit_chain.up.sql",
+  "db/migrations/*_audit_chain.down.sql",
+  "crates/smbuild-audit/tests/migration.rs",
+]
+description = """
+Author the forward + rollback SQL migration that creates `audit_chain`. The table schema is per ADR 0003 §Audit chain row.
+
+**up.sql (canonical schema):**
+```sql
+-- pgcrypto provides digest(); already required by Phase-1 directive #2 init migration
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+CREATE TABLE audit_chain (
+    id           bigserial PRIMARY KEY,
+    tenant_id    uuid NOT NULL,
+    scope        text NOT NULL CHECK (scope IN ('invoice','payment','comms','auth_event','composer_output')),
+    seq          bigint NOT NULL,
+    prev_hash    bytea NOT NULL,           -- 32 bytes; sha256
+    row_json     jsonb NOT NULL,
+    row_hash     bytea NOT NULL,           -- 32 bytes; sha256(prev_hash || row_json::text::bytea)
+    actor_id     uuid,                     -- nullable for system-emitted events
+    occurred_at  timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (tenant_id, scope, seq)
+);
+
+CREATE INDEX audit_chain_tenant_scope_seq_idx ON audit_chain (tenant_id, scope, seq DESC);
+
+ALTER TABLE audit_chain ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY audit_chain_rls ON audit_chain
+    USING (tenant_id = current_setting('app.current_tenant_id', true)::uuid)
+    WITH CHECK (tenant_id = current_setting('app.current_tenant_id', true)::uuid);
+
+-- The verify trigger: recompute row_hash from (prev_hash || row_json) and
+-- reject if it doesn't match the supplied row_hash. Also verify prev_hash
+-- == the current chain head's row_hash (or 32 zero bytes if seq=1).
+CREATE OR REPLACE FUNCTION audit_chain_verify() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+    expected_prev bytea;
+    expected_hash bytea;
+    expected_seq  bigint;
+BEGIN
+    SELECT COALESCE(row_hash, decode(repeat('00', 32), 'hex')),
+           COALESCE(seq, 0)
+      INTO expected_prev, expected_seq
+      FROM audit_chain
+     WHERE tenant_id = NEW.tenant_id AND scope = NEW.scope
+     ORDER BY seq DESC LIMIT 1;
+
+    IF expected_prev IS NULL THEN
+        expected_prev := decode(repeat('00', 32), 'hex');
+        expected_seq  := 0;
+    END IF;
+
+    IF NEW.prev_hash <> expected_prev THEN
+        RAISE EXCEPTION 'audit_chain prev_hash mismatch for tenant=% scope=% seq=%: expected %, got %',
+            NEW.tenant_id, NEW.scope, NEW.seq,
+            encode(expected_prev, 'hex'), encode(NEW.prev_hash, 'hex');
+    END IF;
+
+    IF NEW.seq <> expected_seq + 1 THEN
+        RAISE EXCEPTION 'audit_chain seq gap for tenant=% scope=%: expected %, got %',
+            NEW.tenant_id, NEW.scope, expected_seq + 1, NEW.seq;
+    END IF;
+
+    expected_hash := digest(NEW.prev_hash || NEW.row_json::text::bytea, 'sha256');
+    IF NEW.row_hash <> expected_hash THEN
+        RAISE EXCEPTION 'audit_chain row_hash mismatch for tenant=% scope=% seq=%: expected %, got %',
+            NEW.tenant_id, NEW.scope, NEW.seq,
+            encode(expected_hash, 'hex'), encode(NEW.row_hash, 'hex');
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER audit_chain_verify_trg
+    BEFORE INSERT ON audit_chain
+    FOR EACH ROW EXECUTE FUNCTION audit_chain_verify();
+```
+
+**down.sql:**
+```sql
+DROP TRIGGER IF EXISTS audit_chain_verify_trg ON audit_chain;
+DROP FUNCTION IF EXISTS audit_chain_verify();
+DROP TABLE IF EXISTS audit_chain;
+```
+
+**Why BEFORE INSERT vs AFTER:** BEFORE lets us RAISE EXCEPTION and prevent the row from landing at all — the contract is "if insert succeeds, the row was verified." AFTER would leave window where bad rows exist transiently.
+
+**Escalation:** this step ALWAYS carries `needs-decision`. The build loop reads `touches_existing_data=false` (Phase 1, fresh DB) and treats it as quick-ack. If poured against a non-empty production DB in Phase 3+, the human must approve the backfill / lockout strategy explicitly.
+
+**Acceptance:**
+- `db/migrations/NNNNNN_audit_chain.up.sql` and `.down.sql` created with the SQL above (NNNNNN auto-assigned by sqlx-cli convention; placed AFTER the `000001_init` migration)
+- `sqlx migrate run` against a fresh Postgres 16 applies cleanly
+- A bench test in `crates/smbuild-audit/tests/migration.rs` (testcontainers): applies migration, attempts an INSERT directly via raw SQL with a tampered row_hash -> trigger RAISES, INSERT rejected. Confirms the trigger is wired.
+- `sqlx migrate revert` removes the table cleanly; re-applying succeeds (round-trip)
+"""
+
+[steps.testPlan]
+file = "crates/smbuild-audit/tests/migration.rs"
+cases = 3
+coverage = "fresh-DB migration creates audit_chain + trigger + RLS policy; INSERT with bad row_hash -> trigger raises (verify trigger wired); migration down->up round-trip is idempotent"
+
+# =============================================================================
+# append() — the only public writer
+# =============================================================================
+
+[[steps]]
+id = "audit-append-fn"
+title = "smbuild_audit::append — the only pub writer of audit_chain"
+type = "feature"
+priority = 3
+needs = ["audit-event-trait", "audit-receipt-type", "audit-chain-migration"]
+files = [
+  "crates/smbuild-audit/src/append.rs",
+]
+description = """
+Implement `pub fn append` — the single entrypoint for writing to `audit_chain`.
+
+**Signature:**
+```rust
+pub async fn append<C: crate::AuditEvent>(
+    pool: &sqlx::PgPool,
+    ctx: &smbuild_tenantctx::TenantCtx,
+    event: C,
+) -> Result<crate::AuditReceipt, AuditError>;
+```
+
+(Note: `scope` is NOT a parameter — it comes from `C::SCOPE`. Compile-time chokepoint: wrong event in wrong chain is a type mismatch.)
+
+**Body:**
+1. Begin a transaction. `SET LOCAL app.current_tenant_id = $tenant_id` so RLS is active for this tenant's writes.
+2. `SELECT row_hash, seq FROM audit_chain WHERE tenant_id=$1 AND scope=$2 ORDER BY seq DESC LIMIT 1 FOR UPDATE` — the `FOR UPDATE` serializes concurrent appenders for the same (tenant, scope) chain so seq numbers don't race.
+3. If no previous row: `prev_hash = [0u8; 32]`, `next_seq = 1`. Else: `prev_hash = row.row_hash`, `next_seq = row.seq + 1`.
+4. `row_json = serde_json::to_value(&event)?` (then canonical bytes for hashing).
+5. `row_hash = sha256(prev_hash || row_json_canonical_bytes)`.
+6. Insert: `INSERT INTO audit_chain (tenant_id, scope, seq, prev_hash, row_json, row_hash, actor_id, occurred_at) VALUES ($1,$2,$3,$4,$5,$6,$7,now()) RETURNING seq`. The Postgres trigger re-verifies; mismatch is a defense-in-depth check (the Rust side cooperates honestly, but the DB trusts no one).
+7. Commit the transaction.
+8. Return `AuditReceipt::from_appended(tenant_id, C::SCOPE, seq, row_hash)`.
+
+**AuditError:**
+```rust
+#[derive(Debug, thiserror::Error)]
+pub enum AuditError {
+    #[error("audit_chain database error: {0}")]
+    Db(#[from] sqlx::Error),
+    #[error("audit event serialization failed: {0}")]
+    Serialize(#[from] serde_json::Error),
+    #[error("RLS denied the audit write — tenant context does not match the connection's app.current_tenant_id")]
+    RlsDenied,
+}
+```
+
+`RlsDenied` is set when the trigger or the RLS policy rejects (sqlx returns a typed error we map). Caller cannot recover; this means TenantCtx and the conn fell out of sync — a critical bug.
+
+**Acceptance:**
+- `crates/smbuild-audit/src/append.rs` exports `pub async fn append<C: AuditEvent>(pool, ctx, event) -> Result<AuditReceipt, AuditError>` — exact signature
+- The function takes the chain lock via `FOR UPDATE` on the head row
+- Canonical JSON hashing: uses `serde_json::to_vec` with a stable key order (e.g. via `serde_json::to_writer` with sorted-keys feature OR an explicit canonicalization helper). The witness job must be able to recompute the same hash from row_json, so the canonicalization MUST be deterministic — document this in a code comment.
+- `cargo nextest run -p smbuild-audit append` passes a unit smoke test that constructs a fake event, calls append against a testcontainers Postgres, and asserts the returned `AuditReceipt.seq == 1` and `row_hash` is 32 bytes
+- `cargo clippy -p smbuild-audit --all-targets -- -D warnings` passes
+"""
+
+[steps.testPlan]
+file = "crates/smbuild-audit/src/append.rs"
+cases = 2
+coverage = "first append for a new (tenant, scope) returns seq=1 with prev_hash=[0;32] and row_hash=sha256(zero || canonical_json); concurrent appenders for the same chain serialize via FOR UPDATE (two parallel appends produce seqs 1 then 2, never both 1)"
+
+# =============================================================================
+# cargo-deny ban: enforce smbuild-audit is the only writer
+# =============================================================================
+
+[[steps]]
+id = "cargo-deny-audit-ban"
+title = "cargo-deny ban: only smbuild-audit may INSERT INTO audit_chain"
+type = "feature"
+priority = 4
+needs = ["audit-append-fn"]
+files = [
+  "deny.toml",
+  "xtask/Cargo.toml",
+  "xtask/src/main.rs",
+  "xtask/src/audit_chain_ban.rs",
+  ".github/workflows/ci.yml",
+]
+description = """
+Enforce, at CI time, that no Rust code outside `crates/smbuild-audit/src/` contains a string literal matching `INSERT INTO audit_chain` (case-insensitive) or `sqlx::query!("INSERT INTO audit_chain` or any other pattern that bypasses `audit::append`.
+
+**Why an xtask vs cargo-deny native:** `cargo-deny`'s `[bans]` section bans CRATES, not source-code patterns. We need source-pattern bans. The xtask approach is the standard escape hatch (ADR 0003 §`deny.toml` already names this: "a small `xtask` that greps for `INSERT INTO audit_chain` outside `crates/smbuild-audit/` and `db/migrations/`").
+
+**xtask/src/audit_chain_ban.rs:**
+```rust
+use std::path::Path;
+
+pub fn check() -> anyhow::Result<()> {
+    let banned_patterns = [
+        "INSERT INTO audit_chain",
+        "insert into audit_chain",
+        "INSERT INTO \"audit_chain\"",
+    ];
+    let allowed_roots = [
+        "crates/smbuild-audit/src/",
+        "db/migrations/",         // .up.sql / .down.sql declare the table
+        "xtask/src/audit_chain_ban.rs",  // this file itself contains the patterns
+    ];
+    // Walk crates/**/*.rs, contracts/**/*.proto, frontend/**/*.ts —
+    // anything that could conceivably issue a SQL write.
+    // Skip target/, node_modules/, .git/, .sqlx/.
+    // For each file: read; for each banned pattern that appears AND the file
+    // path does not start with any allowed_roots -> report a violation.
+    let violations = find_violations(&banned_patterns, &allowed_roots)?;
+    if violations.is_empty() { return Ok(()); }
+    for v in &violations {
+        eprintln!("AUDIT-CHAIN-BAN: {}:{} — banned pattern `{}` outside smbuild-audit",
+            v.path.display(), v.line, v.pattern);
+    }
+    anyhow::bail!("{} audit-chain bypass attempts detected; route writes through smbuild_audit::append", violations.len());
+}
+```
+
+**xtask/src/main.rs dispatch:**
+```rust
+fn main() -> anyhow::Result<()> {
+    let cmd = std::env::args().nth(1).unwrap_or_default();
+    match cmd.as_str() {
+        "check-audit-ban" => audit_chain_ban::check(),
+        other => anyhow::bail!("unknown xtask subcommand: {}", other),
+    }
+}
+```
+
+**xtask/Cargo.toml:** standalone binary crate; lists `[package.metadata.agent] purpose = "Workspace dev/CI tools — not shipped in any container."`. Workspace `default-members` does NOT include xtask (keep inner-loop cheap per Jankurai pattern).
+
+**.github/workflows/ci.yml addition:**
+Add a job (or a step in the existing CI job):
+```yaml
+  - name: audit-chain bypass check
+    run: cargo xtask check-audit-ban
+```
+
+**deny.toml updates:** keep the existing `[bans]` from ADR 0003 unchanged. Append a comment block pointing at the xtask.
+
+**Acceptance:**
+- `xtask/` is a workspace member with `src/main.rs` and `src/audit_chain_ban.rs`
+- `cargo xtask check-audit-ban` exits 0 on the current tree (no violations expected in a clean Phase 1 state)
+- A negative-control test (a temporary file `crates/smbuild-api/src/__ban_test__.rs` containing `let _ = "INSERT INTO audit_chain (...) VALUES (...)";`) -> re-run `cargo xtask check-audit-ban` -> exits non-zero, prints the violating path + pattern; then delete the test file
+- `.github/workflows/ci.yml` calls `cargo xtask check-audit-ban` on every PR
+- The `deny.toml` pointer comment is in place; no existing `[bans]` rules deleted
+"""
+
+[steps.testPlan]
+file = "xtask/src/audit_chain_ban.rs"
+cases = 2
+coverage = "ban check exits 0 on a clean Phase 1 tree (positive case); ban check exits non-zero and prints the violating path when a non-audit-crate file contains the banned string (negative-control proof)"
+
+# =============================================================================
+# Daily witness job — anchor heads to S3 Object Lock
+# =============================================================================
+
+[[steps]]
+id = "audit-witness-job"
+title = "audit_witness: daily cron job anchoring chain heads to S3 Object Lock"
+type = "feature"
+priority = 4
+needs = ["audit-append-fn"]
+files = [
+  "crates/smbuild-worker/src/jobs/audit_witness.rs",
+  "crates/smbuild-worker/src/jobs/mod.rs",
+  "crates/smbuild-worker/Cargo.toml",
+]
+description = """
+Implement the daily `audit_witness` cron job in `crates/smbuild-worker/src/jobs/audit_witness.rs`. Mirrors Jankurai's merge-witness/SOC-ready-evidence pattern: the engineering chain is the source of truth, but external evidence (S3 Object Lock cross-region) makes it audit-defensible against retroactive tampering — including by us.
+
+**Cron expression:** `{{cron_schedule}}` (default `0 4 * * *`).
+
+**Behavior (per scheduled invocation):**
+1. Open control-plane pool (Phase 1: same Postgres as tenant data; Phase 3: per-tenant pools).
+2. Enumerate all (tenant_id, scope) chains: `SELECT DISTINCT tenant_id, scope FROM audit_chain`.
+3. For each (tenant, scope):
+   a. Inside a per-tenant transaction with `SET LOCAL app.current_tenant_id`:
+      - `SELECT seq, row_hash FROM audit_chain WHERE tenant_id=$1 AND scope=$2 ORDER BY seq DESC LIMIT 1` -> head_seq, head_hash
+   b. Build the `WitnessEnvelope { tenant_id, scope, head_seq, head_hash: hex(head_hash), anchored_at: now_utc }` (pub(crate) type from receipt.rs).
+   c. Upsert into the control-plane `audit_chain_index` table: `INSERT INTO audit_chain_index (tenant_id, scope, head_seq, head_hash, anchored_at, anchor_s3_key) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (tenant_id, scope) DO UPDATE SET head_seq=EXCLUDED.head_seq, head_hash=EXCLUDED.head_hash, anchored_at=EXCLUDED.anchored_at, anchor_s3_key=EXCLUDED.anchor_s3_key`.
+   d. Upload the WitnessEnvelope JSON to `s3://{{anchor_s3_bucket}}/{date}/{tenant_id}/{scope}.json` with Object Lock (Compliance mode, retention 7 years). The bucket is cross-region-replicated to `{{anchor_region_replica}}` per the terraform-aws-baseline formula.
+   e. The `anchor_s3_key` recorded in (c) is the S3 key written in (d). This closes the loop: the control-plane row points at the external witness.
+4. Log a summary line per scope with span attributes `tenant_id`, `scope`, `head_seq`, `anchored_at`, `anchor_s3_key` — visible in the tracing-opentelemetry pipeline.
+
+**S3 client:** `aws-sdk-s3` (the official Rust SDK, used elsewhere for Invoice PDF archival per plan.md feature #12). The job constructs a client at startup; per-upload it calls `put_object` with `object_lock_mode = Compliance` and `object_lock_retain_until_date = now + 7y`.
+
+**Failure handling:**
+- Per-tenant failures are logged and the loop continues to the next tenant. ONE tenant's S3 outage cannot block witness for the rest.
+- After the loop, if any tenant failed -> return a typed error so the scheduler retries the next interval. T-9 demands an alert path on persistent witness failure; the OpenTelemetry pipeline catches this via a metric `audit_witness_failures_total`.
+
+**Phase-1 scope vs out-of-scope:**
+- IN: the cron job itself; the control-plane `audit_chain_index` table (declared in plan.md's data model already); the S3 upload path with Object Lock parameters; basic OTel instrumentation.
+- OUT: the bucket itself (created by `terraform-aws-baseline` formula); KMS rotation (Phase 2 polish); cross-region replication policy (created by terraform module). This formula assumes the bucket exists; tests use a localstack/MinIO container.
+
+**Acceptance:**
+- `crates/smbuild-worker/src/jobs/audit_witness.rs` exports `pub async fn run(pool: &PgPool, s3: &aws_sdk_s3::Client) -> Result<WitnessRunSummary, WitnessError>`
+- The Worker binary's scheduler registers this job under cron `{{cron_schedule}}`
+- For each (tenant, scope), the run produces (a) a row in `audit_chain_index` and (b) an S3 object under `{date}/{tenant_id}/{scope}.json` with `object_lock_mode = Compliance`
+- An integration test uses a MinIO/localstack container + testcontainers Postgres: seed 3 events for one tenant via `append`, run the witness job, assert MinIO has an object at the expected key whose JSON deserializes to WitnessEnvelope with head_seq=3 and head_hash matching the third append's receipt
+- `cargo nextest run -p smbuild-worker audit_witness` passes
+"""
+
+[steps.testPlan]
+file = "crates/smbuild-worker/src/jobs/audit_witness.rs"
+cases = 3
+coverage = "witness run after 3 appends uploads JSON to s3://bucket/{date}/{tenant_id}/{scope}.json with head_seq=3 and head_hash matching the third receipt; per-tenant S3 failure does not block subsequent tenants in the same run; OTel metric audit_witness_failures_total increments on per-tenant failure"
+
+# =============================================================================
+# Tamper-detection integration test
+# =============================================================================
+
+[[steps]]
+id = "audit-trigger-tamper-test"
+title = "Tamper detection: trigger rejects retroactive edits"
+type = "feature"
+priority = 4
+needs = ["audit-append-fn", "audit-chain-migration"]
+files = [
+  "crates/smbuild-audit/tests/tamper_detection.rs",
+  "crates/smbuild-audit/tests/common/mod.rs",
+]
+description = """
+Prove the audit chain is tamper-evident at the DB level. Uses testcontainers Postgres + the migration from `audit-chain-migration` + the `append` fn.
+
+**Test flow:**
+1. Spin up Postgres 16, run migrations.
+2. Seed one tenant in the control-plane `tenants` table; set `app.current_tenant_id` to that tenant's UUID on the test connection (mimicking what the middleware does in prod).
+3. Append three legitimate events for scope=Invoice via `append::<TestInvoiceEvent>(...)`. Assert seqs 1, 2, 3 with chained hashes.
+4. TAMPER: with a raw SQL connection (bypassing `append` — this is what an attacker, OR a buggy migration, would do), `UPDATE audit_chain SET row_json = '{"tampered":true}' WHERE tenant_id = $1 AND scope = 'invoice' AND seq = 2`. This update succeeds (UPDATE isn't gated by the BEFORE INSERT trigger — that's intentional; the trigger gates INSERTs, and the tamper-evident *detection* comes from a verify_chain helper).
+5. Call `audit::verify_chain(pool, tenant_id, AuditScope::Invoice)` -> reports `ChainBroken { at_seq: 2, reason: "row_hash mismatch with recomputed canonical hash" }`. This is the detection mechanism (used by the daily witness job and on-demand).
+6. Also assert PREVENTION: attempting to INSERT seq=4 with a wrong prev_hash via raw SQL is rejected by the trigger.
+
+**Acceptance:**
+- Test 1 (PREVENTION): with the chain at seq=1, raw SQL `INSERT INTO audit_chain (...) VALUES (..., seq=2, prev_hash=BAD_HASH, ..., row_hash=correctly_computed_from_BAD_HASH)` -> trigger raises `audit_chain prev_hash mismatch` per the trigger's RAISE EXCEPTION
+- Test 2 (PREVENTION): raw SQL insert with correct prev_hash but wrong row_hash -> trigger raises `audit_chain row_hash mismatch`
+- Test 3 (DETECTION): seed seq 1..3 via `append`; raw SQL `UPDATE audit_chain SET row_json = '{"tampered":true}' WHERE seq=2`; call `audit::verify_chain(pool, tenant_id, Invoice)` -> returns `Err(ChainBroken { at_seq: 2 })`
+- All tests run under testcontainers Postgres (real RLS, real trigger; T-14 proof)
+- Total test runtime <60s with container reuse
+"""
+
+[steps.testPlan]
+file = "crates/smbuild-audit/tests/tamper_detection.rs"
+cases = 3
+coverage = "trigger rejects INSERT with wrong prev_hash (prevention); trigger rejects INSERT with wrong row_hash (prevention); verify_chain detects post-hoc UPDATE to row_json (detection — what the daily witness job catches)"
+
+# =============================================================================
+# append() round-trip + cross-tenant RLS test
+# =============================================================================
+
+[[steps]]
+id = "audit-append-integration-test"
+title = "append: hash-chain round-trip + cross-tenant RLS proof"
+type = "feature"
+priority = 4
+needs = ["audit-append-fn", "audit-chain-migration"]
+files = [
+  "crates/smbuild-audit/tests/append_round_trip.rs",
+]
+description = """
+End-to-end test for `append`. Uses testcontainers Postgres + the migration.
+
+**Test 1 — chain consistency:**
+- Seed one tenant; bind the test conn to `app.current_tenant_id = tenant_a`.
+- Append three events for scope=Invoice: `InvoiceSent { invoice_id: ulid1 }`, then `InvoicePaid { invoice_id: ulid1, paid_cents: 12345 }`, then `InvoiceVoided { invoice_id: ulid1 }`. (Define these as test-internal struct + `impl AuditEvent` blocks.)
+- Read back via raw SQL: `SELECT seq, prev_hash, row_hash, row_json FROM audit_chain WHERE tenant_id=$1 AND scope='invoice' ORDER BY seq`.
+- Assert: seq=1 has `prev_hash = [0;32]`. seq=2.prev_hash == seq=1.row_hash. seq=3.prev_hash == seq=2.row_hash.
+- Assert: each row_hash recomputes from canonical row_json (`sha256(prev_hash || canonical_json_bytes(row_json))`) — proves canonicalization is deterministic and round-trips.
+- Assert: receipts returned by `append` match the persisted seqs and row_hashes.
+
+**Test 2 — cross-tenant RLS proof:**
+- Create two tenants, A and B.
+- Open a connection, attempt a raw SQL INSERT into `audit_chain` for tenant_a's row while the conn has `app.current_tenant_id = tenant_b` set OUTSIDE a smbuild_audit::append call -> RLS rejects with `permission denied` or RLS check failure. This is the defense-in-depth proof.
+- Assert: a legitimate `append` for tenant_a from a conn that was previously set to tenant_b succeeds, because append takes responsibility for SET LOCAL itself — this is the contract.
+
+**Acceptance:**
+- Test 1 passes — 3 sequential appends produce a consistent chain with verifiable prev_hash links and round-trippable row_hash
+- Test 2 passes — raw SQL INSERT bypassing `append` is rejected by RLS (defense-in-depth)
+- All tests run against testcontainers Postgres (T-14 — real RLS, real trigger, no mocks)
+"""
+
+[steps.testPlan]
+file = "crates/smbuild-audit/tests/append_round_trip.rs"
+cases = 3
+coverage = "3 sequential appends produce a hash-chained sequence (seq=N.prev_hash == seq=N-1.row_hash); row_hash recomputes deterministically from (prev_hash, canonical row_json); raw SQL cross-tenant INSERT bypassing append is rejected by RLS policy (defense-in-depth)"
