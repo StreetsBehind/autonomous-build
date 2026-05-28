@@ -5,8 +5,9 @@ Workflow infrastructure for going from a `vision.md` file to a shipped app, with
 ## The pipeline
 
 ```
-vision.md   ──/vision──▶   plan.md
-plan.md     ──/compose──▶  beads DAG (epics + tasks + deps)
+vision.md   ──/vision──▶   plan.md + plan.lock.json
+plan.lock.json  ──/compose──▶  beads DAG (epics + tasks + deps)
+   (falls back to plan.md regex parse if lock missing)
                                   │
                                   ▼
                           /quality-pass   ──▶  per-bead score; under 95 → /split

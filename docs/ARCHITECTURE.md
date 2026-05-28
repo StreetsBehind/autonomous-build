@@ -10,21 +10,23 @@
 
 ## Stage-by-stage
 
-### `/vision` — vision.md → plan.md
+### `/vision` — vision.md → plan.md + plan.lock.json
 
 Inputs: `templates/vision.md` filled out by the user.
-Outputs: `plan.md` containing:
+Outputs: a paired `plan.md` (human narrative) and `plan.lock.json` (machine-readable mirror), both containing:
 - Tech stack decision with one-line reasoning per choice
 - Data model (entities, fields, relationships)
 - Feature list ranked by dependency
 - Formula picks (which `formulas/*.formula.toml` to pour, with variable bindings)
 - Escalation budget (e.g. "block on >$5/day API spend")
 
+The lock is validated against [`schemas/plan.lock.schema.json`](../schemas/plan.lock.schema.json) before being written; field reference is in [`docs/PLAN_LOCK.md`](PLAN_LOCK.md). The lock is the source of truth `/compose` consumes — `plan.md` exists for human review and as a fallback for repos that pre-date the lock.
+
 This stage runs *with the user in the loop*. The plan is a contract — the loop won't second-guess it later.
 
-### `/compose` — plan.md → beads DAG
+### `/compose` — plan.lock.json → beads DAG
 
-Initializes beads in the app repo, runs `bd setup claude --project`, then for each formula pick:
+Reads `plan.lock.json` (falling back to `plan.md` regex parse with a deprecation warning if the lock is absent). Initializes beads in the app repo, runs `bd setup claude --project`, then for each formula pick:
 - `bd cook <formula> --var k=v ... --persist` (or `bd mol pour`) to spawn the issue subtree
 - `bd dep add` for cross-formula dependencies declared in the plan
 

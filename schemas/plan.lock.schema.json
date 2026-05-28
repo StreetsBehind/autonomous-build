@@ -1,0 +1,171 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/cstaulbee/autonomous-build/schemas/plan.lock.schema.json",
+  "title": "plan.lock.json",
+  "description": "Machine-readable mirror of plan.md emitted by /vision and consumed by /compose. Authoritative for stack, data model, features, formula picks, deps, and escalation budget. plan.md remains the human narrative.",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "app",
+    "stack",
+    "dataModel",
+    "featureOrder",
+    "crossFeatureDependencies",
+    "escalationBudget",
+    "openQuestions",
+    "incomplete"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": {
+      "type": "integer",
+      "const": 1,
+      "description": "Schema version. Bump on breaking changes; /compose refuses unknown versions."
+    },
+    "app": {
+      "type": "object",
+      "required": ["name"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "description": { "type": "string" }
+      }
+    },
+    "stack": {
+      "type": "object",
+      "description": "Tech stack decisions, keyed by layer. Each value is the chosen tool and the one-line justification.",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["choice", "why"],
+        "additionalProperties": false,
+        "properties": {
+          "choice": { "type": "string", "minLength": 1 },
+          "why":    { "type": "string", "minLength": 1 }
+        }
+      },
+      "propertyNames": {
+        "enum": [
+          "language",
+          "backend",
+          "frontend",
+          "database",
+          "orm",
+          "auth",
+          "hosting",
+          "tests",
+          "lint"
+        ]
+      }
+    },
+    "dataModel": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["entity", "fields"],
+        "additionalProperties": false,
+        "properties": {
+          "entity": { "type": "string", "minLength": 1 },
+          "fields": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "relationships": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "notes": { "type": "string" }
+        }
+      }
+    },
+    "featureOrder": {
+      "type": "array",
+      "description": "Ordered list of features. Each feature names one or more formulas to pour and the variable bindings.",
+      "items": {
+        "type": "object",
+        "required": ["name", "formulas"],
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "formulas": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "vars": {
+            "type": "object",
+            "description": "Variable bindings passed to bd mol pour --var k=v. Values may be strings, numbers, booleans, or arrays of those.",
+            "additionalProperties": {
+              "oneOf": [
+                { "type": "string" },
+                { "type": "number" },
+                { "type": "boolean" },
+                {
+                  "type": "array",
+                  "items": {
+                    "oneOf": [
+                      { "type": "string" },
+                      { "type": "number" },
+                      { "type": "boolean" }
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          "notes": { "type": "string" }
+        }
+      }
+    },
+    "crossFeatureDependencies": {
+      "type": "array",
+      "description": "Each entry produces a `bd dep add <blocked> <blocker>` call after the pour.",
+      "items": {
+        "type": "object",
+        "required": ["blocked", "blocker"],
+        "additionalProperties": false,
+        "properties": {
+          "blocked": {
+            "type": "string",
+            "description": "Feature name (matches featureOrder[].name) or specific bead ID."
+          },
+          "blocker": {
+            "type": "string",
+            "description": "Feature name (matches featureOrder[].name) or specific bead ID."
+          },
+          "reason": { "type": "string" }
+        }
+      }
+    },
+    "escalationBudget": {
+      "type": "object",
+      "required": ["maxSessionCostUsd", "maxFailuresPerTask"],
+      "additionalProperties": false,
+      "properties": {
+        "maxSessionCostUsd": { "type": "number", "minimum": 0 },
+        "maxFailuresPerTask": { "type": "integer", "minimum": 1 },
+        "additionalBlockTriggers": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "openQuestions": {
+      "type": "array",
+      "description": "Questions /vision could not resolve. Any with blockingCompose=true must be answered before /compose runs.",
+      "items": {
+        "type": "object",
+        "required": ["question", "blockingCompose"],
+        "additionalProperties": false,
+        "properties": {
+          "question":        { "type": "string", "minLength": 1 },
+          "blockingCompose": { "type": "boolean" },
+          "context":         { "type": "string" }
+        }
+      }
+    },
+    "incomplete": {
+      "type": "boolean",
+      "description": "True iff openQuestions contains any entry with blockingCompose=true. /compose refuses to run when this is true."
+    }
+  }
+}

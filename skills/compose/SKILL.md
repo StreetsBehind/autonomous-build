@@ -10,10 +10,44 @@ Convert `plan.md` into a live beads DAG inside the current app repo. After this 
 ## Pre-flight checks (run these before doing anything)
 
 1. **`plan.md` exists in CWD.** If not, stop and ask the user to run `/vision`.
-2. **`plan.md` has no "Open questions for human" section content.** If it does, stop and surface them — do not paper over.
-3. **Beads is not yet initialized in this repo.** If `bd info` succeeds, ask the user whether to reset (`rm -rf .beads/`) or proceed and merge. Default: stop and ask.
-4. **Every formula referenced in plan.md exists in `bd formula list`.** If any are missing, stop and ask.
-5. **Jankurai is installed.** `jankurai version` must succeed. If not, stop and surface the install command (`cargo install --path crates/jankurai --locked` from a checkout, or the release installer at github.com/neverhuman/jankurai/releases). Jankurai is the [quality standard for every app this workflow builds](../../README.md#quality-standard) — not optional.
+2. **Plan source resolved.** Prefer `plan.lock.json`; fall back to `plan.md` regex parse with a deprecation warning. See "Plan source" below.
+3. **Plan is not flagged incomplete.** If `plan.lock.json` has `incomplete: true`, refuse and surface its `openQuestions` list. If only `plan.md` is present and has an "Open questions for human" section with content, refuse and surface that — do not paper over.
+4. **Beads is not yet initialized in this repo.** If `bd info` succeeds, ask the user whether to reset (`rm -rf .beads/`) or proceed and merge. Default: stop and ask.
+5. **Every formula referenced in the plan exists in `bd formula list`.** If any are missing, stop and ask.
+6. **Jankurai is installed.** `jankurai version` must succeed. If not, stop and surface the install command (`cargo install --path crates/jankurai --locked` from a checkout, or the release installer at github.com/neverhuman/jankurai/releases). Jankurai is the [quality standard for every app this workflow builds](../../README.md#quality-standard) — not optional.
+
+## Plan source: `plan.lock.json` first, `plan.md` fallback
+
+`/vision` emits both `plan.md` (human narrative) and `plan.lock.json` (machine-readable mirror; schema at [`schemas/plan.lock.schema.json`](../../schemas/plan.lock.schema.json), reference in [`docs/PLAN_LOCK.md`](../../docs/PLAN_LOCK.md)). Resolve the source in this order, before Step 1:
+
+```powershell
+if (Test-Path plan.lock.json) {
+    $lock = Get-Content plan.lock.json -Raw | ConvertFrom-Json
+    # Validate against schemas/plan.lock.schema.json (e.g. via `jankurai` if it has a JSON Schema validator,
+    # or `python -m jsonschema -i plan.lock.json autonomous-build/schemas/plan.lock.schema.json`,
+    # or a small inline check on required top-level fields + schemaVersion == 1).
+    if ($lock.schemaVersion -ne 1) {
+        throw "plan.lock.json schemaVersion=$($lock.schemaVersion) — this compose only understands 1"
+    }
+    if ($lock.incomplete) {
+        Write-Host "plan.lock.json incomplete — open questions blocking /compose:"
+        $lock.openQuestions | Where-Object blockingCompose | ForEach-Object { Write-Host "  - $($_.question)" }
+        exit 1
+    }
+    $planSource = 'lock'
+} else {
+    Write-Host "[deprecation] plan.lock.json missing — falling back to plan.md regex parse; rerun /vision to generate the lock"
+    $planSource = 'md'
+}
+```
+
+When `$planSource -eq 'lock'`:
+- Step 4 iterates `$lock.featureOrder` directly. `$feature.name`, `$feature.formulas`, `$feature.vars` are already structured — no regex.
+- Step 5 (coverage check) compares `$pouredFeatures` keys against `$lock.featureOrder.name` rather than re-parsing markdown.
+- Step 6 reads cross-feature deps from `$lock.crossFeatureDependencies` instead of the markdown section.
+- `plan.md` is only read for human-narrative output (printed in summaries, never parsed).
+
+When `$planSource -eq 'md'`: behave exactly as the prior version of this skill did — regex-parse `plan.md` §"Feature order" and §"Cross-feature dependencies". This is the legacy path; the deprecation warning at pre-flight should prod the user to rerun `/vision`.
 
 ## Process
 
@@ -51,7 +85,9 @@ Convert `plan.md` into a live beads DAG inside the current app repo. After this 
    ```
    Capture the returned epic ID.
 
-4. **For each feature in `plan.md` §"Feature order":**
+4. **For each feature in the resolved plan source:**
+
+   When `$planSource -eq 'lock'`, iterate `$lock.featureOrder` directly — `name`, `formulas`, `vars` are pre-structured. When `$planSource -eq 'md'`, fall back to the regex parse described in Step 5 below (legacy path).
 
    Maintain `$pouredFeatures = @{}` across the loop; Step 5 reads it for the coverage check.
 
@@ -114,35 +150,52 @@ Convert `plan.md` into a live beads DAG inside the current app repo. After this 
 
       If a step declares `files` but no `testPlan`, that's also fine — chore steps (lint config, README) write files but don't ship tests, and the filesTouched declaration still earns them conflict-aware dispatch.
 
-5. **Coverage check: every plan.md feature produced an epic.** During Step 4, build a map `$pouredFeatures[<feature-name>] = @($pourRoot, ...)`. After the loop, parse `plan.md` §"Feature order" to extract feature names (the bolded label before the em-dash) and verify each appears as a key in `$pouredFeatures` with at least one pour-root. Report any feature with no associated pour:
+5. **Coverage check: every plan feature produced an epic.** During Step 4, build a map `$pouredFeatures[<feature-name>] = @($pourRoot, ...)`. After the loop, compare against the source-of-truth feature list:
 
    ```powershell
-   # Parse plan.md §"Feature order" — feature lines look like:
-   #   "1. Habits CRUD — formulas: `[crud-feature]`, vars: `{entity=Habit}`"
-   # The feature name is the text before the em-dash (—).
-   $planLines = Get-Content plan.md
-   $inFeatureSection = $false
-   $planFeatures = @()
-   foreach ($line in $planLines) {
-       if ($line -match '^##\s+Feature order')        { $inFeatureSection = $true;  continue }
-       if ($inFeatureSection -and $line -match '^##\s'){ break }
-       if ($inFeatureSection -and $line -match '^\s*\d+\.\s+(.+?)\s+—') {
-           $planFeatures += $Matches[1].Trim()
+   if ($planSource -eq 'lock') {
+       # Authoritative path — names come straight from the structured lock.
+       $planFeatures = $lock.featureOrder | ForEach-Object { $_.name }
+   } else {
+       # Legacy regex path — used only when plan.lock.json is absent.
+       # Feature lines in plan.md look like:
+       #   "1. Habits CRUD — formulas: `[crud-feature]`, vars: `{entity=Habit}`"
+       # The feature name is the text before the em-dash (—).
+       $planLines = Get-Content plan.md
+       $inFeatureSection = $false
+       $planFeatures = @()
+       foreach ($line in $planLines) {
+           if ($line -match '^##\s+Feature order')        { $inFeatureSection = $true;  continue }
+           if ($inFeatureSection -and $line -match '^##\s'){ break }
+           if ($inFeatureSection -and $line -match '^\s*\d+\.\s+(.+?)\s+—') {
+               $planFeatures += $Matches[1].Trim()
+           }
        }
    }
 
    $missing = $planFeatures | Where-Object { -not $pouredFeatures.ContainsKey($_) }
    if ($missing.Count -gt 0) {
-       Write-Host "PLAN COVERAGE GAP — these plan.md features produced no epic:"
+       Write-Host "PLAN COVERAGE GAP — these plan features produced no epic:"
        $missing | ForEach-Object { Write-Host "  - $_" }
    }
    ```
 
-   Do NOT auto-correct, do NOT block — print the gap to the compose summary so the user can fix `plan.md` or re-pour the missing formula(s). This is the cheap insurance against a typo in plan.md silently dropping a feature.
+   Do NOT auto-correct, do NOT block — print the gap to the compose summary so the user can fix the plan or re-pour the missing formula(s). On the `lock` path this should never fire (structured input means no parse drops); on the `md` fallback it's the cheap insurance against a typo silently dropping a feature.
 
-6. **Add cross-feature dependencies** from `plan.md` §"Cross-feature dependencies":
+6. **Add cross-feature dependencies.** Source-of-truth depends on the resolved plan source:
+
    ```powershell
-   bd dep add <blocked-id> <blocker-id>
+   if ($planSource -eq 'lock') {
+       foreach ($dep in $lock.crossFeatureDependencies) {
+           # Resolve feature names → pour-root bead IDs via $pouredFeatures.
+           # If $dep.blocked / $dep.blocker is already a bead ID, pass through.
+           $blockedId = if ($pouredFeatures.ContainsKey($dep.blocked)) { $pouredFeatures[$dep.blocked][0] } else { $dep.blocked }
+           $blockerId = if ($pouredFeatures.ContainsKey($dep.blocker)) { $pouredFeatures[$dep.blocker][0] } else { $dep.blocker }
+           bd dep add $blockedId $blockerId
+       }
+   } else {
+       # Legacy: parse plan.md §"Cross-feature dependencies" and call bd dep add for each line.
+   }
    ```
 
 7. **Validate the DAG.**

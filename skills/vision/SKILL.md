@@ -34,9 +34,18 @@ Turn a `vision.md` into a `plan.md` the rest of the pipeline can consume.
 
 7. **Set the escalation budget.** Copy from vision.md §9, fill defaults for anything left blank.
 
-## Output: `plan.md`
+## Outputs: `plan.md` + `plan.lock.json`
 
-Use this exact structure so `/compose` can parse it:
+`/vision` writes two paired files in the app repo CWD:
+
+- **`plan.md`** — the human-readable contract (structure below). Quoted to the user, edited if they want, and kept in git as the narrative.
+- **`plan.lock.json`** — the machine-readable mirror that `/compose` consumes. Same content in structured form, validated against [`autonomous-build/schemas/plan.lock.schema.json`](../../schemas/plan.lock.schema.json) before writing. See [`docs/PLAN_LOCK.md`](../../docs/PLAN_LOCK.md) for the field reference.
+
+Write both. If schema validation fails, stop — do not write a partial lock. If `plan.md` §"Open questions for human" has any items the user must answer before composing, write the lock anyway with `incomplete: true` and `openQuestions[].blockingCompose: true` for those items; `/compose` will refuse cleanly with the structured reason.
+
+### `plan.md` structure
+
+Use this exact structure so `/compose`'s fallback parser (for repos that pre-date plan.lock.json) still works:
 
 ```markdown
 # Plan: <app name>
