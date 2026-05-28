@@ -64,6 +64,14 @@ Top-level shape:
       "context": "Defaulted to soft-delete; flag for review pre-launch."
     }
   ],
+  "agentConsults": [
+    {
+      "question": "Habit-streak push notifications: add a queue (Redis/SQS) or run inline?",
+      "decision": "Run inline on the Rust core; revisit if p99 latency on the streak endpoint exceeds 200ms in real load.",
+      "rationale": "Counter-arguer showed the streak endpoint is read-mostly and the notification fan-out is <100 users for v1; architect's queue addition added a new infra row without serving a current pain point.",
+      "reversalCost": "Adding a queue later is a single new service + one Rust worker crate — no data migration needed since streak state stays in Postgres."
+    }
+  ],
   "incomplete": false
 }
 ```
@@ -95,7 +103,12 @@ Each entry becomes a `bd dep add <blocked> <blocker>` call after the pour. `bloc
 - `additionalBlockTriggers` — free-form strings appended to `docs/ESCALATION_RULES.md`'s defaults for this app.
 
 ### `openQuestions` (required, may be empty)
-Items `/vision` could not resolve. Each has `question`, `blockingCompose` (bool), and optional `context`. If any item has `blockingCompose: true`, `incomplete` MUST be `true` and `/compose` will refuse with the question list.
+**Product/scope questions** `/vision` could not resolve. Each has `question`, `blockingCompose` (bool), and optional `context`. If any item has `blockingCompose: true`, `incomplete` MUST be `true` and `/compose` will refuse with the question list.
+
+Tech ambiguity does **not** belong here — it routes to `agentConsults`. See `skills/vision/SKILL.md` step 7 for the consult protocol and `docs/DEFAULT_STACK.md` for the pinned stack.
+
+### `agentConsults` (optional, may be empty or omitted)
+Decisions `/vision` made via the 3-agent off-stack consult (architect / reviewer / counter-arguer) rather than paging the human. Each entry has `question`, `decision`, `rationale`, and `reversalCost` — all required strings. The human reviews these at the `plan.md` gate after `/vision` finishes and can reverse them by editing the plan; they are not surfaced as blocking questions during planning.
 
 ### `incomplete` (required)
 Boolean. True iff any `openQuestions[].blockingCompose === true`. Written explicitly (not derived at read time) so a malformed lock fails validation rather than silently passing.

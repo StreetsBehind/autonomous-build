@@ -38,13 +38,11 @@ Things this app explicitly will NOT do. This is the most valuable section — it
 
 ## 7. Tech preferences
 
-- **Language(s)**: e.g. "TypeScript everywhere", "Python backend, React frontend", "no preference"
-- **Frameworks I like**: e.g. "Next.js, FastAPI, Tailwind"
-- **Frameworks I want to avoid**: e.g. "no Redux, no Prisma"
-- **Database**: e.g. "Postgres", "SQLite for v1", "no preference"
-- **Hosting**: e.g. "Vercel", "Fly.io", "Railway"
-
-If you wrote "no preference" anywhere, the `/vision` skill will pick one with a justification — but it won't ask you mid-build to revisit it.
+> The stack is pinned. The workflow defaults every app to the Jankurai stack documented in [`docs/DEFAULT_STACK.md`](../docs/DEFAULT_STACK.md) (Rust core + TS/React/Vite product surface + PostgreSQL + generated contracts + exception-only Python for AI/data). `/vision` will not ask you to pick a language, framework, database, test runner, lint tool, or hosting target.
+>
+> If you need a stack change for *this app*, edit `docs/DEFAULT_STACK.md` first — it's a workflow-level change, not a vision-level one.
+>
+> If your app needs something outside the pinned stack (e.g. a queue, vector DB, websocket gateway), leave that to `/vision`'s agent consult. Do not pre-decide it here.
 
 ## 8. Success metric
 

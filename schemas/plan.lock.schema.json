@@ -151,7 +151,7 @@
     },
     "openQuestions": {
       "type": "array",
-      "description": "Questions /vision could not resolve. Any with blockingCompose=true must be answered before /compose runs.",
+      "description": "Product/scope questions /vision could not resolve. Any with blockingCompose=true must be answered before /compose runs. Tech ambiguity does NOT go here — it routes to agentConsults.",
       "items": {
         "type": "object",
         "required": ["question", "blockingCompose"],
@@ -160,6 +160,21 @@
           "question":        { "type": "string", "minLength": 1 },
           "blockingCompose": { "type": "boolean" },
           "context":         { "type": "string" }
+        }
+      }
+    },
+    "agentConsults": {
+      "type": "array",
+      "description": "Decisions /vision made via the 3-agent off-stack consult (architect / reviewer / counter-arguer). Each entry is one decided question. Not surfaced to the human during planning; reviewed at the plan.md gate.",
+      "items": {
+        "type": "object",
+        "required": ["question", "decision", "rationale", "reversalCost"],
+        "additionalProperties": false,
+        "properties": {
+          "question":     { "type": "string", "minLength": 1 },
+          "decision":     { "type": "string", "minLength": 1 },
+          "rationale":    { "type": "string", "minLength": 1 },
+          "reversalCost": { "type": "string", "minLength": 1 }
         }
       }
     },

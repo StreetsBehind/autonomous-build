@@ -21,3 +21,7 @@ loop-*.log
 
 # Retro temp files (created during /retro analysis, not the final reports)
 .retro-tmp/
+
+# Transient bd ready dump (some skills pipe `bd ready --json` here mid-run)
+ready.json
+
