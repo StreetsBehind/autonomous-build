@@ -5,9 +5,10 @@ Workflow infrastructure for going from a `vision.md` file to a shipped app, with
 ## The pipeline
 
 ```
-vision.md   ──/vision──▶   plan.md + plan.lock.json
+vision.md   ──/vision──▶   plan.md + plan.lock.json + tenets.md
 plan.lock.json  ──/compose──▶  beads DAG (epics + tasks + deps)
    (falls back to plan.md regex parse if lock missing)
+   tenets.md ─ read by /build-next for build-time judgment calls
                                   │
                                   ▼
                           /quality-pass   ──▶  per-bead score; under 95 → /split
@@ -34,8 +35,11 @@ plan.lock.json  ──/compose──▶  beads DAG (epics + tasks + deps)
 | Path | What it is |
 | --- | --- |
 | `formulas/` | beads workflow templates — the reusable intellectual property |
-| `skills/` | Claude Code skills that drive each stage (`vision`, `compose`, `quality-pass`, `split`, `build-next`, `build-batch`, `escalate`, `flag`, `retro`) |
+| `skills/` | Turn-by-turn Claude Code skills (`vision`, `compose`, `quality-pass`, `split`, `build-next`, `build-batch`, `escalate`, `flag`) |
+| `workflows/` | Dynamic-workflow specs (`<name>.spec.md`) and their canonical generated scripts (`<name>.js`). `retro` lives here. |
 | `templates/vision.md` | The form you fill out per app |
+| `templates/tenets.md` | Template `/vision` populates per-app — inherits the workflow tenets and derives app-specific ones from vision + plan.lock |
+| `docs/TENETS.md` | The workflow-level tenets — principles the loop falls back on for build-time judgment calls |
 | `hooks/post-build-gate.ps1` | Quality gate (typecheck/lint/test + Jankurai audit/witness) run before every `bd close` |
 | `retros/` | Markdown retros produced by `/retro` after each app finishes |
 | `.beads/` | This repo's *own* beads DB — tracks workflow improvements (retro-filed) |
@@ -44,7 +48,7 @@ plan.lock.json  ──/compose──▶  beads DAG (epics + tasks + deps)
 ## Getting started
 
 1. Clone this repo.
-2. From the repo root, run `./install.ps1`. This walks `skills/` and creates a directory junction for each subdir in `~/.claude/skills/`, then walks `formulas/` and creates a same-volume NTFS hard link for each file in `~/.beads/formulas/`. Idempotent — safe to re-run after `git pull` to pick up new skills or formulas. Re-run with `-Force` to overwrite existing real directories or out-of-date files; re-run with `-DryRun` to plan without changing anything.
+2. From the repo root, run `./install.ps1`. This walks `skills/` and creates a directory junction for each subdir in `~/.claude/skills/`, walks `formulas/` and creates a same-volume NTFS hard link for each file in `~/.beads/formulas/`, and walks `workflows/*.js` and hard-links each script into `~/.claude/workflows/` so the dynamic-workflow runtime finds them user-globally. It also cleans up any stale skill junctions whose source no longer exists in this repo (e.g. skills that have graduated to workflows). Idempotent — safe to re-run after `git pull` to pick up new skills, formulas, or workflows. Re-run with `-Force` to overwrite existing real directories or out-of-date files; re-run with `-DryRun` to plan without changing anything.
 3. Install [Jankurai](https://github.com/neverhuman/jankurai) (`cargo install --path crates/jankurai --locked` from a checkout, or the release installer).
 4. In any new app repo: `bd init && bd setup claude --project`, then invoke `/vision`.
 

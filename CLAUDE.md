@@ -8,7 +8,11 @@ The workflow repo behind `/vision → /compose → /build-next → /retro`. Not 
 - `README.md` — pipeline overview, install
 - `docs/ARCHITECTURE.md` — design principles + stage-by-stage
 - `docs/ESCALATION_RULES.md` — when the loop must block instead of guess
-- `skills/<name>/SKILL.md` — symlinked into `~/.claude/skills/`
+- `docs/TENETS.md` — workflow-level principles for build-time judgment calls; inherited by every per-app `tenets.md` that `/vision` produces
+- `docs/DEFAULT_STACK.md` — pinned Jankurai stack `/vision` resolves against
+- `templates/tenets.md` — the template `/vision` populates per-app
+- `skills/<name>/SKILL.md` — turn-by-turn skills, junctioned into `~/.claude/skills/`
+- `workflows/<name>.spec.md` + `workflows/<name>.js` — dynamic-workflow specs and the canonical generated scripts. `install.ps1` hardlinks `*.js` into `~/.claude/workflows/`; `.spec.md` files stay repo-only.
 - `formulas/*.toml` — bd workflow templates. **TOML only.** bd's help text suggests YAML works; the loader disagrees.
 - `hooks/post-build-gate.ps1` — the quality gate (lint + typecheck + test + pre-commit safety + Jankurai). Not `bd preflight`.
 

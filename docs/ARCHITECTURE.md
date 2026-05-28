@@ -66,19 +66,20 @@ When the user notices the loop did something the workflow itself should have pre
 
 ### `/retro` — workflow performance review
 
-Runs automatically at the loop's DONE exit (both ready and blocked are empty), and manually any time. Pulls from:
+Implemented as a **dynamic workflow** (`workflows/retro.spec.md` + `workflows/retro.js`) rather than a turn-by-turn skill. The workflow fans out an independent agent per data source, then runs an adversarial cross-check (two agents must agree) on every proposed improvement bead before it's filed. Runs automatically at the loop's DONE exit (both ready and blocked are empty), and manually any time. Pulls from:
 - App's beads DB: closure metrics, retry counts, flagged issues, blocked issues
 - App git log: reverts of loop commits, post-close edits within 24h, suspiciously-fast closures (<30s)
-- `autonomous-build`'s git log during the build window: mid-build edits to skills/formulas/gate (each one is evidence the workflow needed adjustment)
+- `autonomous-build`'s git log during the build window: mid-build edits to skills/workflows/formulas/gate (each one is evidence the workflow needed adjustment)
 - `bd audit` interactions.jsonl: per-task tool-call activity
+- Jankurai receipts under `target/jankurai/` and prior retros under `retros/`
 
 Outputs:
-1. A markdown report at `retros/retro-<app>-<date>.md`
-2. Concrete improvement issues filed into autonomous-build's own beads DB under the `Workflow improvements` epic, with `workflow-improvement` and `from-app:<name>` labels and acceptance criteria the loop can later self-verify (e.g. "edit `skills/vision/SKILL.md` to add SQLite bias for simple-v1 apps; verify by grep").
+1. A markdown report at `retros/retro-<app>-<date>.md`, including a "Uncertain (human triage)" section for proposed improvements whose evidence or fix didn't survive cross-check
+2. Concrete improvement issues filed into autonomous-build's own beads DB under a per-retro epic, with `workflow-improvement`, `from-app:<name>`, and `retro-date:<date>` labels; acceptance criteria the loop can later self-verify (e.g. "edit `skills/vision/SKILL.md` to add SQLite bias for simple-v1 apps; verify by grep"). Idempotent — re-running the same retro will not duplicate previously-filed beads.
 
 ## The meta-loop
 
-`autonomous-build/` is itself a `bd init`'d repo. Workflow improvement tasks filed by `/retro` are real beads issues here. You can work them by hand or — for ones whose acceptance is self-verifiable — run `/loop /build-next` *on this repo* and let the loop improve the loop. The same machinery applies; the only difference is the work product is a SKILL.md / formula.toml diff instead of app code.
+`autonomous-build/` is itself a `bd init`'d repo. Workflow improvement tasks filed by `/retro` are real beads issues here. You can work them by hand or — for ones whose acceptance is self-verifiable — run `/loop /build-next` *on this repo* and let the loop improve the loop. The same machinery applies; the only difference is the work product is a SKILL.md / `<name>.spec.md` / formula.toml diff instead of app code.
 
 This is where the workflow compounds: the more apps you build, the more retros run, the more improvement issues get filed, and the better the next app's first draft is. The infrastructure improves itself.
 
