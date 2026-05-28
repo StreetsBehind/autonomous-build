@@ -33,7 +33,20 @@ if (-not (Test-Path $fDst)) {
 }
 ```
 
-> Symlinks on Windows require either Developer Mode enabled (Settings → Privacy & security → For developers) or an elevated PowerShell. If symlinks aren't an option, copy instead — but you lose the auto-update-on-pull benefit.
+> Symlinks on Windows require either Developer Mode enabled (Settings → Privacy & security → For developers) or an elevated PowerShell. If neither is available, fall back to **directory junctions** — they require no privileges, work for the skills (each is a directory) and the formulas folder (one directory), and behave identically for our purposes. The block below tries `SymbolicLink` first and falls back to `mklink /J`:
+
+```powershell
+function Try-Link {
+  param([string]$linkPath, [string]$targetPath)
+  if (Test-Path $linkPath) { return }
+  try { New-Item -ItemType SymbolicLink -Path $linkPath -Target $targetPath -ErrorAction Stop | Out-Null }
+  catch { cmd /c mklink /J "$linkPath" "$targetPath" | Out-Null }
+}
+Get-ChildItem .\skills -Directory | ForEach-Object { Try-Link (Join-Path "$env:USERPROFILE\.claude\skills" $_.Name) $_.FullName }
+Try-Link "$env:USERPROFILE\.beads\formulas" ((Resolve-Path .\formulas).Path)
+```
+
+After installing, **restart Claude Code** so the new skills get discovered. They show up as `/vision`, `/compose`, `/build-next`, `/escalate`.
 
 Verify:
 
