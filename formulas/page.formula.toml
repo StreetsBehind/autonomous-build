@@ -1,0 +1,155 @@
+# page: a single UI page — route registration, component, optional data hook, test.
+#
+# The smallest UI unit. Use for settings screens, about pages, dashboards, etc. —
+# anything that isn't a CRUD slice (use crud-feature for that). Stack-agnostic via
+# multi-glob file lists: works for Next.js (app/X/page.*), Vite-React (pages/X.*,
+# src/pages/X.*), SvelteKit, etc.
+#
+# Skip-at-pour-time convention: when fetches_data=false, the data-hook step is
+# semantically a no-op — the builder treats its acceptance as satisfied by absence
+# (no hook needed) and closes it as such. This mirrors crud-feature's include_ui=false
+# treatment of ui-list/ui-form/ui-tests. bd has no native conditional step skipping;
+# the step is always cooked, the description tells the builder when it's a no-op.
+
+formula = "page"
+description = """
+A single named UI page: route registration, page component, optional data hook, component test. Stack-agnostic via multi-glob file lists.
+"""
+type = "workflow"
+version = 1
+
+[vars.page_name]
+description = "Page name in PascalCase (e.g. Settings, Dashboard, About). Used as the component name and as the file-glob root."
+required = true
+
+[vars.route_path]
+description = "Route path the page mounts at (e.g. /settings, /dashboard). Include the leading slash."
+required = true
+
+[vars.fetches_data]
+description = "If true, the page gets a data hook + data_endpoint_var dependency. If false, the data-hook step pours but is treated as a no-op by the builder."
+default = "false"
+
+[vars.data_endpoint_var]
+description = "The data endpoint the page fetches from (e.g. dashboard-summary, user-profile). Only required when fetches_data=true; ignored otherwise."
+default = ""
+
+# =============================================================================
+# Route registration
+# =============================================================================
+
+[[steps]]
+id = "route"
+title = "{{page_name}}: register route {{route_path}}"
+type = "chore"
+priority = 1
+files = [
+  "routes/index.*",
+  "src/routes/index.*",
+  "src/router.*",
+  "app{{route_path}}/page.*",
+]
+description = """
+Register the {{route_path}} route in the framework's router so requests hit the {{page_name}} component.
+
+**Acceptance:**
+- Route {{route_path}} resolves to the {{page_name}} component (Next.js app-router: app{{route_path}}/page.* exists; React Router / Vite: an entry in the router config; SvelteKit: routes{{route_path}}/+page.*)
+- Navigating to {{route_path}} in a running dev server renders the page (or the still-empty placeholder until the component step lands)
+- Type-checker passes
+"""
+
+# =============================================================================
+# Page component
+# =============================================================================
+
+[[steps]]
+id = "component"
+title = "{{page_name}}: page component"
+type = "feature"
+priority = 2
+needs = ["route"]
+files = [
+  "pages/{{page_name}}.*",
+  "src/pages/{{page_name}}.*",
+  "components/pages/{{page_name}}.*",
+  "src/components/pages/{{page_name}}.*",
+  "app{{route_path}}/page.*",
+]
+description = """
+The {{page_name}} page component. Renders the page layout and (when fetches_data=true) wires up the use{{page_name}} data hook.
+
+**Acceptance:**
+- Component file exists at the conventional location for the chosen stack (one of the file paths above)
+- Component renders without crashing in an empty/default state
+- If fetches_data=true: imports and renders data from use{{page_name}}; surfaces loading and error states (don't render the bare data without guards)
+- If fetches_data=false: pure layout/static content; no hook usage
+- Type-checker passes
+"""
+
+[steps.testPlan]
+file = "tests/ui/pages/{{page_name}}.test"
+cases = 3
+coverage = "renders without crashing; renders the page-level layout (heading or distinguishing element); when fetches_data=true the component invokes use{{page_name}}"
+
+# =============================================================================
+# Data hook (no-op when fetches_data=false)
+# =============================================================================
+
+[[steps]]
+id = "data-hook"
+title = "{{page_name}}: use{{page_name}} data hook"
+type = "feature"
+priority = 2
+needs = ["route"]
+files = [
+  "hooks/use{{page_name}}.*",
+  "src/hooks/use{{page_name}}.*",
+]
+description = """
+Data hook that fetches from the {{data_endpoint_var}} endpoint and exposes loading/error/data state to the page component.
+
+**Skip-at-pour-time:** if `fetches_data=false`, this step is a no-op. The builder closes it with a note "no-op: fetches_data=false; no hook needed" and does NOT create the file. The step exists in the proto so the dependency graph stays consistent across both variants.
+
+**Acceptance (when fetches_data=true):**
+- use{{page_name}}() returns { data, isLoading, error } (or the stack's idiomatic equivalent — `useQuery` / `useSWR` / a custom reducer)
+- On mount, fires a request to the {{data_endpoint_var}} endpoint
+- Error responses populate `error`; isLoading is true until the request settles
+- Re-renders don't refire the request unnecessarily (cache or de-dupe — whatever the chosen data layer provides)
+
+**Acceptance (when fetches_data=false):**
+- Step closes as a no-op; no file created. The component step's acceptance covers the absence-of-hook case.
+"""
+
+[steps.testPlan]
+file = "tests/hooks/use{{page_name}}.test"
+cases = 3
+coverage = "loading state exposed before request settles; error state exposed on failed request; data state exposed on successful request (only when fetches_data=true; skipped otherwise)"
+
+# =============================================================================
+# Page test
+# =============================================================================
+
+[[steps]]
+id = "page-test"
+title = "{{page_name}}: component-level test"
+type = "feature"
+priority = 3
+needs = ["component"]
+files = [
+  "tests/ui/pages/{{page_name}}.*",
+]
+description = """
+Component-level test for the {{page_name}} page. Extends `tests/ui/pages/{{page_name}}` (or the stack's conventional test path).
+
+**Acceptance:**
+- Test renders the page component in isolation (mock the data hook if fetches_data=true)
+- "Renders without crashing" assertion passes
+- If fetches_data=true: tests cover the loading, error, and success-with-data states (3 separate cases)
+- If fetches_data=false: a single render assertion is sufficient
+- All tests pass under the project's test runner
+"""
+
+[steps.testPlan]
+file = "tests/ui/pages/{{page_name}}.test"
+cases = 4
+coverage = "renders without crashing; renders page-level layout element; when fetches_data=true renders loading state; when fetches_data=true renders error state and success-with-data state"
