@@ -43,7 +43,12 @@ plan.lock.json  ──/compose──▶  beads DAG (epics + tasks + deps)
 
 ## Getting started
 
-See `docs/INSTALL.md`. Short version: clone, symlink `skills/` into `~/.claude/skills/`, copy `formulas/` into `~/.beads/formulas/`, install [Jankurai](https://github.com/neverhuman/jankurai) (`cargo install --path crates/jankurai --locked` from a checkout, or the release installer), then in any new app repo run `bd init && bd setup claude --project` and invoke `/vision`.
+1. Clone this repo.
+2. From the repo root, run `./install.ps1`. This walks `skills/` and creates a directory junction for each subdir in `~/.claude/skills/`, then walks `formulas/` and creates a same-volume NTFS hard link for each file in `~/.beads/formulas/`. Idempotent — safe to re-run after `git pull` to pick up new skills or formulas. Re-run with `-Force` to overwrite existing real directories or out-of-date files; re-run with `-DryRun` to plan without changing anything.
+3. Install [Jankurai](https://github.com/neverhuman/jankurai) (`cargo install --path crates/jankurai --locked` from a checkout, or the release installer).
+4. In any new app repo: `bd init && bd setup claude --project`, then invoke `/vision`.
+
+See `docs/INSTALL.md` for the long-form notes, including why the installer uses junctions+hardlinks instead of symbolic links (no admin / Developer Mode requirement).
 
 ## Quality standard
 
