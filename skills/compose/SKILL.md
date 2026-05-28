@@ -52,13 +52,18 @@ Convert `plan.md` into a live beads DAG inside the current app repo. After this 
    Capture the returned epic ID.
 
 4. **For each feature in `plan.md` §"Feature order":**
-   a. Pour the formula(s) with their variable bindings:
+   a. Pour the formula directly (no separate cook+persist step — `bd mol pour` accepts a formula name):
       ```powershell
-      bd cook <formula-name> --mode=runtime --var key=value ... --persist --prefix "feat-"
-      bd mol pour <proto-id> --parent <epic-id>
+      $pourOutput = bd mol pour <formula-name> --var key=value ... 2>&1
+      # Parse "Root issue: <id>" from $pourOutput to get the molecule's root.
+      $pourRoot = ($pourOutput | Select-String -Pattern 'Root issue: (\S+)').Matches[0].Groups[1].Value
       ```
       (Use `--dry-run` first to preview if the formula is unfamiliar; print the planned issues to the user, then proceed without confirmation.)
-   b. Capture the spawned issue IDs.
+   b. Reparent the molecule's root epic under the app-level epic. `bd mol pour` has no `--parent` flag (verified 2026-05-28); reparent after the fact:
+      ```powershell
+      bd dep add $pourRoot <app-epic-id> --type parent-child
+      ```
+   c. Capture the spawned child issue IDs from `bd show $pourRoot --json` (`dependents[].id`) for the downstream steps below.
 
 5. **Add cross-feature dependencies** from `plan.md` §"Cross-feature dependencies":
    ```powershell
