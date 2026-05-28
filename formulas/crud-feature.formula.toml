@@ -1,0 +1,175 @@
+# crud-feature: full CRUD slice for a single entity.
+#
+# Spans data model → migration → service → endpoints → endpoint tests → UI list/form → UI tests.
+# Use AFTER app-skeleton has been poured. Compose with auth formulas via cross-feature
+# dependencies declared in plan.md.
+
+formula = "crud-feature"
+description = """
+Full CRUD slice for a single entity — model, migration, service, endpoints, UI, tests.
+"""
+type = "workflow"
+version = 1
+
+[vars.entity]
+description = "Entity name (e.g. Habit, Customer)"
+required = true
+
+[vars.entity_plural]
+description = "Plural form (e.g. Habits, Customers)"
+required = true
+
+[vars.fields]
+description = "Comma-separated field definitions (e.g. name:string,description:text,frequency:int)"
+required = true
+
+[vars.requires_auth]
+description = "If true, endpoints expect authenticated user"
+default = "true"
+
+[vars.include_ui]
+description = "If false, skip UI steps (API-only feature)"
+default = "true"
+
+# =============================================================================
+# Data layer
+# =============================================================================
+
+[[steps]]
+id = "model"
+title = "{{entity}}: define data model"
+type = "feature"
+priority = 1
+description = """
+Define the {{entity}} entity with fields: {{fields}}.
+
+**Acceptance:**
+- Model file exists in conventional location for the chosen stack
+- All fields from {{fields}} present with correct types
+- Type-checker passes
+"""
+
+[[steps]]
+id = "migration"
+title = "{{entity}}: schema migration"
+type = "feature"
+priority = 1
+needs = ["model"]
+description = """
+Create the schema migration for {{entity}}.
+
+**Acceptance:**
+- Migration file created in migrations directory
+- Migration applies cleanly against a fresh DB
+- Reverting the migration leaves no orphaned objects
+
+**Escalation:** if this migration would run against existing data in a deployed
+environment (vs. fresh local dev), block per docs/ESCALATION_RULES.md.
+"""
+
+[[steps]]
+id = "service"
+title = "{{entity}}: service / repository layer"
+type = "feature"
+priority = 2
+needs = ["migration"]
+description = """
+Implement CRUD operations for {{entity}} in the service / repository layer.
+
+**Acceptance:**
+- create, read, update, delete, list functions exist
+- Each has a unit test that passes
+- List supports basic pagination
+"""
+
+# =============================================================================
+# API layer
+# =============================================================================
+
+[[steps]]
+id = "endpoints"
+title = "{{entity_plural}}: REST endpoints"
+type = "feature"
+priority = 2
+needs = ["service"]
+description = """
+Expose {{entity_plural}} via REST.
+
+**Acceptance:**
+- POST /{{entity_plural}} creates and returns 201
+- GET /{{entity_plural}}/:id returns 200 or 404
+- GET /{{entity_plural}} returns paginated list
+- PUT/PATCH and DELETE wired up
+- Validation rejects missing/invalid fields with 400
+- If requires_auth=true: all endpoints require auth, unauthenticated requests get 401
+"""
+
+[[steps]]
+id = "endpoint-tests"
+title = "{{entity_plural}}: endpoint integration tests"
+type = "feature"
+priority = 2
+needs = ["endpoints"]
+description = """
+Integration tests covering the {{entity_plural}} REST surface.
+
+**Acceptance:**
+- Tests cover happy path for every verb
+- Tests cover validation failures (400) and not-found (404)
+- If requires_auth: tests cover the 401 case
+- All tests pass against a real test database (no mocks of the DB layer)
+"""
+
+# =============================================================================
+# UI layer (skipped when include_ui=false)
+# =============================================================================
+
+[[steps]]
+id = "ui-list"
+title = "{{entity_plural}}: list page"
+type = "feature"
+priority = 3
+needs = ["endpoints"]
+labels = ["ui"]
+description = """
+List page for {{entity_plural}}.
+
+**Acceptance:**
+- Route renders the list
+- Empty state is handled
+- Loading and error states are handled
+- include_ui=false → this step is skipped at pour time
+"""
+
+[[steps]]
+id = "ui-form"
+title = "{{entity}}: create/edit form"
+type = "feature"
+priority = 3
+needs = ["endpoints"]
+labels = ["ui"]
+description = """
+Create/edit form for {{entity}}.
+
+**Acceptance:**
+- Form validates required fields client-side
+- Submit calls POST/PUT and handles error responses
+- Successful submit navigates to the list or detail view
+- include_ui=false → skip at pour time
+"""
+
+[[steps]]
+id = "ui-tests"
+title = "{{entity_plural}}: UI tests"
+type = "feature"
+priority = 3
+needs = ["ui-list", "ui-form"]
+labels = ["ui"]
+description = """
+Component tests for the {{entity}} list and form.
+
+**Acceptance:**
+- Component tests cover empty/loading/error/success states for list
+- Component tests cover validation and submit for form
+- include_ui=false → skip at pour time
+"""
