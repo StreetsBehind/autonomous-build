@@ -138,9 +138,31 @@ The kickoff receipt tells you:
 
 If kickoff fails or refuses to bound the intent (intent too broad), block the issue: `bd update $id --status=blocked --notes "jankurai kickoff: intent too broad to bound — needs scope clarification"`.
 
+### Step 6.5: Tenets check
+
+Read the tenets as a context input alongside the bead spec and the kickoff plan. Tenets are the principles the loop falls back on for build-time judgment calls — they exist for exactly the "should I do X or Y" moments Step 7 implementation hits. Loading them now means the builder can consult them at the moment of decision instead of improvising and discovering the conflict at gate time (or worse, post-merge).
+
+**App mode:** the per-app `tenets.md` is the primary source. `/vision` derives it from the app's vision.md and inherits T1–T10 verbatim from the workflow tenets:
+
+```powershell
+$tenets = Get-Content "tenets.md" -Raw -ErrorAction SilentlyContinue
+if (-not $tenets) {
+    # Pre-/vision-tenets app, or tenet was never derived. Fall back to workflow tenets.
+    $tenets = Get-Content "<autonomous-build path>/docs/TENETS.md" -Raw
+}
+```
+
+**Meta mode:** the workflow tenets in `docs/TENETS.md` ARE this repo's tenets — load them directly:
+
+```powershell
+$tenets = Get-Content "docs/TENETS.md" -Raw
+```
+
+Source-of-truth ordering applies: if a question is answered by the bead spec, plan.lock, formula, or gate, those win — the tenets only kick in when none of them decide. If a tenet directly forbids the implementation approach the bead's design calls for, that is a Stopping condition (see below) — block, do not improvise around it.
+
 ### Step 7: implement
 
-Implement against `acceptance` and the kickoff plan. Stay inside the kickoff's ownership boundaries; do not edit forbidden paths. Write tests first if the formula's design notes recommend it. Keep the change scoped to this single issue — if you find yourself touching things outside the kickoff's bounded set, that's an escalation (block with "scope creep: <what>").
+Implement against `acceptance`, the kickoff plan, and the tenets loaded in Step 6.5. Stay inside the kickoff's ownership boundaries; do not edit forbidden paths. Write tests first if the formula's design notes recommend it. Keep the change scoped to this single issue — if you find yourself touching things outside the kickoff's bounded set, that's an escalation (block with "scope creep: <what>").
 
 Optional: launch the editor session under `jankurai guard run -- claude` for realtime write enforcement (failed writes get reverted, agent sees a compile-error header). Useful when the change is risky; overhead otherwise.
 
@@ -220,6 +242,7 @@ The DONE-path `/retro` invocation is automatic. The user can also run `/retro` m
 - A required tool isn't installed (don't auto-install — that's a human decision).
 - Tests pass but acceptance can't be self-verified (e.g. "the UI looks right" — block with a screenshot request).
 - A task's scope expands during implementation (block with "scope creep: <what>").
+- A tenet (per-app `tenets.md` or workflow `docs/TENETS.md`) directly forbids the implementation approach the bead's design calls for — block with `"tenet conflict: <tenet ID> vs <what the bead asked for>"`.
 
 ## Do not
 
@@ -232,3 +255,4 @@ The DONE-path `/retro` invocation is automatic. The user can also run `/retro` m
 - Do not skip the `jankurai kickoff` step **in app mode**. If kickoff cannot bound the intent, that is a real signal — block the issue, do not work around it. (Meta mode skips kickoff by design — see "Modes" above.)
 - Do not edit files outside the kickoff's ownership boundaries to make the gate pass.
 - Do not commit `target/jankurai/` receipts to git — they are local generated outputs. Baselines (`agent/baselines/`) ARE committed, in dedicated commits.
+- Do not improvise around a tenet to make the bead's design work. A tenet conflict is an escalation, not an implementation puzzle — block with `"tenet conflict: <tenet ID> vs <what the bead asked for>"` and let the human resolve (usually by rephrasing the bead, retiring the tenet, or splitting the bead so it no longer crosses the tenet).
