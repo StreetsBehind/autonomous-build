@@ -105,7 +105,40 @@ Convert `plan.md` into a live beads DAG inside the current app repo. After this 
    bd graph --json          # visual sanity check
    ```
 
-7. **Commit the beads state and Jankurai scaffold.**
+7. **Sizing audit (post-pour).** Walk every spawned bead and flag outliers that are likely to exhaust the `/build-next` builder's context window (~70-85K tokens after fixed overhead). This is an advisory pass — surface, don't block:
+
+   ```powershell
+   $beads = bd list --status=open --json | ConvertFrom-Json | Where-Object { $_.issue_type -ne 'epic' }
+   $oversized = @()
+   foreach ($b in $beads) {
+       $desc = $b.description
+       # Acceptance criteria count: lines starting with "- " or "* " in the Acceptance block
+       $acs = ($desc -split "`n" | Where-Object { $_ -match '^\s*[-*]\s' }).Count
+       # File paths in description: rough heuristic — tokens containing / and a file extension
+       $files = ([regex]::Matches($desc, '\b[\w/.-]+\.(ts|tsx|js|jsx|py|sql|md|toml|yaml|json|rs|go|java|kt|swift|rb|php|html|css)\b')).Count
+       # Cross-layer signal: description mentions more than one of {UI/component, API/endpoint, DB/migration, test}
+       $layers = 0
+       if ($desc -match '(?i)\b(ui|component|page|screen|frontend)\b')      { $layers++ }
+       if ($desc -match '(?i)\b(endpoint|api|route|handler|rpc)\b')          { $layers++ }
+       if ($desc -match '(?i)\b(migration|schema|db|database|table|column)\b'){ $layers++ }
+       if ($desc -match '(?i)\b(test|spec|integration test|unit test)\b')    { $layers++ }
+       $flags = @()
+       if ($acs   -gt 6) { $flags += "ACs=$acs (>6)" }
+       if ($files -gt 5) { $flags += "files=$files (>5)" }
+       if ($layers -gt 2){ $flags += "cross-layer=$layers" }
+       if ($flags.Count -gt 0) {
+           $oversized += "  - $($b.id): $($b.title)  [$($flags -join '; ')]"
+       }
+   }
+   if ($oversized.Count -gt 0) {
+       Write-Host "OVERSIZED BEADS (advisory — may exhaust builder context):"
+       $oversized | ForEach-Object { Write-Host $_ }
+   }
+   ```
+
+   Do NOT auto-split, do NOT block. Print to the compose summary so the user can review before invoking `/loop /build-next`. Genuine formula bugs surface this way; one-off outliers can stay.
+
+8. **Commit the beads state and Jankurai scaffold.**
    ```powershell
    git add .beads/ AGENTS.md agent/ .gitignore
    git commit -m "Compose: initial task DAG + Jankurai scaffold"
