@@ -1,0 +1,132 @@
+# migration: a single standalone schema migration with no app-code changes.
+#
+# For one-off DDL: add a column, add an index, drop a deprecated table, rename a
+# constraint. Anything bigger (extracting a new table from a column, multi-table
+# refactor) belongs in /split or a dedicated multi-step formula.
+#
+# OUT OF SCOPE for v1: data backfills. Those need batched-write strategies,
+# progress reporting, and resumability — separate `migration-with-backfill`
+# formula (not yet authored).
+#
+# Escalation: write-migration ALWAYS carries the `needs-decision` label. The
+# description names the touches_existing_data variable so /build-next can
+# distinguish "fresh-DB, auto-approve" from "production-data, real human
+# decision needed" without breaking the existing escalation-rules-by-label
+# convention. Fresh-DB migrations escalate quickly (~one human ack) and are
+# the right safety/speed trade for the loop.
+
+formula = "migration"
+description = """
+A single standalone schema migration: write up/down files, apply against a fresh DB, verify rollback leaves no orphans. Use for one-off DDL (add column, add index, drop deprecated table). NOT for data backfills.
+"""
+type = "workflow"
+version = 1
+
+[vars.migration_name]
+description = "Migration slug in kebab-case, descriptive of the change (e.g. add-archived-flag-to-habits, drop-deprecated-sessions-table)."
+required = true
+
+[vars.up_outline]
+description = "Human-readable description of what `up` does. The builder turns this into actual DDL during write-migration. Example: ALTER TABLE habits ADD COLUMN archived BOOLEAN NOT NULL DEFAULT false"
+required = true
+
+[vars.down_outline]
+description = "What the rollback does — the inverse of up_outline. Example: ALTER TABLE habits DROP COLUMN archived"
+required = true
+
+[vars.touches_existing_data]
+description = "If true, this migration runs against rows that exist in deployed environments. Triggers a real human escalation on write-migration (backfill strategy, lock budget, downtime). If false (fresh-DB), the needs-decision label is treated as a quick auto-approve."
+default = "false"
+
+# =============================================================================
+# Write the migration files
+# =============================================================================
+
+[[steps]]
+id = "write-migration"
+title = "{{migration_name}}: write up + down migration"
+type = "feature"
+priority = 1
+labels = ["needs-decision"]
+files = [
+  "migrations/*_{{migration_name}}.*",
+  "db/migrations/*_{{migration_name}}.*",
+]
+description = """
+Author the migration files implementing the schema change described by:
+- up: {{up_outline}}
+- down: {{down_outline}}
+
+**Acceptance:**
+- One migration file (or up+down pair, depending on framework convention) created under migrations/ or db/migrations/
+- up DDL matches the up_outline above
+- down DDL is the precise inverse of up_outline (drops what up added, recreates what up dropped)
+- File name follows the framework's timestamp/sequence convention with the {{migration_name}} slug as the descriptive tail
+- Type-checker / migration-validator passes if the framework has one (e.g. drizzle-kit check, alembic check)
+
+**Escalation:**
+This step ALWAYS carries the `needs-decision` label. /build-next reads the touches_existing_data variable:
+- touches_existing_data=false → fresh-DB migration; the human ack is a quick approve, no backfill or lock concerns
+- touches_existing_data=true → REAL escalation; the human MUST confirm the backfill strategy, the lock acquisition plan, and the downtime budget BEFORE the migration is written. Do NOT proceed on assumption.
+
+Data backfills are out of scope for this formula — if the up_outline implies a backfill, BLOCK the bead and tell the human to pour a `migration-with-backfill` formula instead (not yet authored as of v1 — escalate to the formula library).
+"""
+
+# =============================================================================
+# Apply against a fresh DB
+# =============================================================================
+
+[[steps]]
+id = "apply-fresh"
+title = "{{migration_name}}: apply against fresh DB"
+type = "feature"
+priority = 2
+needs = ["write-migration"]
+files = [
+  "tests/migrations/{{migration_name}}.apply.*",
+  "scripts/migrate.*",
+]
+description = """
+Run the migration against a fresh local database and verify the resulting schema matches the intended target state.
+
+**Acceptance:**
+- Migration command (e.g. `drizzle-kit migrate`, `alembic upgrade head`, `npm run migrate`) runs to completion with exit 0 against a freshly-created test DB
+- A schema-check assertion confirms the target state (new column exists with the declared type/nullability/default; new index exists; dropped objects are gone)
+- The assertion lives as a runnable test under tests/migrations/{{migration_name}}.apply.* so /retro or CI can re-verify
+- If the framework supports `migrate status` / `migrate current`, the test verifies the migration is recorded as applied
+"""
+
+[steps.testPlan]
+file = "tests/migrations/{{migration_name}}.apply.test"
+cases = 2
+coverage = "migration runs to completion against fresh DB; schema-check assertion confirms target state matches up_outline"
+
+# =============================================================================
+# Round-trip rollback
+# =============================================================================
+
+[[steps]]
+id = "rollback-test"
+title = "{{migration_name}}: rollback round-trip"
+type = "feature"
+priority = 3
+needs = ["apply-fresh"]
+files = [
+  "tests/migrations/{{migration_name}}.rollback.*",
+]
+description = """
+Apply the migration, then immediately revert it. Verify the schema is byte-identical to its pre-up state.
+
+**Acceptance:**
+- Test applies the migration, then runs the down operation
+- After the round-trip, table/column/index counts match the pre-up snapshot
+- No orphaned objects remain (no leftover indexes, constraints, sequences, etc. that up created and down failed to remove)
+- The test is repeatable: running apply→rollback→apply→rollback in sequence leaves the DB in the same state as before all four operations
+
+**Why this matters:** an asymmetric up/down is the most common migration bug. Catching it here, against a fresh DB, costs minutes; catching it in production costs a restore.
+"""
+
+[steps.testPlan]
+file = "tests/migrations/{{migration_name}}.rollback.test"
+cases = 2
+coverage = "up then down leaves schema identical to pre-up (table/column/index counts match); apply→rollback→apply→rollback round-trip is idempotent"
