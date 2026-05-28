@@ -65,6 +65,34 @@ Convert `plan.md` into a live beads DAG inside the current app repo. After this 
       ```
    c. Capture the spawned child issue IDs from `bd show $pourRoot --json` (`dependents[].id`) for the downstream steps below.
 
+   d. **Write test-plan metadata onto the spawned beads.** bd cook silently drops `[steps.testPlan]` blocks from formulas (verified 2026-05-28 against bd 0.55.3), so the spawned beads have no `testPlanFile`/`testPlanCases`/`testPlanCoverage` until compose writes them. /quality-pass and /build-next both depend on this metadata being present:
+
+      ```powershell
+      # Parse the formula TOML and find every step that declares a testPlan.
+      $formulaPath = "$env:USERPROFILE\.beads\formulas\<formula-name>.formula.toml"
+      $cooked     = bd cook <formula-name> --mode=runtime --var key=value ... | ConvertFrom-Json
+      $rawToml    = Get-Content $formulaPath -Raw
+      # Match each step with [steps.testPlan] by walking the formula's steps; build a map
+      # of substituted step.title → testPlan fields (file/cases/coverage) with the same
+      # variable substitution applied to file & coverage.
+      # (See formulas/README.md for the testPlan block schema.)
+
+      # For each spawned child issue under $pourRoot, look up its source step by title and
+      # write the metadata if a testPlan exists:
+      $children = (bd show $pourRoot --json | ConvertFrom-Json)[0].dependents
+      foreach ($child in $children) {
+          $tp = $titleToTestPlan[$child.title]
+          if (-not $tp) { continue }
+          $metaFile = "$env:TEMP\bd-meta-$($child.id).json"
+          @{ testPlanFile = $tp.file; testPlanCases = $tp.cases; testPlanCoverage = $tp.coverage } |
+              ConvertTo-Json | Set-Content -Path $metaFile -Encoding utf8
+          bd update $child.id --metadata "@$metaFile"
+          Remove-Item $metaFile
+      }
+      ```
+
+      Use the `@<file>` pattern — coverage strings contain semicolons that would break inline JSON quoting. The TOML parser used by PowerShell is whatever is convenient (a small parser in this skill, or shell out to `python -c "import tomllib; ..."` if Python is available in the build env). If a step has no `[steps.testPlan]`, skip it — that's a valid signal that the step doesn't produce code with tests (e.g., a `chore: write README`).
+
 5. **Add cross-feature dependencies** from `plan.md` §"Cross-feature dependencies":
    ```powershell
    bd dep add <blocked-id> <blocker-id>
