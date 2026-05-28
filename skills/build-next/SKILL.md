@@ -69,6 +69,29 @@ Pay attention to:
 - `dependencies` — should all be closed (beads enforces this, but sanity check).
 - `labels` — may include hints like `needs-decision`, `touches-auth`. If any match an escalation trigger, block.
 
+### Step 3.5: freshness check
+
+A bead is a snapshot of the codebase at the time it was filed. Other work — sibling beads, manual edits, a partial /retro that landed — may have already satisfied the AC. Skip this step and you'll dispatch a builder to do nothing, waste a worktree, and add a confusing empty commit.
+
+Before doing any other gating, verify the bead's **load-bearing claims** against current code. A load-bearing claim is anything the bead asserts about the *current* state that the implementation plan depends on:
+
+- "File X does not exist" / "X is missing" → `Test-Path X` or `Glob X`
+- "X is not wired into Y" / "Z is orphan" → grep for the wiring, confirm it's still absent
+- "X currently has N lines / N imports / N callers" → spot-check the count is still ≈ correct
+- "Current behavior is X" → quick read or grep to confirm
+
+Three outcomes:
+
+| Outcome | Detection | Action |
+|---|---|---|
+| **Fresh** | every claim still matches current code | proceed to Step 4 |
+| **Drifted** | supporting details moved (file renamed, count off, neighboring code refactored) BUT the underlying gap is still real | proceed to Step 4, **add a "Freshness note" line** to the design field via `bd update $id --design "<original design>\n\nFreshness note (<date>): <what moved>"` so the builder doesn't trust stale details |
+| **Stale** | the bead's AC is already met by code that landed after the bead was filed | close immediately: `bd close $id --reason "stale: AC already met by <file/commit ref>"`. Exit with "STALE: $id" so the loop picks the next bead. Do NOT proceed to Step 4. |
+
+Keep this fast — 2–4 Grep/Glob calls is the right budget. This is a sanity check, not a code review. If a claim is too vague to mechanically verify (e.g. "the system is too slow"), skip the freshness check for that claim and proceed; the escalation pre-check (Step 4) will catch genuinely unverifiable beads.
+
+The stale path is especially important when /retro has filed beads in batches — sibling beads in the same batch often silently satisfy each other.
+
 ### Step 4: escalation pre-check
 
 Before writing any code, check the issue against `docs/ESCALATION_RULES.md`:
@@ -170,6 +193,8 @@ $remaining = (bd ready --json | ConvertFrom-Json | Where-Object { $_.issue_type 
 - `$remaining == 0` and blocked present → invoke `/escalate`, then "BLOCKED: <count>" — loop should exit
 - `$remaining == 0` and no blocked → invoke `/retro` (the build is done; generate the workflow performance report and file improvements), then "DONE" — loop should exit
 
+Note: if this tick exited at Step 3.5 with "STALE: $id", the loop should wake immediately — there's still real work in the queue and the freshness check is cheap.
+
 The DONE-path `/retro` invocation is automatic. The user can also run `/retro` mid-build for a partial review — the skill handles either case.
 
 ## Stopping conditions (escalate, do not guess)
@@ -183,6 +208,7 @@ The DONE-path `/retro` invocation is automatic. The user can also run `/retro` m
 ## Do not
 
 - Do not skip the quality gate "just this once".
+- Do not skip the Step 3.5 freshness check on the assumption that "the bead was just filed". /retro batches and sibling beads regularly satisfy each other invisibly.
 - Do not edit `acceptance` to make a failing build pass.
 - Do not close an issue whose tests are skipped, mocked over, or commented out.
 - Do not work on multiple issues in one tick. The loop will pick them up in order.
