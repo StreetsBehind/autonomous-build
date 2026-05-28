@@ -75,6 +75,15 @@ timeout = "30m"
 
 bd does **simple variable substitution only**: `{{varname}}`. No Jinja-style filters (`{{name | lower}}` is left literal). If you need lowercased or otherwise transformed values, pass them pre-transformed via `--var`.
 
+## Pouring
+
+Validated end-to-end against bd 0.55.3 on 2026-05-28:
+
+- `bd mol pour <formula-name> --var k=v ...` works directly — no need to `bd cook --persist` first. The compose skill's two-step pattern (`bd cook ... --persist` then `bd mol pour <proto-id>`) is unnecessary indirection.
+- Pouring spawns 1 root epic + N child issues (one per step) with `needs:` dependencies translated to bd blocker edges.
+- The `--parent <epic-id>` flag that compose documents **does not exist** on `bd mol pour`. To put a poured molecule under an app-level epic, pour first, then run `bd dep add <pour-root-id> <app-epic-id> --type parent-child` to reparent.
+- `bd ready` after a pour includes the molecule's root epic. /build-next filters epics client-side (autonomous-build-yk9 fix); any other consumer must do the same.
+
 ## Authoring guidance
 
 - **Acceptance is the contract.** If the builder can't self-verify it (e.g. "looks good"), the step blocks. Write acceptance as runnable checks: "endpoint returns 201 on POST with valid body, 400 on missing fields, and an integration test covers both".
