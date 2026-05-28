@@ -71,6 +71,24 @@ id = "release.yml"
 timeout = "30m"
 ```
 
+### Test Plan declarations (testPlan)
+
+Steps that produce code with verifiable tests SHOULD declare where those tests live and what they cover. This tells `/build-next` where to extend (vs. inventing a new test file per bead) and feeds the `/quality-pass` audit.
+
+```toml
+[steps.testPlan]
+file = "tests/services/{{entity_plural}}.test"   # convention path; builder resolves extension
+cases = 5
+coverage = "create succeeds; read returns by id; update mutates; delete removes; list paginates"
+```
+
+Fields:
+- `file` — convention path (no extension); the builder resolves to a real file given the stack
+- `cases` — integer count of test cases this bead should add to the file
+- `coverage` — semicolon-separated list of behaviors covered
+
+**Important:** bd 0.55.3 does not propagate unknown step fields into the spawned issue. `[steps.testPlan]` lives in the formula but bd cook silently drops it. The `/compose` skill is responsible for parsing the formula TOML after pour and writing the testPlan as bd issue metadata (`testPlanFile`, `testPlanCases`, `testPlanCoverage`). See `autonomous-build-5au` for that work.
+
 ## Templating
 
 bd does **simple variable substitution only**: `{{varname}}`. No Jinja-style filters (`{{name | lower}}` is left literal). If you need lowercased or otherwise transformed values, pass them pre-transformed via `--var`.

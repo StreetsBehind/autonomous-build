@@ -94,6 +94,11 @@ Get {{test_framework}} running with a single smoke test.
 - `<package_manager> run test` exits 0
 """
 
+[steps.testPlan]
+file = "tests/smoke.test"
+cases = 1
+coverage = "{{test_framework}} runs and exits 0"
+
 [[steps]]
 id = "ci"
 title = "Add CI workflow (lint + test on PR)"

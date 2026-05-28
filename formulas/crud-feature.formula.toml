@@ -82,6 +82,11 @@ Implement CRUD operations for {{entity}} in the service / repository layer.
 - List supports basic pagination
 """
 
+[steps.testPlan]
+file = "tests/services/{{entity_plural}}.test"
+cases = 5
+coverage = "create succeeds; read returns row by id; update mutates; delete removes; list paginates"
+
 # =============================================================================
 # API layer
 # =============================================================================
@@ -119,6 +124,11 @@ Integration tests covering the {{entity_plural}} REST surface.
 - If requires_auth: tests cover the 401 case
 - All tests pass against a real test database (no mocks of the DB layer)
 """
+
+[steps.testPlan]
+file = "tests/endpoints/{{entity_plural}}.test"
+cases = 7
+coverage = "POST 201; GET by id 200; GET by id 404; GET list paginates; PUT updates; DELETE removes; validation 400 on missing fields; auth 401 when requires_auth"
 
 # =============================================================================
 # UI layer (skipped when include_ui=false)
@@ -173,3 +183,8 @@ Component tests for the {{entity}} list and form.
 - Component tests cover validation and submit for form
 - include_ui=false → skip at pour time
 """
+
+[steps.testPlan]
+file = "tests/ui/{{entity_plural}}.test"
+cases = 6
+coverage = "list renders empty state; list renders loading; list renders rows; form validates required fields; form submit POSTs; form surfaces server errors"
