@@ -100,6 +100,14 @@ Run this loop until the exit condition fires:
 while ($true) {
 
   # ── 1. Fill free slots ──
+  # Build the set of file paths in flight (active pipelines + queued merges + in-flight merge).
+  # `filesTouched` lives in bd metadata; /compose writes it from the formula's per-step `files`
+  # array (see formulas/README.md and skills/compose/SKILL.md Step 4d). Globs are unioned.
+  $inFlightFiles = @()
+  foreach ($p in $activePipelines.Values) { $inFlightFiles += @($p.filesTouched) }
+  foreach ($qId in $mergeQueue)           { $inFlightFiles += @((bd show $qId --json | ConvertFrom-Json)[0].metadata.filesTouched) }
+  if ($mergeInFlight) { $inFlightFiles  += @((bd show $mergeInFlight.beadId --json | ConvertFrom-Json)[0].metadata.filesTouched) }
+
   $freeSlots = $workers - $activePipelines.Count
   if ($freeSlots -gt 0) {
     $candidates = bd ready --json | ConvertFrom-Json |
@@ -109,7 +117,11 @@ while ($true) {
         $_.id -notin $mergeQueue -and
         $_.id -ne $mergeInFlight.beadId -and
         $_.id -notin $mergedSet -and
-        $_.id -notin $blockedSet
+        $_.id -notin $blockedSet -and
+        # filesTouched conflict filter: skip a candidate whose declared file ownership
+        # intersects any in-flight pipeline's filesTouched. Beads with no filesTouched
+        # declared fall through (no intersection possible), and Dispatch-Bead logs a warning.
+        -not (Test-FilesTouched-Intersect $_.metadata.filesTouched $inFlightFiles)
       } |
       Select-Object -First $freeSlots
 
@@ -178,6 +190,23 @@ Dispatch-Bead($bead):
     return $null
   }
 
+  # filesTouched defense in depth. The candidate filter in Phase 1.1 already excluded
+  # any bead whose filesTouched intersected the in-flight set, so reaching here means
+  # the intersection is empty as of the snapshot the filter saw. Re-check anyway —
+  # something may have entered the merge queue between the filter pass and here. If a
+  # new conflict appeared, do NOT claim; let the next loop iteration retry.
+  if (Test-FilesTouched-Intersect $bead.metadata.filesTouched $inFlightFiles) {
+    Write-Host "[SKIP] $($bead.id) deferred — filesTouched would conflict with in-flight pipelines"
+    return $null
+  }
+
+  # Beads with no filesTouched declared fall back to the old behavior: the post-merge
+  # gate is the sole conflict catcher. Warn — this almost always indicates a missing
+  # `files = [...]` declaration on the formula step that produced this bead.
+  if (-not $bead.metadata.filesTouched -or $bead.metadata.filesTouched.Count -eq 0) {
+    Write-Host "[WARN] $($bead.id) has no filesTouched — relying on post-merge gate; consider adding `files` to the formula step"
+  }
+
   # Claim atomically. If another agent (somehow) raced us, skip.
   $claimOutput = bd update $bead.id --claim 2>&1
   if ($LASTEXITCODE -ne 0) { return $null }
@@ -197,7 +226,35 @@ Dispatch-Bead($bead):
                   -prompt "beadId: $($bead.id)`nworktree: $worktreePath"
 
   Write-Host "[DISPATCH] $($bead.id) → worktree $worktreePath, task $taskId"
-  return @{ taskId = $taskId; worktreePath = $worktreePath; branch = "bead/$($bead.id)"; dispatchTime = (Get-Date) }
+  return @{
+    taskId       = $taskId
+    worktreePath = $worktreePath
+    branch       = "bead/$($bead.id)"
+    dispatchTime = (Get-Date)
+    filesTouched = $bead.metadata.filesTouched   # carried so Phase 1.1 can union it next iteration
+  }
+```
+
+### Test-FilesTouched-Intersect
+
+A small helper used by both the candidate filter (Phase 1.1) and Dispatch-Bead's
+defense-in-depth re-check. Compares two arrays of path globs and returns `$true`
+iff any pair intersects.
+
+```
+Test-FilesTouched-Intersect($candidateFiles, $inFlightFiles):
+  if (-not $candidateFiles -or $candidateFiles.Count -eq 0) { return $false }
+  if (-not $inFlightFiles  -or $inFlightFiles.Count  -eq 0) { return $false }
+  foreach ($c in $candidateFiles) {
+    foreach ($f in $inFlightFiles) {
+      # Two globs intersect if any concrete path matches both. For dispatch purposes,
+      # a string-equality OR mutual-glob-match check is sufficient — false positives
+      # (over-defer) are cheap; false negatives (race + merge conflict) are expensive.
+      if ($c -eq $f) { return $true }
+      if ($c -like $f -or $f -like $c) { return $true }   # PowerShell -like glob match
+    }
+  }
+  return $false
 ```
 
 ### Process-WorkerCompletion
@@ -327,4 +384,4 @@ Default `$stageTimeout = 30 minutes` per worker. If a worker hasn't emitted BUIL
 - Do not `bd close` a bead before the post-merge gate passes. The bead's "done" state IS "merged to main and main is green."
 - Do not auto-remove the worktree of a `failed` bead — the human needs that state to debug.
 - Do not invoke `/build-batch` recursively. One orchestrator at a time.
-- Do not promise dependency-aware scheduling beyond what `bd ready` gives you. If two ready siblings would conflict on a shared file (no `testPlanFile` plan yet), the post-merge gate is what catches the conflict.
+- Do not promise dependency-aware scheduling beyond what `bd ready` + the `filesTouched` conflict filter (Phase 1.1) give you. When two ready siblings declare overlapping `filesTouched`, the filter defers the second until the first completes; if a bead has no `filesTouched` declared, the orchestrator warns and falls back to the post-merge gate as the sole conflict catcher.

@@ -70,33 +70,49 @@ Convert `plan.md` into a live beads DAG inside the current app repo. After this 
       ```
    c. Capture the spawned child issue IDs from `bd show $pourRoot --json` (`dependents[].id`) for the downstream steps below.
 
-   d. **Write test-plan metadata onto the spawned beads.** bd cook silently drops `[steps.testPlan]` blocks from formulas (verified 2026-05-28 against bd 0.55.3), so the spawned beads have no `testPlanFile`/`testPlanCases`/`testPlanCoverage` until compose writes them. /quality-pass and /build-next both depend on this metadata being present:
+   d. **Write step-derived metadata onto the spawned beads.** bd cook silently drops unknown step fields from formulas (verified 2026-05-28 against bd 0.55.3), so the spawned beads have no `testPlanFile`/`testPlanCases`/`testPlanCoverage` and no `filesTouched` until compose writes them. Both are load-bearing downstream: /quality-pass and /build-next read the testPlan fields; /build-batch reads `filesTouched` for conflict-aware dispatch (see autonomous-build-1zq.2 and skills/build-batch/SKILL.md "Dispatch-Bead").
 
       ```powershell
-      # Parse the formula TOML and find every step that declares a testPlan.
+      # Parse the formula TOML and find every step that declares testPlan and/or files.
       $formulaPath = "$env:USERPROFILE\.beads\formulas\<formula-name>.formula.toml"
       $cooked     = bd cook <formula-name> --mode=runtime --var key=value ... | ConvertFrom-Json
       $rawToml    = Get-Content $formulaPath -Raw
-      # Match each step with [steps.testPlan] by walking the formula's steps; build a map
-      # of substituted step.title → testPlan fields (file/cases/coverage) with the same
-      # variable substitution applied to file & coverage.
-      # (See formulas/README.md for the testPlan block schema.)
+      # Walk the formula's steps; build a map of substituted step.title → {
+      #   testPlan: { file, cases, coverage }  (from [steps.testPlan] sub-table, optional)
+      #   files:    [ "<glob>", ... ]          (from inline `files = [...]` on the step, optional)
+      # }
+      # Apply the same variable substitution to testPlan.file, testPlan.coverage, AND every
+      # entry in the files array.
+      # (See formulas/README.md for the testPlan block + `files` field schema.)
 
       # For each spawned child issue under $pourRoot, look up its source step by title and
-      # write the metadata if a testPlan exists:
+      # write whatever metadata was declared. Either, both, or neither may be present.
       $children = (bd show $pourRoot --json | ConvertFrom-Json)[0].dependents
       foreach ($child in $children) {
-          $tp = $titleToTestPlan[$child.title]
-          if (-not $tp) { continue }
+          $stepMeta = $titleToStepMeta[$child.title]
+          if (-not $stepMeta) { continue }
+          $payload = @{}
+          if ($stepMeta.testPlan) {
+              $payload.testPlanFile     = $stepMeta.testPlan.file
+              $payload.testPlanCases    = $stepMeta.testPlan.cases
+              $payload.testPlanCoverage = $stepMeta.testPlan.coverage
+          }
+          if ($stepMeta.files) {
+              $payload.filesTouched     = $stepMeta.files   # string array
+          }
+          if ($payload.Count -eq 0) { continue }
           $metaFile = "$env:TEMP\bd-meta-$($child.id).json"
-          @{ testPlanFile = $tp.file; testPlanCases = $tp.cases; testPlanCoverage = $tp.coverage } |
-              ConvertTo-Json | Set-Content -Path $metaFile -Encoding utf8
+          $payload | ConvertTo-Json -Depth 5 | Set-Content -Path $metaFile -Encoding utf8
           bd update $child.id --metadata "@$metaFile"
           Remove-Item $metaFile
       }
       ```
 
-      Use the `@<file>` pattern — coverage strings contain semicolons that would break inline JSON quoting. The TOML parser used by PowerShell is whatever is convenient (a small parser in this skill, or shell out to `python -c "import tomllib; ..."` if Python is available in the build env). If a step has no `[steps.testPlan]`, skip it — that's a valid signal that the step doesn't produce code with tests (e.g., a `chore: write README`).
+      Use the `@<file>` pattern — coverage strings contain semicolons that would break inline JSON quoting. The TOML parser used by PowerShell is whatever is convenient (a small parser in this skill, or shell out to `python -c "import tomllib; ..."` if Python is available in the build env).
+
+      If a step declares neither `[steps.testPlan]` nor `files`, skip it — that's a valid signal that the step doesn't produce code with tests AND has no specific file ownership (e.g., a coordination/decision bead). The orchestrator will still dispatch the bead; it will print a `[WARN] no filesTouched` line and fall back to the post-merge gate for conflict detection.
+
+      If a step declares `files` but no `testPlan`, that's also fine — chore steps (lint config, README) write files but don't ship tests, and the filesTouched declaration still earns them conflict-aware dispatch.
 
 5. **Coverage check: every plan.md feature produced an epic.** During Step 4, build a map `$pouredFeatures[<feature-name>] = @($pourRoot, ...)`. After the loop, parse `plan.md` §"Feature order" to extract feature names (the bolded label before the em-dash) and verify each appears as a key in `$pouredFeatures` with at least one pour-root. Report any feature with no associated pour:
 

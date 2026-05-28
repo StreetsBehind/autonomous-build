@@ -40,6 +40,7 @@ id = "model"
 title = "{{entity}}: define data model"
 type = "feature"
 priority = 1
+files = ["models/{{entity}}.*", "src/models/{{entity}}.*"]
 description = """
 Define the {{entity}} entity with fields: {{fields}}.
 
@@ -55,6 +56,7 @@ title = "{{entity}}: schema migration"
 type = "feature"
 priority = 1
 needs = ["model"]
+files = ["migrations/*_{{entity_plural}}.*", "db/migrations/*_{{entity_plural}}.*"]
 description = """
 Create the schema migration for {{entity}}.
 
@@ -73,6 +75,7 @@ title = "{{entity}}: service / repository layer"
 type = "feature"
 priority = 2
 needs = ["migration"]
+files = ["services/{{entity_plural}}.*", "src/services/{{entity_plural}}.*", "tests/services/{{entity_plural}}.*"]
 description = """
 Implement CRUD operations for {{entity}} in the service / repository layer.
 
@@ -97,6 +100,7 @@ title = "{{entity_plural}}: REST endpoints"
 type = "feature"
 priority = 2
 needs = ["service"]
+files = ["routes/{{entity_plural}}.*", "endpoints/{{entity_plural}}.*", "src/routes/{{entity_plural}}.*", "src/endpoints/{{entity_plural}}.*"]
 description = """
 Expose {{entity_plural}} via REST.
 
@@ -115,6 +119,7 @@ title = "{{entity_plural}}: endpoint integration tests"
 type = "feature"
 priority = 2
 needs = ["endpoints"]
+files = ["tests/endpoints/{{entity_plural}}.*"]
 description = """
 Integration tests covering the {{entity_plural}} REST surface.
 
@@ -141,6 +146,7 @@ type = "feature"
 priority = 3
 needs = ["endpoints"]
 labels = ["ui"]
+files = ["pages/{{entity_plural}}/index.*", "app/{{entity_plural}}/page.*", "src/pages/{{entity_plural}}/index.*"]
 description = """
 List page for {{entity_plural}}.
 
@@ -158,6 +164,7 @@ type = "feature"
 priority = 3
 needs = ["endpoints"]
 labels = ["ui"]
+files = ["components/{{entity}}Form.*", "pages/{{entity_plural}}/new.*", "pages/{{entity_plural}}/[id]/edit.*", "src/components/{{entity}}Form.*"]
 description = """
 Create/edit form for {{entity}}.
 
@@ -175,6 +182,7 @@ type = "feature"
 priority = 3
 needs = ["ui-list", "ui-form"]
 labels = ["ui"]
+files = ["tests/ui/{{entity_plural}}.*"]
 description = """
 Component tests for the {{entity}} list and form.
 

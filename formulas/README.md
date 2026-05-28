@@ -89,6 +89,36 @@ Fields:
 
 **Important:** bd 0.55.3 does not propagate unknown step fields into the spawned issue. `[steps.testPlan]` lives in the formula but bd cook silently drops it. The `/compose` skill is responsible for parsing the formula TOML after pour and writing the testPlan as bd issue metadata (`testPlanFile`, `testPlanCases`, `testPlanCoverage`). See `autonomous-build-5au` for that work.
 
+### File ownership declarations (`files`)
+
+Steps that write code SHOULD declare the file paths they own, so the orchestrator (`/build-batch`) can avoid dispatching two workers whose touched-file sets intersect. The declaration is an inline array on the step table:
+
+```toml
+[[steps]]
+id = "service"
+title = "{{entity}}: service / repository layer"
+type = "feature"
+priority = 2
+needs = ["migration"]
+files = [
+  "services/{{entity_plural}}.*",
+  "src/services/{{entity_plural}}.*",
+  "tests/services/{{entity_plural}}.*",
+]
+description = """..."""
+```
+
+Rules:
+- `files` is an array of strings; each entry is a path or glob (`*`, `**`).
+- `{{var}}` substitution applies, same as other formula fields.
+- Use **multiple alternatives** for stack-dependent paths (e.g. `services/X.*` and `src/services/X.*`) — the orchestrator unions them for intersection checks; the builder picks the one that fits the actual stack.
+- Include test files the step also writes (mirrors what `testPlan.file` declares — listing both is fine, the orchestrator dedupes).
+- For repo-wide chore steps (lint config, CI workflow), list the specific config files only — don't catch-all with `**`, or every step will conflict with every other step.
+
+Like `testPlan`, the `files` array is dropped by bd cook. `/compose` parses it from the formula TOML and writes it as bd issue metadata (`filesTouched`). The orchestrator reads `metadata.filesTouched` during dispatch — see skills/build-batch/SKILL.md "Dispatch-Bead" for the conflict-aware filter, and autonomous-build-1zq.2 for the wiring change.
+
+A step with no `files` declared falls back to the old behavior: the post-merge gate is what catches the conflict. `/build-batch` will warn when it dispatches a bead with no `filesTouched`, so missing declarations surface.
+
 ## Templating
 
 bd does **simple variable substitution only**: `{{varname}}`. No Jinja-style filters (`{{name | lower}}` is left literal). If you need lowercased or otherwise transformed values, pass them pre-transformed via `--var`.

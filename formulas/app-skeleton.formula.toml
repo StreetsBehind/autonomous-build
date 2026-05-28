@@ -40,6 +40,7 @@ id = "init-repo"
 title = "Initialize {{app_name}} repository structure"
 type = "chore"
 priority = 1
+files = [".gitignore", "package.json", "pyproject.toml", "src/**"]
 description = """
 Create the standard project layout for a {{framework}} app.
 
@@ -55,6 +56,7 @@ title = "Install {{framework}} dependencies via {{package_manager}}"
 type = "chore"
 priority = 1
 needs = ["init-repo"]
+files = ["package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "pyproject.toml", "uv.lock", "poetry.lock", "node_modules/**", ".venv/**"]
 description = """
 Install runtime + dev dependencies for {{framework}}.
 
@@ -70,6 +72,7 @@ title = "Configure {{lint_tool}} for lint and format"
 type = "chore"
 priority = 2
 needs = ["install-deps"]
+files = [".editorconfig", "biome.json", "biome.jsonc", ".eslintrc*", "ruff.toml", ".prettierrc*", "package.json", "pyproject.toml"]
 description = """
 Wire up {{lint_tool}} for the project.
 
@@ -85,6 +88,7 @@ title = "Wire up {{test_framework}} with a smoke test"
 type = "chore"
 priority = 2
 needs = ["install-deps"]
+files = ["vitest.config.*", "jest.config.*", "pytest.ini", "conftest.py", "tests/smoke.*", "package.json", "pyproject.toml"]
 description = """
 Get {{test_framework}} running with a single smoke test.
 
@@ -105,6 +109,7 @@ title = "Add CI workflow (lint + test on PR)"
 type = "chore"
 priority = 3
 needs = ["lint-format", "test-setup"]
+files = [".github/workflows/ci.yml"]
 description = """
 GitHub Actions workflow for lint + test on push and PR.
 
@@ -119,6 +124,7 @@ title = "Write project README"
 type = "chore"
 priority = 3
 needs = ["init-repo"]
+files = ["README.md"]
 description = """
 Author the project README.
 
