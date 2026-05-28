@@ -1,0 +1,174 @@
+# background-job: a single scheduled or queue-triggered job.
+#
+# For: scheduled cleanups, queue-driven webhooks, batched recomputes — anything
+# that isn't request-driven. ONE job per pour. Multi-stage pipelines (ETL,
+# fan-out-fan-in) belong in a different formula or in /split.
+#
+# Scope:
+# - Handler function + trigger wiring + optional idempotency guard + handler test.
+# - Does NOT scaffold a worker process. If the app has no worker, that's an
+#   app-skeleton-level concern, not this formula.
+# - Trigger-side integration tests (cron firing, queue draining end-to-end) are
+#   out of scope; the handler-test invokes the handler directly with fake input.
+#
+# Skip-at-pour-time:
+# - idempotency-guard is always cooked. When idempotent=true, the handler is
+#   naturally idempotent and the builder treats this step as a no-op (closes
+#   with "no-op: idempotent=true; handler is naturally idempotent" and creates
+#   no file). When idempotent=false, the step adds a per-invocation key check.
+# - schedule and queue_name variables: only one is meaningful per trigger_type;
+#   the other has an empty default and is ignored by the unused steps.
+
+formula = "background-job"
+description = """
+A single scheduled or queue-triggered background job: handler, trigger wiring, optional idempotency guard, handler test. One job per pour; not a pipeline.
+"""
+type = "workflow"
+version = 1
+
+[vars.job_name]
+description = "Job name in kebab-case (e.g. daily-habit-rollup, process-webhook). Used as the file-glob root and the handler symbol stem."
+required = true
+
+[vars.trigger_type]
+description = "How the job is triggered: 'schedule' (cron/interval) or 'queue' (subscription to a named queue)."
+required = true
+
+[vars.schedule]
+description = "Cron expression or interval the scheduler uses (e.g. '0 3 * * *' for daily at 03:00). Required when trigger_type=schedule; ignored when trigger_type=queue."
+default = ""
+
+[vars.queue_name]
+description = "Name of the queue the worker subscribes to (e.g. 'webhooks', 'image-resize'). Required when trigger_type=queue; ignored when trigger_type=schedule."
+default = ""
+
+[vars.idempotent]
+description = "If true, the handler is naturally idempotent (e.g. a recompute that writes the same output for the same input). If false, the idempotency-guard step adds a per-invocation key check using services/idempotency."
+default = "true"
+
+# =============================================================================
+# Handler
+# =============================================================================
+
+[[steps]]
+id = "handler"
+title = "{{job_name}}: handler function"
+type = "feature"
+priority = 1
+files = [
+  "jobs/{{job_name}}.*",
+  "src/jobs/{{job_name}}.*",
+]
+description = """
+The handler function. Pure-ish: takes an input payload (queue message body, or a fake input from the scheduler), does the work, returns success or raises.
+
+**Acceptance:**
+- Handler exported from jobs/{{job_name}}.* (or src/jobs/{{job_name}}.*) with a clear signature: `handle(input) → void | Result`
+- Handler runs to completion on a representative input (verified by the handler-test step)
+- On a recoverable failure, raises an error the trigger layer can interpret (queue: re-raise for retry; schedule: log + return for next-run reattempt)
+- On an unrecoverable failure, raises a typed error that the trigger layer can route to a dead-letter / alert path
+- No coupling to the trigger mechanism: the handler MUST be invocable directly with a fake input (so handler-test can exercise it without spinning up the scheduler or queue)
+"""
+
+[steps.testPlan]
+file = "tests/jobs/{{job_name}}.test"
+cases = 3
+coverage = "handler runs to completion on representative input; handler raises typed error on unrecoverable failure; handler raises retryable error on recoverable failure (so queue retry / scheduler reattempt fires)"
+
+# =============================================================================
+# Trigger wiring
+# =============================================================================
+
+[[steps]]
+id = "trigger-wiring"
+title = "{{job_name}}: wire up {{trigger_type}} trigger"
+type = "chore"
+priority = 2
+needs = ["handler"]
+files = [
+  "config/jobs.*",
+  "src/scheduler.*",
+  "src/workers/{{job_name}}.*",
+]
+description = """
+Register {{job_name}} with the {{trigger_type}} infrastructure.
+
+**For trigger_type=schedule:**
+- Add an entry to the scheduler config (e.g. config/jobs.*, a cron registration in src/scheduler.*) that fires {{job_name}}'s handler on schedule "{{schedule}}"
+- The schedule expression matches "{{schedule}}" exactly
+- Restarting the app re-registers the schedule (no stale entries)
+
+**For trigger_type=queue:**
+- Add a worker subscription to queue "{{queue_name}}" that dispatches messages to {{job_name}}'s handler (typically in src/workers/{{job_name}}.*)
+- Failed handler invocations route to the queue's retry path (re-raise) or dead-letter path (typed unrecoverable error)
+- The subscription survives a worker restart
+
+**Acceptance:**
+- The chosen wiring file imports the handler from the handler step and registers it correctly for the {{trigger_type}}
+- A read of the running app's config / introspection (whatever the stack provides) shows {{job_name}} as registered
+- This step has no testPlan: end-to-end trigger firing is verified by the test environment in CI / staging, not in unit tests
+"""
+
+# =============================================================================
+# Idempotency guard (no-op when idempotent=true)
+# =============================================================================
+
+[[steps]]
+id = "idempotency-guard"
+title = "{{job_name}}: idempotency-key guard"
+type = "feature"
+priority = 2
+needs = ["handler"]
+files = [
+  "jobs/{{job_name}}.guard.*",
+  "src/jobs/{{job_name}}.guard.*",
+  "services/idempotency.*",
+  "src/services/idempotency.*",
+]
+description = """
+Add a per-invocation idempotency-key check so duplicate invocations short-circuit instead of re-running the handler's side effects.
+
+**Skip-at-pour-time:** if `idempotent=true`, this step is a no-op. The handler is naturally idempotent (e.g. a recompute that writes the same output for the same input) and a key check would be dead code. Builder closes with note "no-op: idempotent=true; handler is naturally idempotent" and creates no file.
+
+**Acceptance (when idempotent=false):**
+- The guard wraps the handler such that an invocation with a previously-seen idempotency key returns the prior result (or a fast-path "already handled" signal) without re-invoking the handler body
+- Idempotency keys are stored via services/idempotency.* (creating that service if it doesn't exist — it's a thin key→{status, result, seen_at} store)
+- The key is derived from the input payload (queue message id, scheduled-run timestamp, or an explicit `idempotency_key` field) — document the derivation
+- TTL on stored keys is set to a value appropriate for the trigger (cron: > interval; queue: > max-retry-window) and surfaces in the file as a constant for review
+
+**Acceptance (when idempotent=true):**
+- Step closes as a no-op; no file created.
+"""
+
+[steps.testPlan]
+file = "tests/jobs/{{job_name}}.guard.test"
+cases = 3
+coverage = "first invocation runs the handler and stores the key; duplicate invocation returns early without re-running side effects; expired key (past TTL) re-runs the handler"
+
+# =============================================================================
+# Handler test
+# =============================================================================
+
+[[steps]]
+id = "handler-test"
+title = "{{job_name}}: handler unit test"
+type = "feature"
+priority = 3
+needs = ["handler"]
+files = [
+  "tests/jobs/{{job_name}}.*",
+]
+description = """
+Direct-invocation unit test for the handler. Bypasses the trigger entirely — instantiates a fake input and calls the handler.
+
+**Acceptance:**
+- Tests invoke the handler with a representative input (mock the queue message / fake the scheduled-run context as needed) and assert success
+- If idempotent=true: an additional test invokes the handler twice with the same input and asserts the observable state after the second call equals the state after the first (idempotency under repeat without a guard)
+- Failure paths covered: recoverable failure raises a retryable error; unrecoverable failure raises a typed terminal error
+- All tests run under the project's test runner with no live scheduler / queue dependency
+"""
+
+[steps.testPlan]
+file = "tests/jobs/{{job_name}}.test"
+cases = 4
+coverage = "handler succeeds on representative input; handler observably idempotent when idempotent=true (state after 2nd call == state after 1st); recoverable failure raises retryable error; unrecoverable failure raises terminal typed error"
