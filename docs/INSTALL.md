@@ -5,6 +5,7 @@ One-time setup for the workflow infrastructure, then per-app setup whenever you 
 ## Prerequisites
 
 - `bd` (beads) on PATH. Verify: `bd --help`. If missing, see https://github.com/gastownhall/beads.
+- `jankurai` on PATH. Verify: `jankurai version`. Install from source: `git clone https://github.com/neverhuman/jankurai && cd jankurai && cargo install --path crates/jankurai --locked`. Or use the release installer at https://github.com/neverhuman/jankurai/releases. Jankurai is the [quality standard](../README.md#quality-standard) every app this workflow builds is held to — required, not optional.
 - Claude Code installed and configured.
 - Git.
 
@@ -77,6 +78,9 @@ In a freshly initialized app repo:
 ```powershell
 bd prime           # should print agent workflow context (not empty)
 bd formula list    # should show formulas symlinked from autonomous-build/
+jankurai version   # should print CLI + standard + schema versions
 ```
 
 If `bd formula list` is empty inside a `bd init`'d project, the formula symlink isn't being picked up — check `~/.beads/formulas/` exists and points where you expect.
+
+If `jankurai version` fails, the rest of the pipeline will refuse to run (`/compose` pre-flight check #5). Reinstall before continuing.

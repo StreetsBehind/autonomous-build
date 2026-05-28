@@ -13,6 +13,7 @@ Convert `plan.md` into a live beads DAG inside the current app repo. After this 
 2. **`plan.md` has no "Open questions for human" section content.** If it does, stop and surface them — do not paper over.
 3. **Beads is not yet initialized in this repo.** If `bd info` succeeds, ask the user whether to reset (`rm -rf .beads/`) or proceed and merge. Default: stop and ask.
 4. **Every formula referenced in plan.md exists in `bd formula list`.** If any are missing, stop and ask.
+5. **Jankurai is installed.** `jankurai version` must succeed. If not, stop and surface the install command (`cargo install --path crates/jankurai --locked` from a checkout, or the release installer at github.com/neverhuman/jankurai/releases). Jankurai is the [quality standard for every app this workflow builds](../../README.md#quality-standard) — not optional.
 
 ## Process
 
@@ -23,13 +24,34 @@ Convert `plan.md` into a live beads DAG inside the current app repo. After this 
    bd hooks install
    ```
 
-2. **Create one top-level epic for the app itself.**
+2. **Initialize Jankurai (quality standard).**
+   ```powershell
+   # Read-only inventory + adoption plan
+   mkdir -Force target/jankurai | Out-Null
+   jankurai adopt . `
+     --profile auto --mode observe `
+     --out target/jankurai/adoption-plan.json `
+     --md  target/jankurai/adoption-plan.md
+
+   # Scaffold AGENTS.md + agent guidance (level 'agents' = minimal tracked footprint)
+   jankurai init . --level agents --yes
+
+   # First advisory audit — establishes the starting score the loop will improve on
+   jankurai audit . --mode advisory `
+     --json target/jankurai/repo-score.json `
+     --md   target/jankurai/repo-score.md
+   ```
+   - `target/jankurai/` should be gitignored (jankurai's init handles this; verify).
+   - `AGENTS.md` is created at repo root — this is what every `/build-next` tick reads before coding.
+   - Do **not** enable ratchet mode yet. Baseline gets accepted later in a dedicated commit (`agent/baselines/main.repo-score.json`) after the first few real tasks have closed cleanly.
+
+3. **Create one top-level epic for the app itself.**
    ```powershell
    bd create "<app name>" --type=epic --priority=1 --description "See plan.md"
    ```
    Capture the returned epic ID.
 
-3. **For each feature in `plan.md` §"Feature order":**
+4. **For each feature in `plan.md` §"Feature order":**
    a. Pour the formula(s) with their variable bindings:
       ```powershell
       bd cook <formula-name> --mode=runtime --var key=value ... --persist --prefix "feat-"
@@ -38,23 +60,24 @@ Convert `plan.md` into a live beads DAG inside the current app repo. After this 
       (Use `--dry-run` first to preview if the formula is unfamiliar; print the planned issues to the user, then proceed without confirmation.)
    b. Capture the spawned issue IDs.
 
-4. **Add cross-feature dependencies** from `plan.md` §"Cross-feature dependencies":
+5. **Add cross-feature dependencies** from `plan.md` §"Cross-feature dependencies":
    ```powershell
    bd dep add <blocked-id> <blocker-id>
    ```
 
-5. **Validate the DAG.**
+6. **Validate the DAG.**
    ```powershell
    bd dep cycles            # must report none
    bd ready --json          # must return at least one issue
    bd graph --json          # visual sanity check
    ```
 
-6. **Commit the beads state.**
+7. **Commit the beads state and Jankurai scaffold.**
    ```powershell
-   git add .beads/
-   git commit -m "Compose: initial task DAG from plan.md"
+   git add .beads/ AGENTS.md agent/ .gitignore
+   git commit -m "Compose: initial task DAG + Jankurai scaffold"
    ```
+   (`target/jankurai/` should be in `.gitignore`; do not commit receipts.)
 
 ## Output: a one-paragraph summary to the user
 

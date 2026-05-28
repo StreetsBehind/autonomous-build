@@ -35,3 +35,14 @@ bd list --label workflow-improvement --all   # full backlog
 ## Git
 
 There is no remote configured for this repo by default. If you set one up later, beads' git hooks will auto-sync the `.beads/` JSONL exports on commit/push.
+
+## Quality standard for the apps this workflow builds
+
+The pipeline applies the **[Jankurai](https://github.com/neverhuman/jankurai)** standard to every app it builds (not to this workflow repo itself — Jankurai governs the *outputs*, not the meta-infrastructure). When you change `skills/`, `formulas/`, or `hooks/`, keep these invariants intact:
+
+- `/compose` scaffolds Jankurai in every new app (`jankurai adopt` + `jankurai init --level agents --yes`) — do not silently remove this; it produces the `AGENTS.md` that downstream `/build-next` ticks read.
+- `/build-next` runs `jankurai kickoff --intent "<acceptance>"` before coding — this is the bounded-plan step. Kickoff refusal is a real signal, not a nuisance.
+- `hooks/post-build-gate.ps1` runs `jankurai audit --changed-fast` (advisory) and `jankurai witness` (hard fail if `agent/baselines/main.repo-score.json` exists). Do not gut this without a replacement audit step.
+- Receipts under `target/jankurai/` are gitignored; baselines under `agent/baselines/` are tracked and accepted in dedicated commits.
+
+Workflow-improvement tasks that touch the Jankurai integration should be labelled `quality-standard` so retros can find them.

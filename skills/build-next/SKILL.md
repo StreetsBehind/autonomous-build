@@ -67,38 +67,60 @@ bd worktree create "task-$id"
 
 `cd` into the worktree. All subsequent file edits happen here.
 
-### Step 6: implement
+### Step 6: Jankurai kickoff (bounded plan)
 
-Implement against `acceptance`. Write tests first if the formula's design notes recommend it. Keep the change scoped to this single issue — if you find yourself touching things outside the issue's scope, that's a sign of an escalation (block with "scope creep detected: <what>").
+The repo has `AGENTS.md` from `/compose`. Read it. Then turn the issue's `acceptance` into a bounded plan:
 
-### Step 7: quality gate
+```powershell
+mkdir -Force target/jankurai | Out-Null
+jankurai kickoff . `
+  --intent "<issue title + key acceptance lines, one paragraph>" `
+  --out target/jankurai/kickoff-$id.json `
+  --md  target/jankurai/kickoff-$id.md
+```
+
+The kickoff receipt tells you:
+- **Read-first files** before editing.
+- **Ownership boundaries** and **forbidden paths** for this change.
+- **Proof lane** the change needs to satisfy.
+- **Clarifying questions** — if any are blocking, treat them as you would a `needs-decision` label: `bd update --status=blocked` with the question.
+
+If kickoff fails or refuses to bound the intent (intent too broad), block the issue: `bd update $id --status=blocked --notes "jankurai kickoff: intent too broad to bound — needs scope clarification"`.
+
+### Step 7: implement
+
+Implement against `acceptance` and the kickoff plan. Stay inside the kickoff's ownership boundaries; do not edit forbidden paths. Write tests first if the formula's design notes recommend it. Keep the change scoped to this single issue — if you find yourself touching things outside the kickoff's bounded set, that's an escalation (block with "scope creep: <what>").
+
+Optional: launch the editor session under `jankurai guard run -- claude` for realtime write enforcement (failed writes get reverted, agent sees a compile-error header). Useful when the change is risky; overhead otherwise.
+
+### Step 8: quality gate
 
 ```powershell
 ..\autonomous-build\hooks\post-build-gate.ps1
 ```
 
-(Or symlink it in.) Exits 0 on green, nonzero with summary on red.
+(Or symlink it in.) Exits 0 on green, nonzero with summary on red. The gate now includes a Jankurai pass: `jankurai audit --changed-fast` (advisory — prints findings, does not fail the gate by itself) and `jankurai witness` against `agent/baselines/main.repo-score.json` if that baseline exists (hard fail on regression).
 
 On red:
-- First failure: read the failure, adjust, re-run. Once.
+- First failure: read the failure (including `target/jankurai/audit-fast.md` and `target/jankurai/merge-witness.md` if present), adjust, re-run. Once.
 - Second failure: `bd update $id --status=blocked --notes "<failure summary>" --append-notes "<full failure output>"`, leave the worktree for the human to inspect, exit.
 
-### Step 8: commit
+### Step 9: commit
 
 ```powershell
 git add -A
 git commit -m "<issue.title> (bd: $id)"
 ```
 
-Use a HEREDOC for multi-line bodies. Do not include co-author lines unless the user has previously enabled them.
+Use a HEREDOC for multi-line bodies. Do not include co-author lines unless the user has previously enabled them. Do **not** stage `target/jankurai/` — it should be in `.gitignore`.
 
-### Step 9: close
+### Step 10: close
 
 ```powershell
 bd close $id --session $env:CLAUDE_SESSION_ID
 ```
 
-### Step 10: clean up worktree
+### Step 11: clean up worktree
 
 ```powershell
 # from main checkout
@@ -107,7 +129,7 @@ bd worktree remove "task-$id"
 
 (If `--merge` is needed first, do that — depends on the user's branching strategy in plan.md.)
 
-### Step 11: schedule next tick
+### Step 12: schedule next tick
 
 Output the next-action hint for `/loop`:
 - `bd ready --json --limit 1` non-empty → "READY: <count> remaining" — loop should wake in 60–180s
@@ -131,3 +153,6 @@ The DONE-path `/retro` invocation is automatic. The user can also run `/retro` m
 - Do not close an issue whose tests are skipped, mocked over, or commented out.
 - Do not work on multiple issues in one tick. The loop will pick them up in order.
 - Do not commit to the main branch from inside the worktree — the worktree has its own branch.
+- Do not skip the `jankurai kickoff` step. If kickoff cannot bound the intent, that is a real signal — block the issue, do not work around it.
+- Do not edit files outside the kickoff's ownership boundaries to make the gate pass.
+- Do not commit `target/jankurai/` receipts to git — they are local generated outputs. Baselines (`agent/baselines/`) ARE committed, in dedicated commits.
