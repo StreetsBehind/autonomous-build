@@ -19,14 +19,16 @@ This skill must:
 ### Step 1: pick
 
 ```powershell
-bd ready --json --limit 1
+$next = bd ready --json | ConvertFrom-Json | Where-Object { $_.issue_type -ne 'epic' } | Select-Object -First 1
 ```
 
-If empty:
+`bd ready` includes epics, but epics are containers with no implementable work. Filter them out client-side (bd has no `--type` filter on `ready`).
+
+If `$next` is empty:
 - Check `bd blocked --json`. If any → invoke `/escalate` and exit.
 - If both empty → print "DONE: no ready or blocked work" and exit.
 
-Capture the returned issue ID as `$id`.
+Capture the returned issue ID as `$id = $next.id`.
 
 ### Step 2: claim
 
@@ -131,10 +133,15 @@ bd worktree remove "task-$id"
 
 ### Step 12: schedule next tick
 
-Output the next-action hint for `/loop`:
-- `bd ready --json --limit 1` non-empty → "READY: <count> remaining" — loop should wake in 60–180s
-- empty + blocked present → invoke `/escalate`, then "BLOCKED: <count>" — loop should exit
-- both empty → invoke `/retro` (the build is done; generate the workflow performance report and file improvements), then "DONE" — loop should exit
+Output the next-action hint for `/loop`. Use the same non-epic filter as Step 1 when counting remaining work:
+
+```powershell
+$remaining = (bd ready --json | ConvertFrom-Json | Where-Object { $_.issue_type -ne 'epic' }).Count
+```
+
+- `$remaining > 0` → "READY: $remaining remaining" — loop should wake in 60–180s
+- `$remaining == 0` and blocked present → invoke `/escalate`, then "BLOCKED: <count>" — loop should exit
+- `$remaining == 0` and no blocked → invoke `/retro` (the build is done; generate the workflow performance report and file improvements), then "DONE" — loop should exit
 
 The DONE-path `/retro` invocation is automatic. The user can also run `/retro` mid-build for a partial review — the skill handles either case.
 
