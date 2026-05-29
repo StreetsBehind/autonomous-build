@@ -1,0 +1,25 @@
+{
+  "fixture": "07-external-integrations",
+  "axis": "app with external integrations",
+  "archetypeProfile": "web-frontend",
+  "expectIncomplete": false,
+  "concernApplicability": {
+    "data-model": "required",
+    "authn": "required",
+    "authz": "excluded",
+    "secrets": "required",
+    "data-lifecycle": "optional",
+    "error-handling": "required",
+    "observability": "required",
+    "external-integrations": "required",
+    "perf-envelope": "excluded",
+    "abuse-surface": "required"
+  },
+  "mustHaves": [
+    { "id": "M1", "summary": "Operator signs in + connects company Stripe; failed-charge events flow in", "mustMapToFeature": true },
+    { "id": "M2", "summary": "On failed charge, send reminder email (Postmark) + SMS (Twilio) with update link", "mustMapToFeature": true },
+    { "id": "M3", "summary": "On later successful charge, stop the sequence + mark resolved", "mustMapToFeature": true }
+  ],
+  "blocking": [],
+  "notes": "external-integrations REQUIRED with three named third-party services (Stripe, Twilio, Postmark), each needing its own shape (auth, data flow, failure mode) + a webhook-receiver surface. secrets required: three sets of API credentials. error-handling required and DEEP: every must-have crosses an external dependency (partial-failure, retry, provider-down). abuse-surface required: the Stripe webhook receiver + the public update link are unauthenticated surfaces (signature verification + link-token validation). authz excluded: a single operator role, no cross-operator data boundary in v1 (recipients are not account holders). observability required: production multi-integration operation. perf-envelope excluded: §8 names no latency/throughput number."
+}

@@ -1,0 +1,96 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://autonomous-build/tests/vision-eval/expect.schema.json",
+  "title": "vision-eval expectation manifest",
+  "description": "The oracle for one vision.md fixture: what a correct /vision run must produce. Graded by the vision-eval harness (autonomous-build-4vj.2+). One expect.json sits beside each fixture's vision.md.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["fixture", "axis", "archetypeProfile", "expectIncomplete", "concernApplicability", "mustHaves", "blocking"],
+  "properties": {
+    "fixture": {
+      "type": "string",
+      "description": "Directory slug of the fixture (matches the containing folder name)."
+    },
+    "axis": {
+      "type": "string",
+      "description": "The coverage-relevant axis this fixture exercises (see README)."
+    },
+    "archetypeProfile": {
+      "type": "string",
+      "description": "The deferred per-archetype profile this fixture maps to (docs/PLAN_CONCERNS.md 'per-archetype profiles'). Profiles are not yet implemented; this records the intended mapping."
+    },
+    "expectIncomplete": {
+      "type": "boolean",
+      "description": "Whether a correct /vision run must write incomplete:true (the plan BLOCKS /decompose). True for adversarial fixtures."
+    },
+    "concernApplicability": {
+      "type": "object",
+      "description": "Derived applicability per concernId, per docs/PLAN_CONCERNS.md 'Applicability' table. Tiers: 'required' | 'optional' | 'excluded' (the doc's excluded-by-default when the vision does not elevate it). For an incomplete-by-empty-sections fixture, applicability is underivable — use 'underivable' for every concern.",
+      "additionalProperties": false,
+      "required": ["data-model", "authn", "authz", "secrets", "data-lifecycle", "error-handling", "observability", "external-integrations", "perf-envelope", "abuse-surface"],
+      "properties": {
+        "data-model":            { "$ref": "#/$defs/applicability" },
+        "authn":                 { "$ref": "#/$defs/applicability" },
+        "authz":                 { "$ref": "#/$defs/applicability" },
+        "secrets":               { "$ref": "#/$defs/applicability" },
+        "data-lifecycle":        { "$ref": "#/$defs/applicability" },
+        "error-handling":        { "$ref": "#/$defs/applicability" },
+        "observability":         { "$ref": "#/$defs/applicability" },
+        "external-integrations": { "$ref": "#/$defs/applicability" },
+        "perf-envelope":         { "$ref": "#/$defs/applicability" },
+        "abuse-surface":         { "$ref": "#/$defs/applicability" }
+      }
+    },
+    "mustHaves": {
+      "type": "array",
+      "description": "One entry per §3 must-have the fixture states, in document order, with the ID /vision should assign and whether it must map to >=1 feature in coverage[].",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "summary", "mustMapToFeature"],
+        "properties": {
+          "id":      { "type": "string", "pattern": "^M[0-9]+$" },
+          "summary": { "type": "string" },
+          "mustMapToFeature": {
+            "type": "boolean",
+            "description": "True if a correct plan maps this must-have to >=1 feature. False only for an adversarial must-have that should instead surface a blocking openQuestion (excluded by a non-goal, or no matching formula)."
+          }
+        }
+      }
+    },
+    "blocking": {
+      "type": "array",
+      "description": "Expected blocking signals (each forces incomplete:true). Empty when expectIncomplete is false.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["gate", "detail"],
+        "properties": {
+          "gate": {
+            "type": "string",
+            "enum": [
+              "forward-coverage",
+              "reverse-trace",
+              "success-metric-oracle",
+              "concern-decidedness",
+              "required-excluded-contradiction",
+              "musthave-nongoal-contradiction",
+              "no-matching-formula",
+              "missing-product-sections"
+            ],
+            "description": "Which /vision gate (skills/vision/SKILL.md steps 6.6/6.7/8.6 + stopping conditions) must fire."
+          },
+          "mustHaveId": { "type": "string", "pattern": "^M[0-9]+$" },
+          "detail":     { "type": "string" }
+        }
+      }
+    },
+    "notes": { "type": "string" }
+  },
+  "$defs": {
+    "applicability": {
+      "type": "string",
+      "enum": ["required", "optional", "excluded", "underivable"]
+    }
+  }
+}

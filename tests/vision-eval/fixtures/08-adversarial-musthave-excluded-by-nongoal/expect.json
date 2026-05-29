@@ -1,0 +1,28 @@
+{
+  "fixture": "08-adversarial-musthave-excluded-by-nongoal",
+  "axis": "adversarial: a must-have excluded by a non-goal",
+  "archetypeProfile": "web-frontend",
+  "expectIncomplete": true,
+  "concernApplicability": {
+    "data-model": "required",
+    "authn": "required",
+    "authz": "excluded",
+    "secrets": "required",
+    "data-lifecycle": "optional",
+    "error-handling": "required",
+    "observability": "optional",
+    "external-integrations": "required",
+    "perf-envelope": "excluded",
+    "abuse-surface": "required"
+  },
+  "mustHaves": [
+    { "id": "M1", "summary": "Sign in + save a web clipping (URL, title, text, tags)", "mustMapToFeature": true },
+    { "id": "M2", "summary": "Search/filter clippings by tag and text", "mustMapToFeature": true },
+    { "id": "M3", "summary": "Export selected clippings as a formatted PDF dossier", "mustMapToFeature": false }
+  ],
+  "blocking": [
+    { "gate": "musthave-nongoal-contradiction", "mustHaveId": "M3", "detail": "M3 (export a PDF dossier) is directly forbidden by §5 ('NOT generate, render, or export any files — no PDF, no downloads, no document generation of any kind'). /vision must surface a blocking openQuestion, NOT invent a feature for it." },
+    { "gate": "success-metric-oracle", "detail": "§8 requires 'produces a PDF dossier', so the success metric depends on the contradicted capability and cannot be satisfied by any allowed feature." }
+  ],
+  "notes": "The trap: M1/M2 are clean and derivable; M3 contradicts the non-goals and the success metric leans on M3. A correct run does NOT silently drop M3 or invent a PDF feature (which would violate the non-goal). It writes incomplete:true with a blocking openQuestion asking the human to reconcile §3 vs §5 (add the feature by relaxing the non-goal, or demote M3). Concern applicability is still derivable for the non-contradicted product, so it is asserted; the plan blocks on the contradiction, not on undecidable concerns."
+}

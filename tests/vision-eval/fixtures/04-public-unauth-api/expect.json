@@ -1,0 +1,25 @@
+{
+  "fixture": "04-public-unauth-api",
+  "axis": "public unauthenticated API",
+  "archetypeProfile": "public-api",
+  "expectIncomplete": false,
+  "concernApplicability": {
+    "data-model": "required",
+    "authn": "excluded",
+    "authz": "excluded",
+    "secrets": "excluded",
+    "data-lifecycle": "optional",
+    "error-handling": "required",
+    "observability": "required",
+    "external-integrations": "required",
+    "perf-envelope": "excluded",
+    "abuse-surface": "required"
+  },
+  "mustHaves": [
+    { "id": "M1", "summary": "Public GET /zip/{code} returns city/state/county/population JSON, no auth", "mustMapToFeature": true },
+    { "id": "M2", "summary": "Clear 404/400 + machine-readable error body for bad/unknown codes", "mustMapToFeature": true },
+    { "id": "M3", "summary": "Per-IP rate limit with documented limits + 429/Retry-After", "mustMapToFeature": true }
+  ],
+  "blocking": [],
+  "notes": "abuse-surface REQUIRED: the entire product is a public unauthenticated network surface; M3 (rate limit) + M2 (input validation) are exactly its evidence. authn/authz excluded: explicitly anonymous, no accounts. secrets EXCLUDED: no authn, no external integration, and the dataset is a static public-domain file loaded in-memory at boot (no DB credentials). The §6 budget line is a cost ceiling, not a secret-management constraint. secrets is excluded-by-default, so with no elevating signal it stays excluded (the derivation table only ever resolves the excluded-by-default five to required or excluded — never optional). perf-envelope excluded: §8 asserts correctness + rate-limit behavior but names no concrete latency/throughput number (contrast fixture 06). observability required: public production service. external-integrations decided 'none' (static dataset)."
+}

@@ -1,0 +1,23 @@
+{
+  "fixture": "10-adversarial-empty-product-sections",
+  "axis": "adversarial: empty / unfilled product sections",
+  "archetypeProfile": "none (no product to classify)",
+  "expectIncomplete": true,
+  "concernApplicability": {
+    "data-model": "underivable",
+    "authn": "underivable",
+    "authz": "underivable",
+    "secrets": "underivable",
+    "data-lifecycle": "underivable",
+    "error-handling": "underivable",
+    "observability": "underivable",
+    "external-integrations": "underivable",
+    "perf-envelope": "underivable",
+    "abuse-surface": "underivable"
+  },
+  "mustHaves": [],
+  "blocking": [
+    { "gate": "missing-product-sections", "detail": "§1 (problem), §2 (users), §3 (must-haves), §5 (non-goals), and §8 (success metric) are still the unedited template placeholders. Per skills/vision/SKILL.md stopping conditions, /vision must refuse to produce a plan and ask the human to fill the product sections — NOT hallucinate a product. The graded outcome is BLOCK (no complete/blessed plan); if a lock is written at all it carries incomplete:true." }
+  ],
+  "notes": "The hardest negative: with no product input, concern applicability is UNDERIVABLE (applicability is derived from §3/§6/§8 — there is nothing to derive from). The failure this guards against is a run that invents must-haves/users to fill the void and emits a confident plan. Correct behavior: stop and escalate for human input. mustHaves is empty because none are stated; a run that returns any must-have here has fabricated it."
+}

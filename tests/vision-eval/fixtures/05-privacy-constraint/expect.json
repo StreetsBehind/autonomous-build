@@ -1,0 +1,25 @@
+{
+  "fixture": "05-privacy-constraint",
+  "axis": "app with a §6 privacy / data-residency constraint",
+  "archetypeProfile": "web-frontend",
+  "expectIncomplete": false,
+  "concernApplicability": {
+    "data-model": "required",
+    "authn": "required",
+    "authz": "required",
+    "secrets": "required",
+    "data-lifecycle": "required",
+    "error-handling": "required",
+    "observability": "optional",
+    "external-integrations": "required",
+    "perf-envelope": "excluded",
+    "abuse-surface": "required"
+  },
+  "mustHaves": [
+    { "id": "M1", "summary": "Sign in + record a dated symptom/mood/meds entry", "mustMapToFeature": true },
+    { "id": "M2", "summary": "Trend view of the patient's own entries over a date range", "mustMapToFeature": true },
+    { "id": "M3", "summary": "Permanent account + entry deletion", "mustMapToFeature": true }
+  ],
+  "blocking": [],
+  "notes": "data-lifecycle REQUIRED via two signals: §6 privacy constraint AND PII/user-owned health data; M3 (permanent delete) is its direct evidence (hard-delete cascade). The EU data-residency line is also a measurable §6 constraint, so a correct run lifts it into nfrs[] (category data-residency) — that is asserted by the L-checks beyond this concern manifest. authz required: per-patient isolation (a patient reads only their own entries). abuse-surface required: sign-in is a public endpoint. observability optional: §8 is a single-patient self-review flow, not a stated multi-user/production-scale operation. perf-envelope excluded: no scale/latency number in §8."
+}

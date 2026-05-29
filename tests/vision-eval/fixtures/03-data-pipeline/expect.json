@@ -1,0 +1,25 @@
+{
+  "fixture": "03-data-pipeline",
+  "axis": "data pipeline (batch ETL, no end-user accounts)",
+  "archetypeProfile": "data-pipeline",
+  "expectIncomplete": false,
+  "concernApplicability": {
+    "data-model": "required",
+    "authn": "excluded",
+    "authz": "excluded",
+    "secrets": "required",
+    "data-lifecycle": "required",
+    "error-handling": "required",
+    "observability": "required",
+    "external-integrations": "required",
+    "perf-envelope": "excluded",
+    "abuse-surface": "excluded"
+  },
+  "mustHaves": [
+    { "id": "M1", "summary": "Scheduled ingest + per-row schema validation of source CSVs", "mustMapToFeature": true },
+    { "id": "M2", "summary": "Load validated rows; record rejects with reasons", "mustMapToFeature": true },
+    { "id": "M3", "summary": "Idempotent runs (no double-load on re-run)", "mustMapToFeature": true }
+  ],
+  "blocking": [],
+  "notes": "No end-user accounts -> authn/authz excluded. secrets REQUIRED: warehouse + source-bucket credentials (external-integrations also forces secrets). external-integrations required: the source bucket + partner feeds are named third-party dependencies. data-lifecycle required: ingested data retention + rejects + idempotency (T8) is core to the product. observability required: §8 describes a scheduled production job whose operator reads run logs. perf-envelope excluded: §8 names correctness, not a throughput/latency number. abuse-surface excluded: no public/unauthenticated network surface."
+}

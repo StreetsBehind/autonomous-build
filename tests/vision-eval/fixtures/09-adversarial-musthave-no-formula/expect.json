@@ -1,0 +1,27 @@
+{
+  "fixture": "09-adversarial-musthave-no-formula",
+  "axis": "adversarial: a must-have with no matching formula (workflow gap)",
+  "archetypeProfile": "web-frontend",
+  "expectIncomplete": true,
+  "concernApplicability": {
+    "data-model": "required",
+    "authn": "required",
+    "authz": "required",
+    "secrets": "required",
+    "data-lifecycle": "optional",
+    "error-handling": "required",
+    "observability": "optional",
+    "external-integrations": "required",
+    "perf-envelope": "excluded",
+    "abuse-surface": "required"
+  },
+  "mustHaves": [
+    { "id": "M1", "summary": "Sign in + submit a purchase request (CRUD entity)", "mustMapToFeature": true },
+    { "id": "M2", "summary": "Admin-defined configurable, branching multi-stage approval engine that advances requests server-side", "mustMapToFeature": false },
+    { "id": "M3", "summary": "View a request's current stage + full approval history", "mustMapToFeature": true }
+  ],
+  "blocking": [
+    { "gate": "no-matching-formula", "mustHaveId": "M2", "detail": "M2 is a configurable, branching approval-workflow / state-machine ENGINE. No library formula pours this: crud-feature is an entity slice, background-job is one job, grpc-tonic-service is a fixed RPC surface — none is a user-configurable workflow engine. It is on the pinned stack (Rust + React) so it is NOT an off-stack agent-consult question; it is a workflow gap. /vision must note 'needs new formula' and surface a blocking openQuestion before /decompose, not force-fit crud-feature." }
+  ],
+  "notes": "The trap: M1 and M3 map cleanly to existing formulas, which tempts a run to declare full coverage and force-fit M2 onto crud-feature (a Workflow entity with rows) — but that does not deliver the branching execution engine §8 demands, and pouring an off-enum/ill-fit formula is exactly the failure 3fr.1 hardened against. Correct behavior: incomplete:true with a 'needs new formula' workflow-gap openQuestion. authz required: requester vs approver vs admin (>1 principal) with a who-may-approve-what boundary. Concern applicability is derivable (normal internal web app) and is asserted; the block is the missing formula, not undecidable concerns."
+}

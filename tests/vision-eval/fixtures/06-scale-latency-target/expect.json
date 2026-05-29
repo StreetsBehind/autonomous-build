@@ -1,0 +1,25 @@
+{
+  "fixture": "06-scale-latency-target",
+  "axis": "app with a §8 scale/latency target",
+  "archetypeProfile": "public-api",
+  "expectIncomplete": false,
+  "concernApplicability": {
+    "data-model": "required",
+    "authn": "required",
+    "authz": "excluded",
+    "secrets": "required",
+    "data-lifecycle": "optional",
+    "error-handling": "required",
+    "observability": "required",
+    "external-integrations": "required",
+    "perf-envelope": "required",
+    "abuse-surface": "required"
+  },
+  "mustHaves": [
+    { "id": "M1", "summary": "Marketer creates a short code -> destination URL mapping", "mustMapToFeature": true },
+    { "id": "M2", "summary": "Public GET /{code} issues a 301/302 redirect", "mustMapToFeature": true },
+    { "id": "M3", "summary": "Per-code click count visible to the marketer", "mustMapToFeature": true }
+  ],
+  "blocking": [],
+  "notes": "perf-envelope REQUIRED: §8 names a concrete envelope (p99 < 50ms at 1,000 req/s, 0 errors) — a correct run also lifts this into nfrs[] (category performance) for a gated enforcement bead. abuse-surface required: public redirect endpoint. authn required: a marketer authenticates to the internal creation page. authz EXCLUDED: a single trusted internal marketer group with no cross-user/cross-tenant data boundary stated, so the 'authn required AND >1 principal or cross-user data' condition is not met; authz is excluded-by-default and stays excluded (reason: 'single trusted internal group, no per-user data partition in v1'). This is the deliberate contrast with fixture 01, where multi-tenant workspaces force authz required. observability required: explicit production load/scale operation."
+}

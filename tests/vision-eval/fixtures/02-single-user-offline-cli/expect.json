@@ -1,0 +1,25 @@
+{
+  "fixture": "02-single-user-offline-cli",
+  "axis": "single-user offline CLI",
+  "archetypeProfile": "cli",
+  "expectIncomplete": false,
+  "concernApplicability": {
+    "data-model": "required",
+    "authn": "excluded",
+    "authz": "excluded",
+    "secrets": "excluded",
+    "data-lifecycle": "optional",
+    "error-handling": "required",
+    "observability": "optional",
+    "external-integrations": "required",
+    "perf-envelope": "excluded",
+    "abuse-surface": "excluded"
+  },
+  "mustHaves": [
+    { "id": "M1", "summary": "jot add appends a timestamped note locally", "mustMapToFeature": true },
+    { "id": "M2", "summary": "jot search prints matches newest-first", "mustMapToFeature": true },
+    { "id": "M3", "summary": "jot list --since prints a date range", "mustMapToFeature": true }
+  ],
+  "blocking": [],
+  "notes": "authn/authz/secrets/perf-envelope/abuse-surface all excluded: single-user, no network surface, no accounts, no credentials. external-integrations still REQUIRED TO DECIDE — the correct decision is 'none' (status: excluded with reason), not silence. observability optional (single-user, not production) and would be decided 'excluded'. data-lifecycle optional: local notes, no privacy/PII constraint elevating it. error-handling required always (file-store write failures)."
+}

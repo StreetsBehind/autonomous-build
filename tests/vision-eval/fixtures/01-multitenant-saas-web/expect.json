@@ -1,0 +1,25 @@
+{
+  "fixture": "01-multitenant-saas-web",
+  "axis": "greenfield multi-tenant web",
+  "archetypeProfile": "web-frontend",
+  "expectIncomplete": false,
+  "concernApplicability": {
+    "data-model": "required",
+    "authn": "required",
+    "authz": "required",
+    "secrets": "required",
+    "data-lifecycle": "required",
+    "error-handling": "required",
+    "observability": "required",
+    "external-integrations": "required",
+    "perf-envelope": "excluded",
+    "abuse-surface": "required"
+  },
+  "mustHaves": [
+    { "id": "M1", "summary": "Admins invite members; members see only their workspaces' boards", "mustMapToFeature": true },
+    { "id": "M2", "summary": "Members create/assign/move tasks across board columns", "mustMapToFeature": true },
+    { "id": "M3", "summary": "Cross-board 'My tasks' view sorted by due date", "mustMapToFeature": true }
+  ],
+  "blocking": [],
+  "notes": "authz required: >1 principal + per-workspace (tenant) data isolation. abuse-surface required: signup/login are public unauthenticated endpoints. observability required: §8 is a multi-user production flow. perf-envelope excluded: §8 names no scale/latency target. data-lifecycle required: holds user-owned PII (member identities, task assignments)."
+}
