@@ -11,6 +11,7 @@ Turn a `vision.md` into a `plan.md` the rest of the pipeline can consume.
 
 - `vision.md` in the current working directory (filled out from `autonomous-build/templates/vision.md`).
 - [`docs/DEFAULT_STACK.md`](../../docs/DEFAULT_STACK.md) — the pinned Jankurai stack the plan resolves against. **Read this first.**
+- [`docs/PLAN_CONCERNS.md`](../../docs/PLAN_CONCERNS.md) — the pinned cross-cutting concern vocabulary (`data-model`, `authn`, `authz`, `secrets`, `data-lifecycle`, `error-handling`, `observability`, `external-integrations`, `perf-envelope`, `abuse-surface`), each with its `addressed`-means bar and the rule that derives its applicability from the vision. Read alongside `DEFAULT_STACK.md`; the concern step (8.5) binds to it.
 - The user is present for this stage — it's the last human-in-the-loop checkpoint before the autonomous build begins. **The checkpoint is for product, not tech.**
 
 ## Process
@@ -63,6 +64,14 @@ Turn a `vision.md` into a `plan.md` the rest of the pipeline can consume.
 
 8. **Set the escalation budget.** Copy from vision.md §9, fill defaults for anything left blank.
 
+8.5. **Derive and decide the cross-cutting concerns.** Read [`docs/PLAN_CONCERNS.md`](../../docs/PLAN_CONCERNS.md) (the same way you read `DEFAULT_STACK.md`). For each of the ten concerns in its vocabulary:
+
+   - **Derive applicability** from the human's product input per that doc's derivation rules — never invent it. Drive it from vision.md §3 (a must-have implying user accounts/per-user data → `authn`, and `authz` if >1 principal or cross-user data), §6 (a privacy/budget/infra constraint → `secrets` + `data-lifecycle`), and §8 (a success metric naming scale/latency/throughput → `perf-envelope`). `external-integrations` is always decided (even "none"); `data-model` and `error-handling` are always required. A concern resolves to `required`, `optional`, or `excluded-by-default`; **applicable** = `required` or `optional`.
+   - **Decide a status** for every concern (applicable or not — `excluded-by-default` concerns are recorded as `excluded` with the standard reason so the decision is explicit and auditable). `addressed` requires *falsifiable evidence* meeting that concern's "addressed means…" bar: a `featureOrder[].name`, a formula, a tenet (by number), the quality gate, or a `DEFAULT_STACK.md` pin. A bare assertion ("we handle auth", "security is covered") is rejected, mirroring the coverage `how` rule and `/decompose`'s anti-vagueness invariant. `excluded` requires a one-line `reason`.
+   - When addressing a concern needs an off-stack decision (e.g. `external-integrations` pulling in a queue or third-party API), that goes through the step 7 agent consult; the concern's evidence then cites the consult/decision.
+
+   Write `concerns[]` into `plan.lock.json` (one entry per concern: `{concernId, status, evidence}` when addressed, `{concernId, status, reason}` when excluded). Add a `## Concerns` table to `plan.md` (see structure below). (The decidedness + required-excluded contradiction *gate* is step 8.6.)
+
 9. **Derive the tenets.** Tenets are the principles the loop falls back on for build-time judgment calls — what to do when the bead spec, formula, gate, and lock don't decide for it. Produce `tenets.md` in the app repo from [`autonomous-build/templates/tenets.md`](../../templates/tenets.md):
 
    - The "Inherited workflow tenets" section is copied verbatim from the template — it summarizes T1–T10 from [`autonomous-build/docs/TENETS.md`](../../docs/TENETS.md). Do not paraphrase; the bullets are deliberately load-bearing.
@@ -82,14 +91,17 @@ Turn a `vision.md` into a `plan.md` the rest of the pipeline can consume.
 `/vision` writes three paired files in the app repo CWD:
 
 - **`plan.md`** — the human-readable contract (structure below). Quoted to the user, edited if they want, and kept in git as the narrative.
-- **`plan.lock.json`** — the machine-readable mirror that `/decompose` consumes (schema v2). Same content in structured form, validated against [`autonomous-build/schemas/plan.lock.schema.json`](../../schemas/plan.lock.schema.json) before writing. In addition to the stack/data-model/feature fields, write the v2 coverage fields: `mustHaves[]` ({id, text} from step 1), `successMetric.steps[]` ({id, text} from step 1), and `coverage[]` ({mustHaveId, features, how} from step 6.5). See [`docs/PLAN_LOCK.md`](../../docs/PLAN_LOCK.md) for the field reference.
+- **`plan.lock.json`** — the machine-readable mirror that `/decompose` consumes (schema v2). Same content in structured form, validated against [`autonomous-build/schemas/plan.lock.schema.json`](../../schemas/plan.lock.schema.json) before writing. In addition to the stack/data-model/feature fields, write the v2 coverage fields: `mustHaves[]` ({id, text} from step 1), `successMetric.steps[]` ({id, text} from step 1), `coverage[]` ({mustHaveId, features, how} from step 6.5), and `concerns[]` (one decided entry per concern from step 8.5). See [`docs/PLAN_LOCK.md`](../../docs/PLAN_LOCK.md) for the field reference.
 - **`tenets.md`** — the build-time judgment-call reference, derived from [`autonomous-build/templates/tenets.md`](../../templates/tenets.md) per step 9. Read by `/build-next` when an agent faces a question the bead spec / formula / gate don't answer.
 
 Write all three. Before writing the lock, cross-check each `featureOrder[].vars` entry against its formula's declared vars (from `bd formula show`): every bound key must be a declared variable name, and every value of an enum-typed variable must be enum-valid. A key that isn't declared, or an off-enum value, is a hard stop — fix the binding (step 6) or escalate the formula gap; do not write a lock that pours will reject or that improvises a rename. If schema validation fails on the lock, stop — do not write a partial lock or a tenets file derived from a partial lock. If `plan.md` §"Open questions for human" has any items the user must answer before composing, write the lock anyway with `incomplete: true` and `openQuestions[].blockingCompose: true` for those items, and still write `tenets.md` (the blocking questions become tenets that say "do not proceed until the human answers"); `/compose` will refuse cleanly with the structured reason.
 
 ### Closing summary
 
-After writing the three files, print a closing summary to the user. It must include the **coverage table** — every must-have (`M1`, `M2`, …) with the feature(s) that deliver it — so the human sees, at the gate, exactly which feature carries each must-have. State **PASS** (every must-have covered) explicitly; if the forward-coverage assertion (step 6.6) found an uncovered must-have, list the offending must-haves and note that `incomplete: true` was written and `/decompose` will refuse until the vision or coverage is fixed.
+After writing the three files, print a closing summary to the user. It must include:
+
+- the **coverage table** — every must-have (`M1`, `M2`, …) with the feature(s) that deliver it — so the human sees, at the gate, exactly which feature carries each must-have. State **PASS** (every must-have covered) explicitly; if the forward-coverage assertion (step 6.6) found an uncovered must-have, list the offending must-haves and note that `incomplete: true` was written and `/decompose` will refuse until the vision or coverage is fixed.
+- the **concerns table** — every concern with its applicability, status, and evidence/reason (step 8.5). State **PASS** (every applicable concern decided, no required+excluded contradictions) explicitly; if the decidedness gate (step 8.6) found an undecided applicable concern or a required+excluded contradiction, list the offending concerns and note that `incomplete: true` was written and `/decompose` will refuse.
 
 ### `plan.md` structure
 
@@ -133,6 +145,16 @@ Use this exact structure so `/compose`'s fallback parser (for repos that pre-dat
 
 - **S1**: <observable>
 - **S2**: <observable>
+
+## Concerns
+> Every cross-cutting concern (docs/PLAN_CONCERNS.md) decided: addressed (with falsifiable evidence) or excluded (with reason). Mirrors `concerns[]` in the lock. One row per concern; silence is not an option (see step 8.5).
+
+| Concern | Applicability | Status | Evidence / Reason |
+| --- | --- | --- | --- |
+| data-model | required | addressed | <entities in Data model> |
+| authn | required | addressed | <feature/formula citing who + mechanism> |
+| ... | ... | ... | ... |
+| abuse-surface | excluded-by-default | excluded | <no public unauthenticated surface> |
 
 ## Cross-feature dependencies
 - Feature 3 depends on feature 1's auth tasks (use `bd dep add`)
