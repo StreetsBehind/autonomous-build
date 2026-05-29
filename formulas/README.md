@@ -115,7 +115,7 @@ Rules:
 - Include test files the step also writes (mirrors what `testPlan.file` declares — listing both is fine, the orchestrator dedupes).
 - For repo-wide chore steps (lint config, CI workflow), list the specific config files only — don't catch-all with `**`, or every step will conflict with every other step.
 
-Like `testPlan`, the `files` array is dropped by bd cook. `/compose` parses it from the formula TOML and writes it as bd issue metadata (`filesTouched`). The orchestrator reads `metadata.filesTouched` during dispatch — see skills/build-batch/SKILL.md "Dispatch-Bead" for the conflict-aware filter, and autonomous-build-1zq.2 for the wiring change.
+Like `testPlan`, the `files` array is dropped by bd cook. `/decompose` parses it from the formula TOML and writes it as bd issue metadata (`filesTouched`). The orchestrator reads `metadata.filesTouched` during dispatch — see `workflows/build-batch.spec.md` ("Dispatch-Bead" / the conflict-aware filter) for the intersection logic, and autonomous-build-1zq.2 for the wiring change.
 
 A step with no `files` declared falls back to the old behavior: the post-merge gate is what catches the conflict. `/build-batch` will warn when it dispatches a bead with no `filesTouched`, so missing declarations surface.
 
