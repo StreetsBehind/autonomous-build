@@ -188,10 +188,14 @@ Optional: launch the editor session under `jankurai guard run -- claude` for rea
 
 Run the gate that matches the host OS. There is **no PowerShell on the documented Linux/macOS path** — use the `.sh`; reserve the `.ps1` (invoked via `pwsh`) for Windows. Resolve the `hooks/` dir from the app repo root first, then from the sibling `autonomous-build` checkout:
 
+In **app mode**, export `GATE_REQUIRE_BASELINE=1` before running the gate. App repos are blessed by `/decompose` before the loop starts, so a missing baseline at gate time is a `/decompose` bug, not a benign fresh-repo condition — the signal flips the gate's no-baseline branch from quiet SKIP to LOUD FAIL (igu.3), blocking the bead instead of silently shipping ungated commits. In **meta mode**, do NOT set it: this workflow repo is never Jankurai-governed, so no baseline is correct and the gate's quiet SKIP is what we want.
+
 ```bash
 # Linux / macOS
 gate="$(git rev-parse --show-toplevel)/hooks/post-build-gate.sh"
 [ -f "$gate" ] || gate="$(cd "$(git rev-parse --show-toplevel)/.." && pwd)/autonomous-build/hooks/post-build-gate.sh"
+# App mode only — meta mode leaves GATE_REQUIRE_BASELINE unset (quiet SKIP).
+if [ "$metaMode" != "1" ]; then export GATE_REQUIRE_BASELINE=1; fi
 "$gate"
 ```
 
@@ -199,6 +203,8 @@ gate="$(git rev-parse --show-toplevel)/hooks/post-build-gate.sh"
 # Windows
 $gate = Join-Path (git rev-parse --show-toplevel) "hooks/post-build-gate.ps1"
 if (-not (Test-Path $gate)) { $gate = Join-Path (Resolve-Path "../autonomous-build/hooks/post-build-gate.ps1") "" }
+# App mode only — meta mode leaves GATE_REQUIRE_BASELINE unset (quiet SKIP).
+if (-not $metaMode) { $env:GATE_REQUIRE_BASELINE = "1" }
 pwsh -NoProfile -File $gate
 ```
 
