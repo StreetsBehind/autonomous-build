@@ -35,6 +35,19 @@ In meta mode:
 
 If unsure whether the work is "risky enough" to warrant a worktree in meta mode: default to no worktree. The diff is git-tracked; revert is one command.
 
+## Phases
+
+One tick is a linear pipeline of gates; each phase can exit the tick early (stale, blocked, DONE) without reaching the next. The detailed `## Process` steps below map onto these phases:
+
+1. **meta** — detect meta vs app mode (`$metaMode`); meta mode skips the worktree, Jankurai kickoff, and worktree-cleanup phases.
+2. **pick + claim** — `bd ready` → first non-epic leaf → **claim** it (`bd update --claim`); if nothing ready, branch to blocked-escalation or DONE.
+3. **freshness** — verify the bead's load-bearing claims against current code; close-as-stale if the AC is already met before doing any work.
+4. **epic + escalation** — read the issue (and its parent **epic** context); escalation pre-check against `docs/ESCALATION_RULES.md`; block rather than guess.
+5. **tenets** — Jankurai kickoff (app mode) and the **tenets** check bound the change to declared intent before code is written.
+6. **implement** — make the edit in the worktree (app) or on `main` (meta).
+7. **gate** — run the post-build quality **gate** (lint + typecheck + test + Jankurai); a red gate blocks the close.
+8. **close** — commit, **close** the bead, clean up the worktree, and schedule the next tick.
+
 ## Process
 
 ### Step 1: pick
