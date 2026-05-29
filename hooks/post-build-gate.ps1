@@ -45,7 +45,15 @@ if (Test-Path "package.json") {
     if ($scripts.lint)      { if (-not (Run-Step "lint"      "$pm run lint"))      { $failures += "lint" } }
     if ($scripts.typecheck) { if (-not (Run-Step "typecheck" "$pm run typecheck")) { $failures += "typecheck" } }
     elseif ($scripts.tsc)   { if (-not (Run-Step "tsc"       "$pm run tsc"))       { $failures += "tsc" } }
-    if ($scripts.test)      { if (-not (Run-Step "test"      "$pm run test"))      { $failures += "test" } }
+    # Tests are mandatory. A detected stack with no test suite is a HARD FAIL,
+    # not a silent pass — "no tests" must never be indistinguishable from green.
+    if ($scripts.test) {
+        if (-not (Run-Step "test" "$pm run test")) { $failures += "test" }
+    } else {
+        Write-Host "=== test ==="
+        Write-Host "FAIL: test — package.json declares no `"test`" script. A detected stack must ship a runnable test suite; absent tests are a hard fail, not a pass."
+        $failures += "test-missing"
+    }
 }
 
 # --- Python ---
@@ -58,8 +66,25 @@ if ((Test-Path "pyproject.toml") -or (Test-Path "requirements.txt")) {
     if ((Get-Command mypy -ErrorAction SilentlyContinue) -or (Test-Path "mypy.ini")) {
         if (-not (Run-Step "mypy" "$runner mypy .")) { $failures += "mypy" }
     }
+    # Tests are mandatory (see Node block). pytest exit 5 == "no tests collected":
+    # an empty suite is treated as a hard fail, not a pass.
+    Write-Host "=== pytest ==="
     if (Get-Command pytest -ErrorAction SilentlyContinue) {
-        if (-not (Run-Step "pytest" "$runner pytest -q")) { $failures += "pytest" }
+        $pytestCmd = "$runner pytest -q"
+        Write-Host "  $ $pytestCmd"
+        $pyProc = Start-Process -FilePath "pwsh" -ArgumentList "-NoProfile", "-Command", $pytestCmd -NoNewWindow -PassThru -Wait
+        if ($pyProc.ExitCode -eq 0) {
+            Write-Host "PASS: pytest"
+        } elseif ($pyProc.ExitCode -eq 5) {
+            Write-Host "FAIL: pytest — no tests collected. An empty suite is a hard fail, not a pass."
+            $failures += "pytest-empty"
+        } else {
+            Write-Host "FAIL: pytest (exit $($pyProc.ExitCode))"
+            $failures += "pytest"
+        }
+    } else {
+        Write-Host "FAIL: pytest not available — a detected Python stack must ship a runnable test suite; absent tests are a hard fail, not a pass."
+        $failures += "pytest-missing"
     }
 }
 

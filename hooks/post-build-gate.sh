@@ -11,7 +11,8 @@
 # Gate checks (in execution order):
 # 1. lint            — stack linter (eslint / cargo clippy / etc.); style + obvious errors
 # 2. typecheck       — type checker (tsc / mypy); reject untyped or ill-typed code
-# 3. test            — the project's test suite; all tests must be green
+# 3. test            — the project's test suite; MANDATORY when a stack is detected
+#                      (no runnable suite / no tests collected == hard fail, never a silent pass)
 # 4. pre-commit safety — secret / large-file / merge-marker scan before anything commits
 # 5. Jankurai        — `jankurai audit` (advisory) + `jankurai witness` (hard fail if baseline exists)
 #
@@ -66,7 +67,16 @@ if [ -f "package.json" ]; then
   elif npm_script tsc; then
     run_step "tsc"       "$pm run tsc"
   fi
-  npm_script test      && run_step "test"      "$pm run test"
+  # Tests are mandatory. A detected stack with no test suite is a HARD FAIL,
+  # not a silent pass — "no tests" must never be indistinguishable from green
+  # (it's the easiest escape hatch for an agent under retry pressure).
+  if npm_script test; then
+    run_step "test" "$pm run test"
+  else
+    echo "=== test ==="
+    echo "FAIL: test — package.json declares no \"test\" script. A detected stack must ship a runnable test suite; absent tests are a hard fail, not a pass."
+    failures+=("test-missing")
+  fi
 fi
 
 # --- Python ---
@@ -82,8 +92,26 @@ if [ -f "pyproject.toml" ] || [ -f "requirements.txt" ]; then
   if has_cmd mypy || [ -f "mypy.ini" ]; then
     run_step "mypy" "${runner}mypy ."
   fi
+  # Tests are mandatory (see Node block). pytest exit 5 == "no tests collected":
+  # an empty suite is treated as a hard fail, not a pass.
+  echo "=== pytest ==="
   if has_cmd pytest; then
-    run_step "pytest" "${runner}pytest -q"
+    echo "  \$ ${runner}pytest -q"
+    if bash -c "${runner}pytest -q"; then
+      echo "PASS: pytest"
+    else
+      code=$?
+      if [ "$code" -eq 5 ]; then
+        echo "FAIL: pytest — no tests collected. An empty suite is a hard fail, not a pass."
+        failures+=("pytest-empty")
+      else
+        echo "FAIL: pytest (exit $code)"
+        failures+=("pytest")
+      fi
+    fi
+  else
+    echo "FAIL: pytest not available — a detected Python stack must ship a runnable test suite; absent tests are a hard fail, not a pass."
+    failures+=("pytest-missing")
   fi
 fi
 
