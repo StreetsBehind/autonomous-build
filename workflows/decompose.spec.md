@@ -168,6 +168,8 @@ After the first wave of `atomize` agents completes:
 
 One agent per epic in the DAG (app-level epic + each pour-root epic from Phase 3). Each agent runs `/quality-pass`'s per-bead rubric across its epic's children and returns scores + remediations.
 
+**Epic discovery must reach the molecule-root epics.** Pours produce `app-epic → molecule-root-epic → task`, so the discovery step enumerates *every* open epic that directly parents an open non-epic bead — molecule-root epics and any deeper sub-epics, not just the app epic's direct children. It also returns `totalOpenNonEpic` (an exact count of all open non-epic beads) as ground truth. If a non-empty pour set yields zero scoring epics, that is a discovery bug, not a clean DAG. (smbuild scored **zero** beads here and the gate passed vacuously — this is the guard against that.)
+
 **Agent:** `quality-score` (K = number of open epics after Phase 4)
 **Tools:** `Bash`, `Read`, `Grep`, `Glob`
 **Inputs per agent:** `{ epicId }`
@@ -265,7 +267,7 @@ Aggregate Phase 3–7 outputs, compute the overall verdict, write `decomposeRepo
 **Steps:**
 1. Aggregate `PourResult[]`, `AtomizeSummary`, `EpicScoreResult[]`, `FidelityResult`, `DepAuditResult`.
 2. Compute verdict:
-   - **BLESSED** iff: every `PourResult.status == 'ok'` AND `AtomizeSummary.persistentlyOversized.length == 0` AND `AtomizeSummary.unsplittable.length == 0` AND every bead in every `EpicScoreResult.scores` has `score >= 95` AND `FidelityResult.bin == 'pass'` AND `DepAuditResult.cycles.length == 0` AND `DepAuditResult.emptyReady == false`.
+   - **BLESSED** iff: every `PourResult.status == 'ok'` AND `AtomizeSummary.persistentlyOversized.length == 0` AND `AtomizeSummary.unsplittable.length == 0` AND every bead in every `EpicScoreResult.scores` has `score >= 95` AND the quality pass actually covered the beads (`scoredCount > 0` when `totalOpenNonEpic > 0`, and `scoredCount >= totalOpenNonEpic`) AND `FidelityResult.bin == 'pass'` AND `DepAuditResult.cycles.length == 0` AND `DepAuditResult.emptyReady == false`. The "every bead ≥ 95" check is vacuously true on an empty score set, so the coverage clause is load-bearing — a run that scored zero beads is NEEDS-FIX, never a silent pass.
    - **NEEDS-FIX** otherwise. The report explains exactly which condition failed.
 3. Write `decomposeReport.md` in cwd per the schema below.
 4. Return `{ verdict, reportPath, summary }` to the runtime.

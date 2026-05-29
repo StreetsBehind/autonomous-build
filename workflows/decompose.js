@@ -412,17 +412,45 @@ log(`Atomize done: ${AtomizeSummary.atomized.length} atomized, ${AtomizeSummary.
 // ---------------------------------------------------------------------------
 phase('Quality scoring');
 
-// Discover the epic set after Phase 4 mutations.
+// Discover the epic set after Phase 4 mutations. (Self-contained: no external spec needed.)
+// CRITICAL: pours create app-epic → molecule-root-epic → task. A naive "epics with
+// direct non-epic children" scan can return nothing if the scorer's --parent traversal
+// misses the molecule-root epics — which is exactly how smbuild scored zero beads and
+// passed vacuously. So we (a) enumerate every epic in the app subtree that directly
+// parents an open non-epic bead, and (b) return a ground-truth count of ALL open
+// non-epic beads so synthesis can detect under-coverage even if discovery under-finds.
+const epicDiscoverySchema = {
+  type: 'object',
+  required: ['epics', 'totalOpenNonEpic'],
+  properties: {
+    epics: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['id', 'title'],
+        properties: { id: { type: 'string' }, title: { type: 'string' } }
+      }
+    },
+    totalOpenNonEpic: { type: 'number' }
+  }
+};
+
 const epicDiscovery = await agent(`
-Discover the open-epic set for /decompose Phase 5. Spec: workflows/decompose.spec.md §"Phase 5".
+Discover the scoring-epic set for /decompose Phase 5.
 
-Run \`bd list --type=epic --status=open --json\` and return:
-{ "epics": [{ "id": "...", "title": "..." }, ...] }
+Context: app epic = ${ParsedPlan.appEpicId}. Pour roots from Phase 3 (the molecule-root epics, reparented under the app epic): ${JSON.stringify(pourOk.map(r => r.pourRoot).filter(Boolean))}.
 
-Only return epics that have at least one open non-epic child (\`bd list --parent <id> --status=open --json\` non-empty).
-`, { label: 'epic-discovery', phase: 'Quality scoring', agentType: 'general-purpose' });
+Steps:
+1. Run \`bd list --status=open --json\`. Split into epics (issue_type=="epic") and non-epics.
+2. Set totalOpenNonEpic = count of open non-epic beads. This is the GROUND TRUTH the orchestrator uses to detect under-scoring — it must be exact.
+3. Return the set of "scoring epics" = every open epic that DIRECTLY parents at least one open non-epic bead (check each epic via \`bd list --parent <id> --status=open --json\`, or by reading parent links in the snapshot). This deliberately includes molecule-root epics AND any deeper sub-epics that directly parent tasks — do not stop at the app epic's direct children. If the app epic itself directly parents non-epic beads, include it too.
+4. Sanity check: if totalOpenNonEpic > 0 but you found zero scoring epics, re-examine the parent links — every open non-epic bead has SOME parent epic, so a non-empty pour set must yield at least one scoring epic. Return what you actually find; the orchestrator cross-checks against totalOpenNonEpic.
+
+Return JSON: { "epics": [{ "id": "...", "title": "..." }, ...], "totalOpenNonEpic": <n> }
+`, { label: 'epic-discovery', phase: 'Quality scoring', schema: epicDiscoverySchema, agentType: 'general-purpose' });
 
 const epics = epicDiscovery?.epics || [];
+const totalOpenNonEpic = epicDiscovery?.totalOpenNonEpic ?? 0;
 
 const qualityScoreSchema = {
   type: 'object',
@@ -501,7 +529,14 @@ This is read-only: do NOT mutate any bead.
 `, { label: `quality-${e.id}`, phase: 'Quality scoring', schema: qualityScoreSchema, agentType: 'general-purpose' }));
 
 const qualityResults = (await parallel(qualityTasks)).filter(Boolean);
-log(`Quality scoring done: ${qualityResults.length} epics scored, ${qualityResults.flatMap(r => r.scores).filter(s => s.score < 95).length} beads below 95`);
+const scoredCount = qualityResults.flatMap(r => r.scores).length;
+// A non-empty pour set that scored zero beads is the smbuild vacuous-pass bug:
+// `every()` over an empty score set returns true, so the gate "passed" without
+// scoring anything. Treat zero-scored-with-beads-present, or scoring fewer beads
+// than exist, as a quality coverage gap that forces NEEDS-FIX.
+const qualityVacuous = totalOpenNonEpic > 0 && scoredCount === 0;
+const qualityUndercovered = scoredCount < totalOpenNonEpic;
+log(`Quality scoring done: ${qualityResults.length} epics scored, ${scoredCount}/${totalOpenNonEpic} open non-epic beads scored, ${qualityResults.flatMap(r => r.scores).filter(s => s.score < 95).length} below 95${qualityVacuous ? ' [VACUOUS — no beads scored despite a non-empty pour set]' : qualityUndercovered ? ' [UNDER-COVERED — fewer beads scored than exist]' : ''}`);
 
 // ---------------------------------------------------------------------------
 // Phase 6 — Adversarial fidelity cross-check (2 verifiers + 1 reconcile)
@@ -652,12 +687,17 @@ log(`Dep audit: cycles=${(DepAuditResult?.cycles || []).length}, emptyReady=${De
 phase('Synthesis');
 
 // Verdict computation — done in JS so it's mechanical and auditable.
+// allBeadsAt95 alone is not enough: `every()` is vacuously true on an empty
+// score set, so we also require the quality pass to have actually covered the
+// open non-epic beads (qualityOk), else a zero-scored run would bless silently.
 const allBeadsAt95 = qualityResults.every(r => r.scores.every(s => s.score >= 95));
+const qualityOk = !qualityVacuous && !qualityUndercovered;
 const blessed =
   pourFailed.length === 0 &&
   AtomizeSummary.persistentlyOversized.length === 0 &&
   AtomizeSummary.unsplittable.length === 0 &&
   allBeadsAt95 &&
+  qualityOk &&
   fidelityBin === 'pass' &&
   (DepAuditResult?.cycles || []).length === 0 &&
   !DepAuditResult?.emptyReady;
@@ -707,7 +747,9 @@ const finalResult = {
     pourFailed.length > 0 ? `pour (${pourFailed.length} failed)` : null,
     AtomizeSummary.unsplittable.length > 0 ? `atomize (${AtomizeSummary.unsplittable.length} unsplittable)` : null,
     AtomizeSummary.persistentlyOversized.length > 0 ? `atomize (${AtomizeSummary.persistentlyOversized.length} persistently oversized)` : null,
-    !allBeadsAt95 ? 'quality (some beads < 95)' : null,
+    qualityVacuous ? 'quality (no beads scored — vacuous pass)' : null,
+    (!qualityVacuous && qualityUndercovered) ? `quality (only ${scoredCount}/${totalOpenNonEpic} beads scored)` : null,
+    (qualityOk && !allBeadsAt95) ? 'quality (some beads < 95)' : null,
     fidelityBin !== 'pass' ? `fidelity (${fidelityBin})` : null,
     (DepAuditResult?.cycles || []).length > 0 ? 'dep-audit (cycles)' : null,
     DepAuditResult?.emptyReady ? 'dep-audit (empty ready set)' : null
