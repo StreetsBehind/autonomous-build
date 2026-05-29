@@ -112,7 +112,7 @@ Use Bash, Read.
   };
   const inbox = await agent(`
 You are inbox-collect for /retro --inbox. List the triage inbox in the meta repo (${metaPath}).
-Run: \`bd --db "${metaPath}/.beads" list --label triage --all --json\` — the \`triage\` label IS the inbox; \`--all\` covers every status.
+Run: \`( cd "${metaPath}" && bd list --label triage --all --json )\` — run bd from INSIDE the meta repo so it auto-discovers the DB. Do NOT pass \`--db "${metaPath}/.beads"\`: pointing --db at the .beads *directory* opens an empty/uninitialized DB and \`list\` SILENTLY returns [] (a false "inbox empty"). The \`triage\` label IS the inbox; \`--all\` covers every status.
 Keep ONLY un-vetted beads still awaiting triage: status \`open\` or \`in_progress\` (skip \`closed\` — already resolved). For each kept bead capture { id, title, description, status, labels, fromApp (parse the \`from-app:<x>\` label → "<x>", else null), category (parse "Category: <c>" out of the description, else null) }.
 Return { "triage": [...] } (empty array if the inbox is empty). If bd errors, return { "triage": [] } and note it — do NOT throw (T7).
 Use Bash.
@@ -192,12 +192,12 @@ Return { "verifiable": true|false, "suggestedRewrite": "<the concrete AC — REQ
     };
     const promoteInput = promote.map(p => ({ id: p.bead.id, title: p.bead.title, acceptance: p.acceptance, verification: p.verification }));
     const promoted = await agent(`
-You are inbox-promote for /retro --inbox. Promote vetted triage beads IN PLACE in the meta repo (${metaPath}). Run every bd command with \`--db "${metaPath}/.beads"\`.
+You are inbox-promote for /retro --inbox. Promote vetted triage beads IN PLACE in the meta repo (${metaPath}). Run every bd command from INSIDE the meta repo: \`( cd "${metaPath}" && bd ... )\` so it auto-discovers the DB. Do NOT pass \`--db "${metaPath}/.beads"\`: pointing --db at the .beads *directory* opens an empty/uninitialized DB — \`list\` silently returns [] and \`create\`/\`update\` hard-error 'database not initialized: issue_prefix config is missing'.
 Survivors to promote: ${JSON.stringify(promoteInput)}
 
 Steps (Bash + bd):
-1. IDEMPOTENCY: look for an existing per-drain epic for this date — \`bd --db "${metaPath}/.beads" list --label triage-drain --label retro-date:${drainDate} --all\`. If one exists, reuse its ID; otherwise create it: \`bd --db "${metaPath}/.beads" create "Triage drain (${drainDate})" --type=epic --priority=2 --labels "workflow-improvement,triage-drain,retro-date:${drainDate}"\` and capture the new ID. (bd create takes \`--labels <comma-separated>\`, NOT --add-label.)
-2. For EACH survivor, one update call: \`bd --db "${metaPath}/.beads" update <id> --parent <epicId> --remove-label triage\` — re-parents it under the drain epic AND drops the \`triage\` label so it leaves the inbox. Do NOT touch its other labels (\`workflow-improvement\`, \`from-app:<app>\` stay). If the survivor's acceptance field above is non-null, ALSO pass \`--acceptance "<that acceptance>"\`.
+1. IDEMPOTENCY: look for an existing per-drain epic for this date — \`( cd "${metaPath}" && bd list --label triage-drain --label retro-date:${drainDate} --all )\`. If one exists, reuse its ID; otherwise create it: \`( cd "${metaPath}" && bd create "Triage drain (${drainDate})" --type=epic --priority=2 --labels "workflow-improvement,triage-drain,retro-date:${drainDate}" )\` and capture the new ID. (bd create takes \`--labels <comma-separated>\`, NOT --add-label.)
+2. For EACH survivor, one update call: \`( cd "${metaPath}" && bd update <id> --parent <epicId> --remove-label triage )\` — re-parents it under the drain epic AND drops the \`triage\` label so it leaves the inbox. Do NOT touch its other labels (\`workflow-improvement\`, \`from-app:<app>\` stay). If the survivor's acceptance field above is non-null, ALSO pass \`--acceptance "<that acceptance>"\`.
 3. If any bd call errors, record { "id": <id>, "error": <message> } under failedToPromote and continue — do NOT crash (T7).
 Return { "epicId": "<id|null>", "promotedBeadIds": [<ids actually re-parented + de-triaged>], "failedToPromote": [...] }.
 `, { label: 'inbox-promote', phase: 'Inbox promote', schema: promoteSchema, agentType: 'general-purpose' });

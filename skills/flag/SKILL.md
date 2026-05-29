@@ -71,17 +71,19 @@ Invocation: `/flag --upstream "<one-line observation>"` (optionally with a `cate
 
 3. **Idempotency.** Don't double-file the same observation in a session:
    ```bash
-   bd --db "$META/.beads" list --label triage --label "from-app:<app>" --all 2>/dev/null  # scan for a matching open title
+   ( cd "$META" && bd list --label triage --label "from-app:<app>" --all ) 2>/dev/null  # scan for a matching open title
    ```
-   If a near-identical open triage bead exists, append to it (`bd --db "$META/.beads" update <id> --append-notes "..."`) instead of creating a duplicate.
+   If a near-identical open triage bead exists, append to it (`( cd "$META" && bd update <id> --append-notes "..." )`) instead of creating a duplicate.
+
+   > **Run every bd call from *inside* `$META`** (the `( cd "$META" && bd ... )` subshell) so bd auto-discovers the DB. Do **not** pass `--db "$META/.beads"`: that points `--db` at the `.beads` *directory*, where bd silently opens an empty/uninitialized DB — `list` returns `[]` and `create`/`update` hard-error `database not initialized`.
 
 4. **File the triage bead** into the meta repo:
    ```bash
-   bd --db "$META/.beads" create "<one-line observation>" --type=task --priority=3 \
+   ( cd "$META" && bd create "<one-line observation>" --type=task --priority=3 \
       --labels "workflow-improvement,triage,from-app:<app>" \
-      --description "Upstream capture from <app> (hand-work, $(date +%F)). Category: <category|unset>. Observation: <reason>. Evidence: <files/ids/commands the user pointed at, if any>."
+      --description "Upstream capture from <app> (hand-work, $(date +%F)). Category: <category|unset>. Observation: <reason>. Evidence: <files/ids/commands the user pointed at, if any>." )
    ```
-   - Top-level (no `--parent`): the anchor epic `autonomous-build-1zq` is **closed**, and these are *un-vetted*. The `triage` label **is** the inbox — `bd --db "$META/.beads" list --label triage --all` lists everything awaiting vetting.
+   - Top-level (no `--parent`): the anchor epic `autonomous-build-1zq` is **closed**, and these are *un-vetted*. The `triage` label **is** the inbox — `( cd "$META" && bd list --label triage --all )` lists everything awaiting vetting.
    - `workflow-improvement` keeps it in the same backlog `/retro` files into; `triage` distinguishes "captured, not yet cross-checked" from a vetted improvement; `from-app:<app>` records origin so the fix can later be re-confirmed against that app.
 
 5. **Confirm.** Echo: `Captured upstream as <new-id> (triage, from-app:<app>): <observation>. Lives in autonomous-build; vet/promote it with the triage drain.`
@@ -105,9 +107,9 @@ bd update bd-<id> --add-label workflow-issue --add-label workflow-issue:gate-iss
 User (hand-editing smbuild): "the crud-feature formula keeps emitting REST handlers but this is a gRPC stack — flag this upstream"
 → resolve meta repo, then:
 ```bash
-bd --db "$META/.beads" create "crud-feature formula emits REST handlers on a gRPC-locked stack" --type=task --priority=3 \
+( cd "$META" && bd create "crud-feature formula emits REST handlers on a gRPC-locked stack" --type=task --priority=3 \
    --labels "workflow-improvement,triage,from-app:smbuild" \
-   --description "Upstream capture from smbuild (hand-work, 2026-05-29). Category: formula-issue. Observation: crud-feature poured REST handlers; stack is gRPC/tonic per DEFAULT_STACK. Evidence: formulas/crud-feature.formula.toml vs crud-feature-rust."
+   --description "Upstream capture from smbuild (hand-work, 2026-05-29). Category: formula-issue. Observation: crud-feature poured REST handlers; stack is gRPC/tonic per DEFAULT_STACK. Evidence: formulas/crud-feature.formula.toml vs crud-feature-rust." )
 ```
 
 ## Do not
