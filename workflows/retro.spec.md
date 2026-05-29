@@ -30,6 +30,7 @@ The workflow accepts these arguments (parsed from the `/retro` invocation; all o
 | `--no-file` | false | Produce report only; skip filing beads (debug mode). |
 | `--self` | false | Meta-retro: analyze autonomous-build itself, treating its own beads + git log as the build window. |
 | `--inbox` | false | Triage-drain mode: vet the `triage` inbox (`bd list --label triage --all`) via the adversarial cross-check and **promote survivors in place** (re-parent under a per-drain epic, drop the `triage` label) instead of analyzing a build window. Counterpart to `/flag --upstream`. See "Inbox mode" below — it short-circuits Phases 1–5 of the build-window flow. |
+| `--phase <N>` | none | **Per-phase retro** (epic `autonomous-build-0ms`): scope the retro to ONE phase's build window. Pre-flight resolves the window from the `Phase N` epic's children (since = earliest child `created_at`, until = latest child `closed_at`), and every collector scopes to that slice (beads under the `Phase N` epic, commits in that window). The report is named `retro-<app>-phaseN-<date>.md` and is an explicit input to `/replan --replan-from N+1`. Default (omitted) retros the whole build, unchanged. |
 
 ---
 
@@ -42,11 +43,11 @@ Verify the run is viable. Produces a `Context` object the rest of the workflow c
 **Steps:**
 1. **Resolve `meta-path`** per `docs/META_PATH_RESOLUTION.md`: if `--meta-path` was passed, use it; else resolve from `$HOME` (`$AUTONOMOUS_BUILD_HOME` → trace the `~/.claude/skills/flag` link up two dirs → candidate probe `~/.openclaw/workspace/autonomous-build`, `~/Documents/Github/autonomous-build`). A resolved path must contain both `.beads/` and `skills/build-next/SKILL.md`.
 2. `bd info` in `app-path`; fail loud if not bd-initialized.
-3. Resolve `since`/`until`: if `since` not given, query `bd query "status in (in_progress, closed) ORDER BY created_at ASC LIMIT 1"` for the first timestamp. (bd <=0.55.x emits no `claimed_at` in `.beads/issues.jsonl`, so order by `created_at` — the only reliably-present timestamp — as the window start.)
+3. Resolve `since`/`until`: if `since` not given, query `bd query "status in (in_progress, closed) ORDER BY created_at ASC LIMIT 1"` for the first timestamp. (bd <=0.55.x emits no `claimed_at` in `.beads/issues.jsonl`, so order by `created_at` — the only reliably-present timestamp — as the window start.) **If `--phase N` (epic 0ms):** instead resolve the window from the `Phase N` epic's children — `since` = earliest child `created_at`, `until` = latest child `closed_at` (or today if any child is still open); if no `Phase N` epic exists, return `no-work`. Explicit `--since`/`--until` still override.
 4. Compute `app-name` from `app-path` directory basename.
 5. Check `meta-path` resolved AND `meta-path/.beads/` exists → `metaAvailable`. If not, set `metaAvailable=false` and continue with file-only mode, **logging a loud line** ("meta-path unresolved — file-only; set `AUTONOMOUS_BUILD_HOME` or pass `--meta-path`") so the fallback is never silent (T7).
 6. If `--self`, set `app-path == meta-path` and `app-name = "autonomous-build"` — and if `meta-path` did not resolve, fail loud (a `--self` retro cannot run without finding this repo).
-**Output:** `Context = { appName, appPath, metaPath, metaAvailable, since, until, isSelf, isMetaRetro }`
+**Output:** `Context = { appName, appPath, metaPath, metaAvailable, since, until, isSelf, isMetaRetro, phase }` (`phase` = the `--phase N` value or `null`; when set, every collector scopes to that phase's slice and the report feeds `/replan`)
 **Failure:** any pre-flight failure stops the workflow with a clear message — do not proceed to data collection on bad context (T1, T7).
 
 ---
@@ -137,12 +138,12 @@ One `reconcile` agent reads all verifier outputs and bins each signal:
 ## Phase 5 — Synthesis & file (sequential, 2 agents)
 
 ### `write-report`
-Writes the markdown report to `<meta-path>/retros/retro-<app-name>-<YYYY-MM-DD>.md`. Schema:
+Writes the markdown report to `<meta-path>/retros/retro-<app-name>-<YYYY-MM-DD>.md` — or `retro-<app-name>-phaseN-<YYYY-MM-DD>.md` for a `--phase N` retro (epic 0ms). A per-phase report is an explicit input to `/replan --replan-from N+1`, so its Headline + "What didn't" sections must be actionable for re-cutting phase N+1. Schema:
 
 ```markdown
-# Retro: <app-name> (<date>)
+# Retro: <app-name>[ — phase N] (<date>)
 
-**Window:** <since> → <until>  |  **Mode:** <build|self|mid-build>
+**Window:** <since> → <until>  |  **Mode:** <build|self|mid-build>[  |  **Phase:** N (feeds /replan N+1)]
 **Tasks:** <closed> closed, <blocked> blocked, <flagged> flagged
 **Data sources:** <list with status; "skipped: <reason>" for failed Phase 2 agents>
 

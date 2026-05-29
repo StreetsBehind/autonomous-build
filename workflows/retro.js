@@ -26,7 +26,10 @@ function parseArgs(s) {
   // metaPath default is null → the pre-flight agent resolves it via docs/META_PATH_RESOLUTION.md
   // (env → installed-skill-link trace → candidate probe). The old hardcoded path did not exist on
   // every host, so a no-arg run silently dropped to file-only and filed zero beads.
-  const out = { appPath: '.', since: null, until: null, metaPath: null, noFile: false, isSelf: false, isInbox: false };
+  // phase: scope the retro to ONE phase's build window (epic 0ms). null = the whole build (default,
+  // unchanged). With --phase N, the pre-flight resolves the window from phase N's beads (the "Phase N"
+  // epic's children) and every collector scopes to that slice; the report feeds /replan for phase N+1.
+  const out = { appPath: '.', since: null, until: null, metaPath: null, noFile: false, isSelf: false, isInbox: false, phase: null };
   if (!s) return out;
   const tokens = (typeof s === 'string') ? s.trim().split(/\s+/).filter(Boolean) : (Array.isArray(s) ? s : []);
   for (let i = 0; i < tokens.length; i++) {
@@ -37,6 +40,7 @@ function parseArgs(s) {
     else if (tokens[i] === '--no-file') { out.noFile = true; }
     else if (tokens[i] === '--self') { out.isSelf = true; }
     else if (tokens[i] === '--inbox') { out.isInbox = true; }
+    else if (tokens[i] === '--phase' && tokens[i + 1]) { const n = parseInt(tokens[++i], 10); if (Number.isInteger(n) && n >= 1) out.phase = n; }
   }
   return out;
 }
@@ -282,7 +286,8 @@ Run these checks IN ORDER and return JSON matching the schema:
 2. Resolve appPath: if --self, appPath = metaPath (REQUIRED — if metaPath did not resolve in step 1, → { "status": "failed", "failedReason": "--self but could not resolve autonomous-build repo; set AUTONOMOUS_BUILD_HOME" }) and appName = "autonomous-build"; else appPath = "${parsedArgs.appPath}" (resolve to absolute) and appName = basename(appPath).
 3. \`bd info\` in appPath. If it errors (not bd-initialized) → { "status": "failed", "failedReason": "app repo not bd-initialized at <appPath>" }.
 4. Resolve the window:
-   - since: if "${parsedArgs.since || ''}" is empty, query \`bd query "status in (in_progress, closed) ORDER BY created_at ASC LIMIT 1"\` and use that created_at date (YYYY-MM-DD). bd <=0.55.x emits no claimed_at, so created_at is the only reliable start. If there are NO closed/in_progress beads → { "status": "no-work" } (nothing to retro).
+   - **Phase scope (epic 0ms):** ${parsedArgs.phase ? `this is a PHASE ${parsedArgs.phase} retro. Find the epic whose title starts with "Phase ${parsedArgs.phase}" (\`bd list --type=epic --all --json\`). Resolve the window from ITS children only: since = the earliest child created_at, until = the latest child closed_at (or today's date if any child is still open). If no "Phase ${parsedArgs.phase}" epic exists → { "status": "no-work", "failedReason": "no Phase ${parsedArgs.phase} epic — nothing built for that phase yet" }. Explicit --since/--until below override these if given.` : 'no --phase given — use the whole-build window below.'}
+   - since: if "${parsedArgs.since || ''}" is empty${parsedArgs.phase ? ' and no phase window resolved above' : ''}, query \`bd query "status in (in_progress, closed) ORDER BY created_at ASC LIMIT 1"\` and use that created_at date (YYYY-MM-DD). bd <=0.55.x emits no claimed_at, so created_at is the only reliable start. If there are NO closed/in_progress beads → { "status": "no-work" } (nothing to retro).
    - until: "${parsedArgs.until || ''}" or today's date.
 5. Check metaPath resolved AND metaPath/.beads/ exists → metaAvailable=true; else metaAvailable=false. If false, log a LOUD line ("meta-path unresolved — file-only mode; set AUTONOMOUS_BUILD_HOME or pass --meta-path to file beads") so the no-file fallback is never silent.
 6. Return { "status": "ok", "context": { appName, appPath, metaPath, metaAvailable, since, until, isSelf: ${parsedArgs.isSelf} } } (metaPath = the resolved absolute path, or "" if unresolved).
@@ -298,8 +303,8 @@ if (preflight.status === 'no-work') {
   log('Retro: no closed/in-progress beads in window — nothing to retro.');
   return { status: 'no-work', reportPath: null, filedBeadIds: [], note: 'no closed issues in window' };
 }
-const Context = preflight.context;
-log(`Pre-flight OK — app=${Context.appName}, window=${Context.since}..${Context.until}, metaAvailable=${Context.metaAvailable}, self=${Context.isSelf}`);
+const Context = { ...preflight.context, phase: parsedArgs.phase };
+log(`Pre-flight OK — app=${Context.appName}, window=${Context.since}..${Context.until}${Context.phase ? `, phase=${Context.phase}` : ''}, metaAvailable=${Context.metaAvailable}, self=${Context.isSelf}`);
 
 // ---------------------------------------------------------------------------
 // Phase 2 — Data collection (parallel fan-out, 6 agents)
@@ -310,7 +315,7 @@ phase('Data collection');
 
 const blobSchema = { type: 'object' };  // each collector defines its own shape; keep the wrapper permissive
 const collect = (label, prompt) => () => agent(prompt, { label, phase: 'Data collection', schema: blobSchema, agentType: 'general-purpose' });
-const W = `Window: ${Context.since}..${Context.until}. App: ${Context.appPath}. Meta: ${Context.metaPath}.`;
+const W = `Window: ${Context.since}..${Context.until}. App: ${Context.appPath}. Meta: ${Context.metaPath}.${Context.phase ? ` PHASE SCOPE (epic 0ms): this retro covers PHASE ${Context.phase} ONLY — scope every source to beads under the "Phase ${Context.phase}" epic (and to the window above, which is that phase's build slice). Ignore other phases' beads/commits.` : ''}`;
 const T7 = `If this source errors (file missing, bd transient failure, parse error), return { "status": "failed", "reason": "<message>" } — do NOT throw (T7).`;
 
 const collected = await parallel([
@@ -531,7 +536,7 @@ const reportSchema = {
   properties: { status: { enum: ['ok', 'failed'] }, reportPath: { type: ['string', 'null'] }, reportMarkdown: { type: 'string' } }
 };
 const reportResult = await agent(`
-You are write-report for /retro Phase 5. Write the markdown report to \`<reportDir>/retros/retro-${Context.appName}-${Context.until}.md\` via the Write tool, using EXACTLY the spec's section structure. <reportDir> = "${Context.metaPath}" if non-empty, else "${Context.appPath}" (meta-path unresolved → keep the report in the analyzed app repo so it is not lost; note this in the Data sources section). \`mkdir -p <reportDir>/retros\` first.
+You are write-report for /retro Phase 5. Write the markdown report to \`<reportDir>/retros/retro-${Context.appName}${Context.phase ? `-phase${Context.phase}` : ''}-${Context.until}.md\` via the Write tool, using EXACTLY the spec's section structure.${Context.phase ? ` This is a PHASE ${Context.phase} retro (epic 0ms): its findings are an explicit input to \`/replan --replan-from ${Context.phase + 1}\` — make the Headline + What-didn't sections actionable for re-cutting phase ${Context.phase + 1}.` : ''} <reportDir> = "${Context.metaPath}" if non-empty, else "${Context.appPath}" (meta-path unresolved → keep the report in the analyzed app repo so it is not lost; note this in the Data sources section). \`mkdir -p <reportDir>/retros\` first.
 
 Inputs:
 - Context: ${JSON.stringify(Context)}
@@ -542,7 +547,7 @@ Inputs:
 - reportOnly (uncertain — show both verifier verdicts): ${JSON.stringify(reportOnly)}
 - crossCheckFileability: ${toFile.length}/${proposedSignals.length}
 
-Sections (fill every one): "# Retro: ${Context.appName} (${Context.until})" header line with Window/Mode/Tasks/Data sources; ## Headline (one paragraph); ## What worked (from wins — never omit this, it guards against over-engineering); ## What didn't (filed as improvements) — one entry per filed bead with its id, labels, evidence refs, and verification; ## Uncertain (human triage) — from reportOnly with both verdicts; ## Speed metrics table (wall time, median + p90 — label as "created-to-closed" when on the created_at fallback, revert rate, post-close edit rate, flag rate, cross-check fileability rate); ## Data sources (paths + counts + failed/skipped sources). If filed.wouldFile is non-empty, add a "## Would file (not filed: --no-file / no meta .beads)" section. If filed.failedToFile is non-empty, add a loud "## FAILED TO FILE" section with full specs for manual re-entry.
+Sections (fill every one): "# Retro: ${Context.appName}${Context.phase ? ` — phase ${Context.phase}` : ''} (${Context.until})" header line with Window/Mode${Context.phase ? `/Phase (${Context.phase}, feeds /replan ${Context.phase + 1})` : ''}/Tasks/Data sources; ## Headline (one paragraph); ## What worked (from wins — never omit this, it guards against over-engineering); ## What didn't (filed as improvements) — one entry per filed bead with its id, labels, evidence refs, and verification; ## Uncertain (human triage) — from reportOnly with both verdicts; ## Speed metrics table (wall time, median + p90 — label as "created-to-closed" when on the created_at fallback, revert rate, post-close edit rate, flag rate, cross-check fileability rate); ## Data sources (paths + counts + failed/skipped sources). If filed.wouldFile is non-empty, add a "## Would file (not filed: --no-file / no meta .beads)" section. If filed.failedToFile is non-empty, add a loud "## FAILED TO FILE" section with full specs for manual re-entry.
 
 Return { "status": "ok", "reportPath": "<path>" }. If Write fails, retry once; on second failure return { "status": "failed", "reportPath": null, "reportMarkdown": "<the body inlined>" }.
 `, { label: 'write-report', phase: 'Synthesis', schema: reportSchema, agentType: 'general-purpose' });
@@ -556,6 +561,7 @@ log(`Retro: filed ${filed.filedBeadIds.length} improvements${filed.filedEpicId ?
 
 return {
   status: 'ok',
+  phase: Context.phase,
   reportPath: reportResult?.reportPath || null,
   filedEpicId: filed.filedEpicId || null,
   filedBeadIds: filed.filedBeadIds || [],
