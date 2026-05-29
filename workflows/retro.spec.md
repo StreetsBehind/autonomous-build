@@ -26,7 +26,7 @@ The workflow accepts these arguments (parsed from the `/retro` invocation; all o
 | `--app-path <path>` | cwd | App repo to analyze. Must be `bd init`'d. |
 | `--since <YYYY-MM-DD>` | first claim in the window | Start of the analysis window. |
 | `--until <YYYY-MM-DD>` | now | End of the window. |
-| `--meta-path <path>` | `~/Documents/Github/autonomous-build` | Where to file improvement beads. |
+| `--meta-path <path>` | resolved per `docs/META_PATH_RESOLUTION.md` | Where to file improvement beads. When omitted, pre-flight resolves the autonomous-build repo from `$HOME` (env → installed-skill-link trace → candidate probe). The old hardcoded `~/Documents/Github/autonomous-build` did not exist on every host and silently produced file-only (zero-bead) runs. |
 | `--no-file` | false | Produce report only; skip filing beads (debug mode). |
 | `--self` | false | Meta-retro: analyze autonomous-build itself, treating its own beads + git log as the build window. |
 
@@ -39,11 +39,12 @@ Verify the run is viable. Produces a `Context` object the rest of the workflow c
 **Agent:** `preflight`
 **Tools:** `Bash`, `Read`
 **Steps:**
-1. `bd info` in `app-path`; fail loud if not bd-initialized.
-2. Resolve `since`/`until`: if `since` not given, query `bd query "status in (in_progress, closed) ORDER BY created_at ASC LIMIT 1"` for the first timestamp. (bd <=0.55.x emits no `claimed_at` in `.beads/issues.jsonl`, so order by `created_at` — the only reliably-present timestamp — as the window start.)
-3. Compute `app-name` from `app-path` directory basename.
-4. Check `meta-path/.beads/` exists. If not, set `metaAvailable=false` and continue with file-only mode.
-5. If `--self`, set `app-path == meta-path` and `app-name = "autonomous-build"`.
+1. **Resolve `meta-path`** per `docs/META_PATH_RESOLUTION.md`: if `--meta-path` was passed, use it; else resolve from `$HOME` (`$AUTONOMOUS_BUILD_HOME` → trace the `~/.claude/skills/flag` link up two dirs → candidate probe `~/.openclaw/workspace/autonomous-build`, `~/Documents/Github/autonomous-build`). A resolved path must contain both `.beads/` and `skills/build-next/SKILL.md`.
+2. `bd info` in `app-path`; fail loud if not bd-initialized.
+3. Resolve `since`/`until`: if `since` not given, query `bd query "status in (in_progress, closed) ORDER BY created_at ASC LIMIT 1"` for the first timestamp. (bd <=0.55.x emits no `claimed_at` in `.beads/issues.jsonl`, so order by `created_at` — the only reliably-present timestamp — as the window start.)
+4. Compute `app-name` from `app-path` directory basename.
+5. Check `meta-path` resolved AND `meta-path/.beads/` exists → `metaAvailable`. If not, set `metaAvailable=false` and continue with file-only mode, **logging a loud line** ("meta-path unresolved — file-only; set `AUTONOMOUS_BUILD_HOME` or pass `--meta-path`") so the fallback is never silent (T7).
+6. If `--self`, set `app-path == meta-path` and `app-name = "autonomous-build"` — and if `meta-path` did not resolve, fail loud (a `--self` retro cannot run without finding this repo).
 **Output:** `Context = { appName, appPath, metaPath, metaAvailable, since, until, isSelf, isMetaRetro }`
 **Failure:** any pre-flight failure stops the workflow with a clear message — do not proceed to data collection on bad context (T1, T7).
 
@@ -180,8 +181,8 @@ Writes the markdown report to `<meta-path>/retros/retro-<app-name>-<YYYY-MM-DD>.
 For each entry in `toFile`:
 
 1. **Idempotency check (T8):** query `bd query "labels CONTAINS 'from-app:<app-name>' AND labels CONTAINS 'retro-date:<YYYY-MM-DD>' AND title = <proposed.title>"` — if a match exists, skip (already filed in a prior re-run of this same retro).
-2. Create per-retro epic if not yet created: `bd create "Improvements from <app-name> retro (<date>)" --type=epic --priority=2 --add-label workflow-improvement --add-label "from-app:<app-name>" --add-label "retro-date:<date>"`. Capture its ID.
-3. For each signal: `bd create "<proposed.title>" --type=task --priority=2 --parent <epicId> --description "Source: retro-<app>-<date>. Evidence: <refs>. Verification: both checks passed." --acceptance "<proposed.acceptance>" --add-label workflow-improvement --add-label "from-app:<app-name>" --add-label "retro-date:<date>" $(for $l in proposed.labelExtras: --add-label $l)`.
+2. Create per-retro epic if not yet created: `bd create "Improvements from <app-name> retro (<date>)" --type=epic --priority=2 --labels "workflow-improvement,from-app:<app-name>,retro-date:<date>"`. Capture its ID. (`bd create` takes `--labels <comma-separated>`, **not** `--add-label` — the latter is update-only and errors on create.)
+3. For each signal: `bd create "<proposed.title>" --type=task --priority=2 --parent <epicId> --description "Source: retro-<app>-<date>. Evidence: <refs>. Verification: both checks passed." --acceptance "<proposed.acceptance>" --labels "workflow-improvement,from-app:<app-name>,retro-date:<date>,<each proposed.labelExtras entry>"` — fold every `labelExtras` value into the single comma-separated `--labels` list.
 4. Collect the filed bead IDs; pass back to `write-report` so the report's "What didn't" section can link them.
 
 **If `metaAvailable=false` or `--no-file`:** skip step 1–3 and instead emit the would-be-filed list into a "would-file" section at the bottom of the markdown report (T7: visible, not silent).

@@ -25,3 +25,10 @@ loop-*.log
 # Transient bd ready dump (some skills pipe `bd ready --json` here mid-run)
 ready.json
 
+# Stray bd/dolt runtime working files when bd runs with cwd at the repo ROOT
+# (the real, committed store lives under .beads/ — these root copies are cruft).
+# Anchored with a leading slash so .beads/dolt/ etc. are unaffected.
+/dolt/
+/dolt-access.lock
+/ephemeral.sqlite3
+

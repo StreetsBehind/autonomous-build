@@ -10,6 +10,7 @@ The workflow repo behind `/vision → /decompose → /build-batch → /retro` (`
 - `docs/ESCALATION_RULES.md` — when the loop must block instead of guess
 - `docs/TENETS.md` — workflow-level principles for build-time judgment calls; inherited by every per-app `tenets.md` that `/vision` produces
 - `docs/DEFAULT_STACK.md` — pinned Jankurai stack `/vision` resolves against
+- `docs/META_PATH_RESOLUTION.md` — how `/flag --upstream` and `/retro` find this repo from inside a sibling app (env → installed-link trace → probe); the rule both consumers must stay in sync with
 - `templates/tenets.md` — the template `/vision` populates per-app
 - `skills/<name>/SKILL.md` — turn-by-turn skills (`vision`, `build-next`, `escalate`, `flag`, `orchestrate`), junctioned into `~/.claude/skills/`
 - `workflows/<name>.spec.md` + `workflows/<name>.js` — dynamic-workflow specs and their canonical scripts: `decompose` (pre-build: subsumes the old compose/quality-pass/split skills), `build-batch` (parallel build, converted from a skill), `retro`. `install.ps1` hardlinks `*.js` into `~/.claude/workflows/`; `.spec.md` files stay repo-only. `decompose.js`/`build-batch.js`/`retro.js` are hand-authored and kept in sync with their specs in the same commit (`retro.js` was authored from `retro.spec.md` per bead `autonomous-build-lbq.21`; when the spec changes meaningfully, update the script in the same commit).

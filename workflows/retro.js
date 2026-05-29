@@ -23,7 +23,10 @@ const parsedArgs = parseArgs(rawArgs);
 log(`retro args: ${JSON.stringify(parsedArgs)}`);
 
 function parseArgs(s) {
-  const out = { appPath: '.', since: null, until: null, metaPath: '~/Documents/Github/autonomous-build', noFile: false, isSelf: false };
+  // metaPath default is null → the pre-flight agent resolves it via docs/META_PATH_RESOLUTION.md
+  // (env → installed-skill-link trace → candidate probe). The old hardcoded path did not exist on
+  // every host, so a no-arg run silently dropped to file-only and filed zero beads.
+  const out = { appPath: '.', since: null, until: null, metaPath: null, noFile: false, isSelf: false };
   if (!s) return out;
   const tokens = (typeof s === 'string') ? s.trim().split(/\s+/).filter(Boolean) : (Array.isArray(s) ? s : []);
   for (let i = 0; i < tokens.length; i++) {
@@ -70,13 +73,20 @@ You are the pre-flight agent for the /retro dynamic workflow. (Self-contained: a
 Invocation args: ${JSON.stringify(parsedArgs)}
 
 Run these checks IN ORDER and return JSON matching the schema:
-1. Resolve appPath: if --self, appPath = metaPath and appName = "autonomous-build"; else appPath = "${parsedArgs.appPath}" (resolve to absolute) and appName = basename(appPath).
-2. \`bd info\` in appPath. If it errors (not bd-initialized) → { "status": "failed", "failedReason": "app repo not bd-initialized at <appPath>" }.
-3. Resolve the window:
+1. Resolve metaPath (the autonomous-build repo) per docs/META_PATH_RESOLUTION.md. If the invocation passed --meta-path ("${parsedArgs.metaPath || ''}" — non-empty means explicit), use it verbatim. Otherwise resolve from \$HOME with this bash (do NOT hardcode):
+   \`\`\`bash
+   META="\$AUTONOMOUS_BUILD_HOME"
+   { [ -n "\$META" ] && [ -d "\$META/.beads" ]; } || META="\$(readlink -f ~/.claude/skills/flag 2>/dev/null | xargs -r dirname | xargs -r dirname)"
+   { [ -d "\$META/.beads" ] && [ -f "\$META/skills/build-next/SKILL.md" ]; } || for c in "\$HOME/.openclaw/workspace/autonomous-build" "\$HOME/Documents/Github/autonomous-build"; do [ -d "\$c/.beads" ] && [ -f "\$c/skills/build-next/SKILL.md" ] && META="\$c" && break; done
+   \`\`\`
+   A resolved metaPath must contain BOTH \`.beads/\` and \`skills/build-next/SKILL.md\`.
+2. Resolve appPath: if --self, appPath = metaPath (REQUIRED — if metaPath did not resolve in step 1, → { "status": "failed", "failedReason": "--self but could not resolve autonomous-build repo; set AUTONOMOUS_BUILD_HOME" }) and appName = "autonomous-build"; else appPath = "${parsedArgs.appPath}" (resolve to absolute) and appName = basename(appPath).
+3. \`bd info\` in appPath. If it errors (not bd-initialized) → { "status": "failed", "failedReason": "app repo not bd-initialized at <appPath>" }.
+4. Resolve the window:
    - since: if "${parsedArgs.since || ''}" is empty, query \`bd query "status in (in_progress, closed) ORDER BY created_at ASC LIMIT 1"\` and use that created_at date (YYYY-MM-DD). bd <=0.55.x emits no claimed_at, so created_at is the only reliable start. If there are NO closed/in_progress beads → { "status": "no-work" } (nothing to retro).
    - until: "${parsedArgs.until || ''}" or today's date.
-4. Check metaPath/.beads/ exists → metaAvailable. If absent, metaAvailable=false (file-only mode), continue.
-5. Return { "status": "ok", "context": { appName, appPath, metaPath, metaAvailable, since, until, isSelf: ${parsedArgs.isSelf} } }.
+5. Check metaPath resolved AND metaPath/.beads/ exists → metaAvailable=true; else metaAvailable=false. If false, log a LOUD line ("meta-path unresolved — file-only mode; set AUTONOMOUS_BUILD_HOME or pass --meta-path to file beads") so the no-file fallback is never silent.
+6. Return { "status": "ok", "context": { appName, appPath, metaPath, metaAvailable, since, until, isSelf: ${parsedArgs.isSelf} } } (metaPath = the resolved absolute path, or "" if unresolved).
 
 Use Bash, Read. Failures stop the workflow (T1, T7).
 `, { label: 'preflight', phase: 'Pre-flight', schema: preflightSchema });
@@ -293,8 +303,8 @@ Signals to file: ${JSON.stringify(toFile)}
 
 Steps (Bash + bd, from ${Context.metaPath}):
 1. IDEMPOTENCY (T8): before creating each, \`bd query "labels CONTAINS 'from-app:${Context.appName}' AND labels CONTAINS 'retro-date:${Context.until}' AND title = <proposed.title>"\` — if a match exists, skip it (already filed in a prior re-run).
-2. Create the per-retro epic if not already present this run: \`bd create "Improvements from ${Context.appName} retro (${Context.until})" --type=epic --priority=2 --add-label workflow-improvement --add-label "from-app:${Context.appName}" --add-label "retro-date:${Context.until}"\`. Capture its ID.
-3. For each signal: \`bd create "<proposed.title>" --type=task --priority=2 --parent <epicId> --description "Source: retro-${Context.appName}-${Context.until}. Evidence: <refs>. Verification: <verification>." --acceptance "<proposed.acceptance>" --add-label workflow-improvement --add-label "from-app:${Context.appName}" --add-label "retro-date:${Context.until}"\` plus one --add-label per proposed.labelExtras entry.
+2. Create the per-retro epic if not already present this run: \`bd create "Improvements from ${Context.appName} retro (${Context.until})" --type=epic --priority=2 --labels "workflow-improvement,from-app:${Context.appName},retro-date:${Context.until}"\`. Capture its ID. (NOTE: \`bd create\` takes \`--labels <comma-separated>\`, NOT \`--add-label\` — the latter is an update-only flag and errors on create.)
+3. For each signal: \`bd create "<proposed.title>" --type=task --priority=2 --parent <epicId> --description "Source: retro-${Context.appName}-${Context.until}. Evidence: <refs>. Verification: <verification>." --acceptance "<proposed.acceptance>" --labels "workflow-improvement,from-app:${Context.appName},retro-date:${Context.until}<,each proposed.labelExtras entry>"\` — fold every labelExtras value into the one comma-separated --labels list.
 4. If bd errors at file time, catch it: record under "failedToFile" ({title, spec}) with the full spec for manual re-entry — do NOT crash (T7).
 Return { "filedEpicId": "<id|null>", "filedBeadIds": [...], "failedToFile": [...] }.
 `, { label: 'file-beads', phase: 'Synthesis', schema: fileSchema, agentType: 'general-purpose' });
@@ -311,7 +321,7 @@ const reportSchema = {
   properties: { status: { enum: ['ok', 'failed'] }, reportPath: { type: ['string', 'null'] }, reportMarkdown: { type: 'string' } }
 };
 const reportResult = await agent(`
-You are write-report for /retro Phase 5. Write the markdown report to \`${Context.metaPath}/retros/retro-${Context.appName}-${Context.until}.md\` via the Write tool, using EXACTLY the spec's section structure.
+You are write-report for /retro Phase 5. Write the markdown report to \`<reportDir>/retros/retro-${Context.appName}-${Context.until}.md\` via the Write tool, using EXACTLY the spec's section structure. <reportDir> = "${Context.metaPath}" if non-empty, else "${Context.appPath}" (meta-path unresolved → keep the report in the analyzed app repo so it is not lost; note this in the Data sources section). \`mkdir -p <reportDir>/retros\` first.
 
 Inputs:
 - Context: ${JSON.stringify(Context)}

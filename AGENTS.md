@@ -11,7 +11,7 @@ This is the **workflow repository**, not an app. Beads issues here track *improv
 ## How issues get created here
 
 1. **Automatically** by `/retro` against an app repo. The retro analyzes the app's beads + git log, finds patterns (reverts, post-close edits, flagged issues, vague acceptance), and files concrete change-this-file-to-do-that tasks here.
-2. **Manually** when you notice something you want to fix but don't have time to fix now: `bd create "..." --type=task -p 2 --add-label workflow-improvement`.
+2. **Manually** when you notice something you want to fix but don't have time to fix now: `bd create "..." --type=task -p 2 --labels workflow-improvement` (`bd create` uses `--labels <comma-separated>`, not `--add-label`). From inside a sibling app you're hand-working, use `/flag --upstream "<observation>"` instead — it files a `triage`-labelled bead straight here (see `docs/META_PATH_RESOLUTION.md`).
 
 ## How to work on these issues
 
