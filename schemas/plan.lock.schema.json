@@ -44,7 +44,8 @@
         "additionalProperties": false,
         "properties": {
           "id":   { "type": "string", "minLength": 1, "description": "Stable must-have ID, e.g. M1." },
-          "text": { "type": "string", "minLength": 1 }
+          "text": { "type": "string", "minLength": 1 },
+          "phase": { "type": "integer", "minimum": 1, "default": 1, "description": "Phase this must-have is assigned to (matches a phases[].id). Optional; default 1 when omitted. A must-have tagged to a future phase is a deliberate deferral (decompose verifier C), not a coverage gap." }
         }
       }
     },
@@ -65,6 +66,22 @@
               "text": { "type": "string" }
             }
           }
+        }
+      }
+    },
+    "phases": {
+      "type": "array",
+      "description": "Optional ordered build phases for phased apps (epic autonomous-build-0ms). A lock with no phases[] (and no phase tags) is a single-phase plan and behaves exactly as today, so this field is additive: schemaVersion STAYS 2. The pipeline JIT-decomposes one phase at a time, so phase isolation is the orchestration loop pausing to replan/decompose the next slice, not a graph gate. Cross-phase dependencies must point backward only (phase N+1 may depend on N, never the reverse). See docs/PHASED_BUILD_PROPOSAL.md.",
+      "items": {
+        "type": "object",
+        "required": ["id", "name", "goal", "status", "provisional"],
+        "additionalProperties": false,
+        "properties": {
+          "id":          { "type": "integer", "minimum": 1, "description": "Stable 1-based phase number. Phase 1 is the walking skeleton — the minimal features that make successMetric.steps[] run end-to-end." },
+          "name":        { "type": "string", "minLength": 1, "description": "Short phase label, e.g. 'Walking skeleton'." },
+          "goal":        { "type": "string", "minLength": 1, "description": "One-line goal: what this phase delivers as an independently-shippable slice." },
+          "status":      { "type": "string", "enum": ["planned", "active", "built"], "description": "Lifecycle: planned (not yet decomposed) | active (currently decomposing/building) | built (drained + frozen). /replan freezes phases with status=built and re-derives the rest." },
+          "provisional": { "type": "boolean", "description": "True for a later-phase sketch (goal + rough must-have assignment) that /replan firms up when the phase is reached. Phase 1 is provisional:false — fully decided and decompose-ready." }
         }
       }
     },
@@ -149,7 +166,8 @@
               ]
             }
           },
-          "notes": { "type": "string" }
+          "notes": { "type": "string" },
+          "phase": { "type": "integer", "minimum": 1, "default": 1, "description": "Phase this feature belongs to (matches a phases[].id). Optional; default 1 when omitted — a lock with no phases is a single-phase plan. /decompose --phase N pours only the features tagged for phase N." }
         }
       }
     },

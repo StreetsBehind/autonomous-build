@@ -15,8 +15,8 @@ Top-level shape:
   "schemaVersion": 2,
   "app": { "name": "habit-tracker", "description": "..." },
   "mustHaves": [
-    { "id": "M1", "text": "Track daily habits" },
-    { "id": "M2", "text": "See current streak per habit" }
+    { "id": "M1", "text": "Track daily habits", "phase": 1 },
+    { "id": "M2", "text": "See current streak per habit", "phase": 2 }
   ],
   "successMetric": {
     "steps": [
@@ -24,6 +24,10 @@ Top-level shape:
       { "id": "S2", "text": "Streak count increments and is visible" }
     ]
   },
+  "phases": [
+    { "id": 1, "name": "Walking skeleton", "goal": "log a habit completion end-to-end", "status": "active",  "provisional": false },
+    { "id": 2, "name": "Streaks",          "goal": "compute + show per-habit streaks",  "status": "planned", "provisional": true  }
+  ],
   "stack": {
     "language":  { "choice": "TypeScript", "why": "team familiarity" },
     "backend":   { "choice": "Next.js API routes", "why": "single deploy target" },
@@ -47,12 +51,20 @@ Top-level shape:
     {
       "name": "App skeleton",
       "formulas": ["app-skeleton"],
-      "vars": { "name": "habit-tracker" }
+      "vars": { "name": "habit-tracker" },
+      "phase": 1
     },
     {
       "name": "Habits CRUD",
       "formulas": ["crud-feature"],
-      "vars": { "entity": "Habit", "fields": ["name", "description"] }
+      "vars": { "entity": "Habit", "fields": ["name", "description"] },
+      "phase": 1
+    },
+    {
+      "name": "Streaks",
+      "formulas": ["streak-feature"],
+      "vars": { "entity": "Habit" },
+      "phase": 2
     }
   ],
   "coverage": [
@@ -112,10 +124,19 @@ Integer `2`. `/decompose` refuses unknown versions rather than guessing at compa
 - `description` — optional one-liner for the epic body.
 
 ### `mustHaves` (required, may be empty)
-The product must-haves `/vision` lifts from `vision.md` §3, each with a stable ID (`M1`, `M2`, …) and `text`. This is the set the **forward-coverage gate** checks against: every `mustHaves[].id` must appear in `coverage[]` mapped to ≥1 feature, or `/vision` flips `incomplete: true` and `/decompose` refuses. Recording the must-haves here is what closes the hole where a must-have silently evaporated during freeform feature decomposition. See `skills/vision/SKILL.md` and bead `autonomous-build-bfo.3`/`bfo.4`.
+The product must-haves `/vision` lifts from `vision.md` §3, each with a stable ID (`M1`, `M2`, …) and `text`. This is the set the **forward-coverage gate** checks against: every `mustHaves[].id` must appear in `coverage[]` mapped to ≥1 feature, or `/vision` flips `incomplete: true` and `/decompose` refuses. Recording the must-haves here is what closes the hole where a must-have silently evaporated during freeform feature decomposition. See `skills/vision/SKILL.md` and bead `autonomous-build-bfo.3`/`bfo.4`. Each entry may also carry an optional `phase` (integer, default `1`) tying it to a `phases[].id`; a must-have tagged to a *future* phase is a deliberate deferral (decompose verifier C), not a coverage gap — this is what stops a "really phase 2" must-have from vanishing.
 
 ### `successMetric` (required)
 The `vision.md` §8 success metric decomposed into observable `steps[]`, each with a stable ID (`S1`, `S2`, …) and `text`. The success-metric oracle (bead `autonomous-build-bfo.5`) maps each step to ≥1 covered feature, catching the case where every must-have is individually present but they don't compose into the working end-to-end flow.
+
+### `phases` (optional, may be empty or omitted)
+Ordered build phases for **phased apps** (epic `autonomous-build-0ms`; design of record [`docs/PHASED_BUILD_PROPOSAL.md`](PHASED_BUILD_PROPOSAL.md)). Each entry is `{id, name, goal, status, provisional}`:
+- `id` — stable 1-based phase number. **Phase 1 is the walking skeleton** — the minimal features that make `successMetric.steps[]` run end-to-end.
+- `name` / `goal` — short label + one-line statement of what the phase delivers as an independently-shippable slice.
+- `status` — `planned` (not yet decomposed) | `active` (currently decomposing/building) | `built` (drained + frozen). `/replan` freezes `built` phases and re-derives the rest.
+- `provisional` — `true` for a later-phase sketch that `/replan` firms up when the phase is reached; phase 1 is `provisional: false` (fully decided, decompose-ready).
+
+**Backward-compatible / additive.** A lock with no `phases` (and no `phase` tags) is a single-phase plan and behaves exactly as today, so `schemaVersion` **stays 2** (the versioning rules below count new optional fields as non-breaking). The pipeline JIT-decomposes one phase at a time, so phase isolation is the orchestration loop pausing to `/replan` + `/decompose --phase N` the next slice, not a bead-graph gate. Cross-phase dependencies point **backward only** (phase `N+1` may depend on `N`, never the reverse — a forward dep would reference a bead that does not exist yet under JIT decomposition).
 
 ### `coverage` (required, may be empty)
 The forward-coverage map: each entry ties a must-have (`mustHaveId`, matching a `mustHaves[].id`) to the `features` (matching `featureOrder[].name`, `minItems: 1`) that deliver it and **`how`**. `how` must state *how* the feature delivers the must-have — falsifiable evidence, not a bare restatement of the link — mirroring `/decompose`'s anti-vagueness invariant. `plan.md` carries the same map as a human-readable `## Coverage` table.
@@ -133,7 +154,7 @@ Object keyed by layer name. Allowed keys: `language`, `backend`, `frontend`, `da
 Array of entities. `fields` and `relationships` are free-form strings — schema-as-prose, not schema-as-DDL. The first migration formula will translate.
 
 ### `featureOrder` (required)
-Ordered array. Each entry names one or more formulas to pour and the variable bindings. `vars` values may be strings, numbers, booleans, or arrays of those (everything the bd CLI `--var k=v` syntax accepts). Order is significant — `/decompose` pours in this order, and cross-feature deps assume earlier entries pour first.
+Ordered array. Each entry names one or more formulas to pour and the variable bindings. `vars` values may be strings, numbers, booleans, or arrays of those (everything the bd CLI `--var k=v` syntax accepts). Order is significant — `/decompose` pours in this order, and cross-feature deps assume earlier entries pour first. Each entry may also carry an optional `phase` (integer, default `1`) tying it to a `phases[].id`; `/decompose --phase N` pours only the features tagged for phase `N`.
 
 ### `crossFeatureDependencies` (required, may be empty)
 Each entry becomes a `bd dep add <blocked> <blocker>` call after the pour. `blocked` and `blocker` are either feature names (matching `featureOrder[].name` — `/decompose` resolves to the pour root) or specific bead IDs if known in advance.
@@ -176,7 +197,7 @@ The coverage check in decompose Step 5 still runs (cheap insurance), but with th
 
 Schema is versioned via the top-level `schemaVersion` integer. Bumping rules:
 
-- **Non-breaking additions** (new optional field, new allowed enum value) — no version bump.
+- **Non-breaking additions** (new optional field, new allowed enum value) — no version bump. `nfrs`, `phases`, `featureOrder[].phase`, and `mustHaves[].phase` were all added this way: optional, additive, `schemaVersion` stayed `2`.
 - **Breaking changes** (renamed/removed field, changed type, new required field) — bump `schemaVersion`. `/decompose` refuses unknown versions; bump in lockstep with the `/decompose` reader.
 
 The schema file itself is the source of truth; this doc is a guide.
