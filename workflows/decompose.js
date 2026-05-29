@@ -545,11 +545,19 @@ phase('Fidelity cross-check');
 
 const coverageSchema = {
   type: 'object',
-  required: ['coverage', 'features', 'crossDeps'],
+  required: ['coverage', 'features', 'crossDeps', 'concernTrace'],
   properties: {
     coverage: { enum: ['complete', 'incomplete'] },
     features: { type: 'array' },
     crossDeps: { type: 'array' },
+    concernTrace: {
+      type: 'object',
+      required: ['traceable', 'concerns'],
+      properties: {
+        traceable: { enum: ['complete', 'gap'] },
+        concerns: { type: 'array' }
+      }
+    },
     note: { type: 'string' }
   }
 };
@@ -581,6 +589,12 @@ For each plan feature, find the bead(s) that implement it by matching feature na
 
 For each cross-dep, run \`bd show <blockedId>\` (resolving names to IDs via Phase 3 pours) and check whether <blockerId> appears in its dependencies.
 
+CONCERN TRACEABILITY (anti-rubber-stamp): if the plan is a lock (planSource=lock), read its \`concerns[]\` array. For EACH entry with \`status == "addressed"\`, classify its \`evidence\`:
+- If the evidence cites a **feature** (it names or clearly maps to a \`featureOrder[].name\`), this is a falsifiable claim: assert that >=1 open bead implements that feature (reuse the same feature->bead mapping you did above). If a feature-cited "addressed" concern has NO implementing bead, that concern is a LIE the DAG exposes — mark it \`covered: false\` (a gap).
+- If the evidence cites a **tenet** (e.g. "T7"), the **quality gate** (hooks/post-build-gate), a **DEFAULT_STACK pin**, or a **formula name** (not a feature), accept it as-is — those are always present; this is a weaker but honest check. Mark \`covered: true\`, \`evidenceKind\` accordingly.
+- Concerns with \`status == "excluded"\` are not checked here (no claim to verify).
+Set \`concernTrace.traceable = "gap"\` if ANY feature-cited addressed concern has no bead; else "complete". If planSource is not lock, return \`{ "traceable": "complete", "concerns": [] }\` (nothing to check).
+
 You are INDEPENDENT — do NOT see verifier B's reasoning, do NOT see Phase 7's dep audit. Just answer your question.
 
 Return JSON:
@@ -588,6 +602,10 @@ Return JSON:
   "coverage": "complete" | "incomplete",
   "features": [{ "name": "...", "beads": ["..."], "status": "covered" | "gap" }, ...],
   "crossDeps": [{ "blocked": "...", "blocker": "...", "edgePresent": <bool> }, ...],
+  "concernTrace": {
+    "traceable": "complete" | "gap",
+    "concerns": [{ "concernId": "...", "evidenceKind": "feature" | "tenet" | "gate" | "stack-pin" | "formula", "citedFeature": "<name | null>", "beads": ["..."], "covered": <bool> }, ...]
+  },
   "note": "<one sentence summary>"
 }
 `, { label: 'verify-plan-to-dag', phase: 'Fidelity cross-check', schema: coverageSchema, agentType: 'general-purpose' }),
@@ -620,25 +638,32 @@ const verifierA = fidelityResults[0];
 const verifierB = fidelityResults[1];
 
 // Reconcile bin — pure synthesis, can be inline JS rather than another agent.
+// A feature-cited "addressed" concern with no implementing bead is a fidelity
+// gap (bfo.9): it forces NEEDS-FIX exactly like coverage-gap. It is reported
+// independently so the offending concern is named even when coverage/traceability
+// also fail (the concern section in the report keys off concernGap, not the bin).
+const concernGap = !!(verifierA && verifierA.concernTrace && verifierA.concernTrace.traceable === 'gap');
 let fidelityBin;
 if (!verifierA || !verifierB) {
   fidelityBin = 'disagree';
-} else if (verifierA.coverage === 'complete' && verifierB.traceability === 'clean') {
-  fidelityBin = 'pass';
-} else if (verifierA.coverage === 'incomplete' && verifierB.traceability === 'clean') {
-  fidelityBin = 'coverage-gap';
-} else if (verifierA.coverage === 'complete' && verifierB.traceability === 'drift') {
-  fidelityBin = 'traceability-drift';
-} else if (verifierA.coverage === 'incomplete' && verifierB.traceability === 'drift') {
-  // Both failed. Distinguish independent failures from a true disagreement.
-  // A pure disagreement: A says a feature is covered by bead X, but B says X traces to feature Z (not the one A claims).
-  // For now we conservatively report both-fail; the report shows both and the human reads.
-  fidelityBin = 'both-fail';
 } else {
-  fidelityBin = 'disagree';
+  const covOk = verifierA.coverage === 'complete';
+  const traceOk = verifierB.traceability === 'clean';
+  if (covOk && traceOk) {
+    fidelityBin = concernGap ? 'concern-gap' : 'pass';
+  } else if (!covOk && traceOk) {
+    fidelityBin = 'coverage-gap';
+  } else if (covOk && !traceOk) {
+    fidelityBin = 'traceability-drift';
+  } else {
+    // Both directions failed. Conservatively report both-fail; the report shows
+    // both verifier outputs verbatim and the human reads. (A true A-vs-B
+    // disagreement is surfaced in the report's disagreement block.)
+    fidelityBin = 'both-fail';
+  }
 }
-const FidelityResult = { bin: fidelityBin, A: verifierA, B: verifierB, blockingForBlessed: fidelityBin !== 'pass' };
-log(`Fidelity verdict: ${fidelityBin}`);
+const FidelityResult = { bin: fidelityBin, A: verifierA, B: verifierB, concernGap, blockingForBlessed: fidelityBin !== 'pass' || concernGap };
+log(`Fidelity verdict: ${fidelityBin}${concernGap && fidelityBin !== 'concern-gap' ? ' (+ concern-gap)' : ''}`);
 
 // ---------------------------------------------------------------------------
 // Phase 7 — Dep audit (sequential, 1 agent)
@@ -763,8 +788,15 @@ Steps:
 - Beads with plan citation: <count>
 - Drifted beads (no plan source): <list with beadIds and titles>
 
+## Concern traceability (Phase 6.A — anti-rubber-stamp)
+- <concernId> — addressed by feature "<name>" → <beadId(s)> ✓
+- <concernId> — addressed by feature "<name>" → **GAP** (no bead implements it — the "addressed" claim has no teeth)
+- <concernId> — addressed by tenet/gate/stack-pin/formula → accepted as-is
+- <omit this section entirely if planSource is not lock or concerns[] is empty>
+
 ## Fidelity verdict (Phase 6 reconcile)
-- Bin: <pass | coverage-gap | traceability-drift | both-fail | disagree>
+- Bin: <pass | coverage-gap | traceability-drift | concern-gap | both-fail | disagree>
+- <if concernGap is true: name each feature-cited "addressed" concern that has no implementing bead — this forces NEEDS-FIX even when coverage and traceability are otherwise clean>
 - <if disagree: FIDELITY DISAGREEMENT block with both verifier outputs verbatim>
 
 ## Per-epic quality (Phase 5)

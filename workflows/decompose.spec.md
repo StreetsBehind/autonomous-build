@@ -200,8 +200,8 @@ The load-bearing phase that makes `/decompose` worth more than the sum of compos
 **Agent A:** `verify-plan-to-dag` (plan-direction coverage)
 **Tools:** `Read`, `Bash`
 **Inputs:** plan.md, plan.lock.json (if present), full open-bead snapshot (`bd list --status=open --json`)
-**Question:** does every feature in `plan.featureOrder` have at least one open bead implementing it? Does every entry in `plan.crossFeatureDependencies` map to a real `bd dep` edge?
-**Output:** `{ coverage: 'complete' | 'incomplete', features: [{name, beads: [<ids>], status: 'covered' | 'gap'}], crossDeps: [{blocked, blocker, edgePresent: <bool>}], note: <one sentence> }`
+**Question:** does every feature in `plan.featureOrder` have at least one open bead implementing it? Does every entry in `plan.crossFeatureDependencies` map to a real `bd dep` edge? **And (anti-rubber-stamp, bfo.9):** does every `concerns[]` entry with `status == "addressed"` whose `evidence` cites a *feature* trace to ≥1 open bead implementing that feature? Evidence citing a tenet/gate/stack-pin/formula is accepted as-is (always present, weaker check); `excluded` concerns are not checked. A feature-cited "addressed" concern with no implementing bead is a lie the DAG exposes — a fidelity gap. (If `planSource != 'lock'`, concern traceability is vacuously `complete`.)
+**Output:** `{ coverage: 'complete' | 'incomplete', features: [{name, beads: [<ids>], status: 'covered' | 'gap'}], crossDeps: [{blocked, blocker, edgePresent: <bool>}], concernTrace: { traceable: 'complete' | 'gap', concerns: [{concernId, evidenceKind: 'feature'|'tenet'|'gate'|'stack-pin'|'formula', citedFeature: <name|null>, beads: [<ids>], covered: <bool>}] }, note: <one sentence> }`
 
 **Agent B:** `verify-dag-to-plan` (DAG-direction traceability)
 **Tools:** `Read`, `Bash`
@@ -220,8 +220,9 @@ Both A and B run in **parallel** on the same inputs (2 agents total). They must 
 
 | Bin | Condition | Disposition |
 | --- | --- | --- |
-| `pass` | A.coverage == 'complete' AND B.traceability == 'clean' | fidelity passes; no remediation needed |
+| `pass` | A.coverage == 'complete' AND B.traceability == 'clean' AND A.concernTrace.traceable == 'complete' | fidelity passes; no remediation needed |
 | `coverage-gap` | A reports `incomplete` (one or more features have no bead) | fidelity fails; surface gaps; recommend `/vision` rerun OR manual pour of missing formulas |
+| `concern-gap` | A.coverage == 'complete' AND B.traceability == 'clean' BUT A.concernTrace.traceable == 'gap' (a feature-cited `addressed` concern has no implementing bead) | fidelity fails; name the offending concern(s); recommend `/vision` rerun to correct the evidence OR pour the missing feature. The `concernGap` flag is also surfaced independently in the report, so the offending concern is named even when `coverage-gap`/`traceability-drift` is the headline bin |
 | `traceability-drift` | B reports `drift` (one or more beads have no plan citation) | fidelity fails; surface drifted beads; recommend either close as scope creep OR amend `plan.md` to declare the feature |
 | `both-fail` | A and B both fail with non-overlapping concerns | fidelity fails; surface both verdicts; the DAG has both gaps and drift |
 | `disagree` | A and B fail with conflicting evidence (e.g. A says feature X is covered by bead Y; B says bead Y traces to feature Z, not X) | fidelity fails; surface BOTH verifier outputs verbatim under a "FIDELITY DISAGREEMENT" section in the report; **the human resolves**, the workflow does not auto-pick (T1) |
@@ -298,8 +299,15 @@ Aggregate Phase 3–7 outputs, compute the overall verdict, write `decomposeRepo
 - Beads with plan citation: <count>
 - Drifted beads (no plan source): <list with beadIds and titles>
 
+## Concern traceability (Phase 6.A — anti-rubber-stamp)
+- <concernId> — addressed by feature "<name>" → <beadId(s)> ✓
+- <concernId> — addressed by feature "<name>" → **GAP** (no bead implements it)
+- <concernId> — addressed by tenet/gate/stack-pin/formula → accepted as-is
+- <omit this section if planSource is not lock or concerns[] is empty>
+
 ## Fidelity verdict (Phase 6 reconcile)
-- Bin: <pass | coverage-gap | traceability-drift | both-fail | disagree>
+- Bin: <pass | coverage-gap | traceability-drift | concern-gap | both-fail | disagree>
+- <if concernGap: name each feature-cited `addressed` concern with no implementing bead (forces NEEDS-FIX even when coverage/traceability are clean)>
 - <if disagree: FIDELITY DISAGREEMENT block with both verifier outputs verbatim>
 
 ## Per-epic quality (Phase 5)
