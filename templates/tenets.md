@@ -19,7 +19,7 @@
 
 When two signals disagree, the higher item wins. Always.
 
-1. The quality gate (`hooks/post-build-gate.ps1` from autonomous-build).
+1. The quality gate (`hooks/post-build-gate.{sh,ps1}` from autonomous-build).
 2. **This app's** `plan.lock.json`.
 3. **This app's** `plan.md` (narrative only; lock wins where they disagree).
 4. The bead spec (description + acceptance criteria + testPlan + filesTouched).

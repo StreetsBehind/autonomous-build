@@ -21,7 +21,7 @@ This file is workflow-level. Every app the loop builds inherits it via the per-a
 
 When two signals disagree, the higher item wins. Always.
 
-1. **The quality gate** (`hooks/post-build-gate.ps1`) — if it says no, it's no.
+1. **The quality gate** (`hooks/post-build-gate.{sh,ps1}`) — if it says no, it's no.
 2. **`plan.lock.json`** — the structured contract; what `/compose` and `/build-next` actually consume.
 3. **`plan.md`** — human narrative. Where it disagrees with the lock, the lock wins; flag the divergence with `/flag`.
 4. **The bead spec** — title, description, acceptance criteria, testPlan, filesTouched. The unit of work.
@@ -46,7 +46,7 @@ Each tenet has the same shape: a one-sentence rule, why it exists, and how to ap
 
 ### T2. The gate is the contract
 
-- **Rule**: `hooks/post-build-gate.ps1` defines "done." Do not disable steps, weaken rules, or skip stages to make the gate pass.
+- **Rule**: `hooks/post-build-gate.{sh,ps1}` defines "done." Do not disable steps, weaken rules, or skip stages to make the gate pass.
 - **Why**: The gate is the only thing that prevents the loop from drifting. A passing gate with a weakened rule is worse than a failing gate with a strong rule — the latter at least surfaces.
 - **How to apply**: If the gate fails, fix the code or fix the spec. Edits to the gate itself require their own bead in autonomous-build with explicit justification — never bundled with the bead the gate just failed.
 

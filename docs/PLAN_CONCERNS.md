@@ -81,7 +81,7 @@ Deliberately excluded from the vocabulary, with the reason — so they are not r
 1. a `featureOrder[]` entry (by name) that delivers the concern,
 2. a formula that encodes it (e.g. `oidc-client-rust`, `otel-bootstrap-rust`),
 3. a tenet, by number (e.g. "T7: no swallowed exceptions"),
-4. the quality gate (`hooks/post-build-gate.ps1`),
+4. the quality gate (`hooks/post-build-gate.{sh,ps1}`),
 5. a `DEFAULT_STACK.md` pin.
 
 A bare assertion ("handled", "we take security seriously", "standard practices") is **not** evidence — it is unfalsifiable and fails, mirroring `/decompose`'s anti-vagueness invariant (`decompose.spec.md` §Phase 5: record the exact phrase, never a bare claim). Evidence that cites a feature is verified downstream: `/decompose` asserts ≥1 bead implements that feature (bead `autonomous-build-bfo.9`). Evidence that cites a tenet/gate/stack-pin is accepted as-is (those are always present — a weaker but honest check).
@@ -115,7 +115,7 @@ A single-user offline CLI, by contrast, would `exclude` `authn`/`authz`/`secrets
 
 - **agentConsults** — when addressing `external-integrations` (or an off-stack infra need) triggers an off-stack decision, that decision is recorded in `plan.lock.json` `agentConsults[]` (the existing 3-agent consult). The concern's evidence then cites the consult. Concerns ensure the *question gets asked*; agentConsults record *how it was answered*.
 - **tenets** — `error-handling`, `data-lifecycle`, and idempotency lean on T5/T7/T8. A concern may legitimately be `addressed` by citing a tenet the build is already bound to.
-- **the gate** — some concerns (lint-enforced input handling, no swallowed exceptions) are partly enforced by `hooks/post-build-gate.ps1`. Citing the gate is valid evidence; it does not remove the obligation to *decide* the concern.
+- **the gate** — some concerns (lint-enforced input handling, no swallowed exceptions) are partly enforced by `hooks/post-build-gate.{sh,ps1}`. Citing the gate is valid evidence; it does not remove the obligation to *decide* the concern.
 
 ---
 

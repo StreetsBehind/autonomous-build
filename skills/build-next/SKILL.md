@@ -181,11 +181,23 @@ Optional: launch the editor session under `jankurai guard run -- claude` for rea
 
 ### Step 8: quality gate
 
-```powershell
-..\autonomous-build\hooks\post-build-gate.ps1
+Run the gate that matches the host OS. There is **no PowerShell on the documented Linux/macOS path** — use the `.sh`; reserve the `.ps1` (invoked via `pwsh`) for Windows. Resolve the `hooks/` dir from the app repo root first, then from the sibling `autonomous-build` checkout:
+
+```bash
+# Linux / macOS
+gate="$(git rev-parse --show-toplevel)/hooks/post-build-gate.sh"
+[ -f "$gate" ] || gate="$(cd "$(git rev-parse --show-toplevel)/.." && pwd)/autonomous-build/hooks/post-build-gate.sh"
+"$gate"
 ```
 
-(Or symlink it in.) Exits 0 on green, nonzero with summary on red. The gate now includes a Jankurai pass: `jankurai audit --changed-fast` (advisory — prints findings, does not fail the gate by itself) and `jankurai witness` against `agent/baselines/main.repo-score.json` if that baseline exists (hard fail on regression).
+```powershell
+# Windows
+$gate = Join-Path (git rev-parse --show-toplevel) "hooks/post-build-gate.ps1"
+if (-not (Test-Path $gate)) { $gate = Join-Path (Resolve-Path "../autonomous-build/hooks/post-build-gate.ps1") "" }
+pwsh -NoProfile -File $gate
+```
+
+Exits 0 on green, nonzero with summary on red. The gate now includes a Jankurai pass: `jankurai audit --changed-fast` (advisory — prints findings, does not fail the gate by itself) and `jankurai witness` against `agent/baselines/main.repo-score.json` if that baseline exists (hard fail on regression).
 
 On red:
 - First failure: read the failure (including `target/jankurai/audit-fast.md` and `target/jankurai/merge-witness.md` if present), adjust, re-run. Once.

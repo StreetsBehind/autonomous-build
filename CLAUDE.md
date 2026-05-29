@@ -14,7 +14,7 @@ The workflow repo behind `/vision → /decompose → /build-batch → /retro` (`
 - `skills/<name>/SKILL.md` — turn-by-turn skills (`vision`, `build-next`, `escalate`, `flag`), junctioned into `~/.claude/skills/`
 - `workflows/<name>.spec.md` + `workflows/<name>.js` — dynamic-workflow specs and their canonical scripts: `decompose` (pre-build: subsumes the old compose/quality-pass/split skills), `build-batch` (parallel build, converted from a skill), `retro`. `install.ps1` hardlinks `*.js` into `~/.claude/workflows/`; `.spec.md` files stay repo-only. `decompose.js`/`build-batch.js` are hand-authored and kept in sync with their specs in the same commit; `retro.js` is first-run-generated then saved.
 - `formulas/*.toml` — bd workflow templates. **TOML only.** bd's help text suggests YAML works; the loader disagrees.
-- `hooks/post-build-gate.ps1` — the quality gate (lint + typecheck + test + pre-commit safety + Jankurai). Not `bd preflight`.
+- `hooks/post-build-gate.{sh,ps1}` — the quality gate (lint + typecheck + test + pre-commit safety + Jankurai). Two kept-in-sync ports: `.sh` runs on the Linux/macOS install path (no PowerShell there), `.ps1` (via `pwsh`) on Windows. Not `bd preflight`.
 
 ## Task tracking
 

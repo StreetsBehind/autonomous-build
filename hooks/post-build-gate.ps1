@@ -1,5 +1,10 @@
 ﻿# post-build-gate.ps1
 #
+# Windows gate. The POSIX install path (Linux/macOS) runs post-build-gate.sh
+# instead — there is no powershell/pwsh there. Keep the two behaviourally in
+# sync. Invokes pwsh (cross-platform PowerShell Core), not the Windows-only
+# "powershell", so this also works on a host where only pwsh is present.
+#
 # Gate checks (in execution order):
 # 1. lint            — stack linter (eslint / cargo clippy / etc.); style + obvious errors
 # 2. typecheck       — type checker (tsc / cargo check); reject untyped or ill-typed code
@@ -20,7 +25,7 @@ function Run-Step {
     param([string]$name, [string]$cmd)
     Write-Host "=== $name ==="
     Write-Host "  $ $cmd"
-    $proc = Start-Process -FilePath "powershell" -ArgumentList "-NoProfile", "-Command", $cmd -NoNewWindow -PassThru -Wait
+    $proc = Start-Process -FilePath "pwsh" -ArgumentList "-NoProfile", "-Command", $cmd -NoNewWindow -PassThru -Wait
     if ($proc.ExitCode -ne 0) {
         Write-Host "FAIL: $name (exit $($proc.ExitCode))"
         return $false
@@ -97,7 +102,7 @@ if (Get-Command jankurai -ErrorAction SilentlyContinue) {
                 "--timings-json target/jankurai/audit-timings.json"
     Write-Host "=== jankurai audit (advisory) ==="
     Write-Host "  $ $auditCmd"
-    $auditProc = Start-Process -FilePath "powershell" -ArgumentList "-NoProfile", "-Command", $auditCmd -NoNewWindow -PassThru -Wait
+    $auditProc = Start-Process -FilePath "pwsh" -ArgumentList "-NoProfile", "-Command", $auditCmd -NoNewWindow -PassThru -Wait
     if ($auditProc.ExitCode -ne 0) {
         Write-Host "ADVISORY: jankurai audit reported findings (exit $($auditProc.ExitCode)) — see target/jankurai/audit-fast.md"
     } else {

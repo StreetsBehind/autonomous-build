@@ -38,7 +38,7 @@ Output: a populated beads DB with epics, tasks, and a working dep graph, plus a 
 
 ### `/build-batch` — parallel build (the concurrent sibling of `/build-next`)
 
-Implemented as a **dynamic workflow** (`workflows/build-batch.spec.md` + `workflows/build-batch.js`), converted from a former single-context skill. One orchestrator script holds in-memory pipeline state, dispatches `beads-builder` workers into their own `bd worktree`s in the background, polls each worker's completion marker file (a cheap `stat()` rather than an LLM round-trip), and merges results to `main` **one at a time** behind the `hooks/post-build-gate.ps1` post-merge gate. Configurable `--workers`, `--max-merges`, and `--budget`.
+Implemented as a **dynamic workflow** (`workflows/build-batch.spec.md` + `workflows/build-batch.js`), converted from a former single-context skill. One orchestrator script holds in-memory pipeline state, dispatches `beads-builder` workers into their own `bd worktree`s in the background, polls each worker's completion marker file (a cheap `stat()` rather than an LLM round-trip), and merges results to `main` **one at a time** behind the `hooks/post-build-gate.{sh,ps1}` post-merge gate. Configurable `--workers`, `--max-merges`, and `--budget`.
 
 It **refuses to run in meta mode** in its Phase 0 pre-flight agent (parallel workers would race on this repo's shared checkout). Use `/loop /build-next` for meta work. Keeping pipeline state in script variables (instead of conversation) makes the run cheap to poll and resumable in-session across a context compaction.
 
@@ -53,7 +53,7 @@ bd worktree create task-<id>
 ↓
 implement against issue.acceptance          # the formula provides this
 ↓
-hooks/post-build-gate.ps1                   # typecheck + lint + test
+hooks/post-build-gate.{sh,ps1}              # typecheck + lint + test
 ↓
 green?  → git commit, bd close <id>, worktree remove
 red x1? → retry once with failure context

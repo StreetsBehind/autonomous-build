@@ -122,12 +122,20 @@ Implement against `acceptance` and the kickoff plan. Constraints:
 
 ### Step 6: quality gate
 
-The gate lives at `<repo-root>/hooks/post-build-gate.ps1` (one level up from worktrees if your worktree is `../task-<id>`).
+The gate lives in `hooks/` (one level up from worktrees if your worktree is `../task-<id>`). Pick the script that matches the host OS — there is **no PowerShell on the documented Linux/macOS path**, so use `post-build-gate.sh` there; reserve the `.ps1` (run via `pwsh`) for Windows. Resolve the `hooks/` dir from the repo root first, then the sibling `autonomous-build` checkout:
+
+```bash
+# Linux / macOS
+gate="$(git rev-parse --show-toplevel)/hooks/post-build-gate.sh"
+[ -f "$gate" ] || gate="$(cd "$(git rev-parse --show-toplevel)/.." && pwd)/autonomous-build/hooks/post-build-gate.sh"
+"$gate"
+```
 
 ```powershell
-$gate = Join-Path (Resolve-Path "../autonomous-build/hooks/post-build-gate.ps1" -ErrorAction SilentlyContinue) ""
-if (-not $gate) { $gate = Join-Path (git rev-parse --show-toplevel) "hooks/post-build-gate.ps1" }
-& $gate
+# Windows
+$gate = Join-Path (git rev-parse --show-toplevel) "hooks/post-build-gate.ps1"
+if (-not (Test-Path $gate)) { $gate = Join-Path (Resolve-Path "../autonomous-build/hooks/post-build-gate.ps1") "" }
+pwsh -NoProfile -File $gate
 ```
 
 Use the symlink/copy the app uses if /compose set one up. Behavior:

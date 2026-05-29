@@ -43,7 +43,7 @@ plan.md + plan.lock.json  ──/decompose──▶  blessed beads DAG (epics + 
 | `templates/vision.md` | The form you fill out per app |
 | `templates/tenets.md` | Template `/vision` populates per-app — inherits the workflow tenets and derives app-specific ones from vision + plan.lock |
 | `docs/TENETS.md` | The workflow-level tenets — principles the loop falls back on for build-time judgment calls |
-| `hooks/post-build-gate.ps1` | Quality gate (typecheck/lint/test + Jankurai audit/witness) run before every `bd close` |
+| `hooks/post-build-gate.{sh,ps1}` | Quality gate (typecheck/lint/test + Jankurai audit/witness) run before every `bd close`. `.sh` on Linux/macOS, `.ps1` (via `pwsh`) on Windows — kept in sync |
 | `retros/` | Markdown retros produced by `/retro` after each app finishes |
 | `.beads/` | This repo's *own* beads DB — tracks workflow improvements (retro-filed) |
 | `docs/` | Architecture, install, escalation rules |
@@ -69,7 +69,7 @@ Every app this workflow builds is held to the **[Jankurai](https://github.com/ne
 | --- | --- | --- |
 | `/decompose` (per-app init) | `jankurai adopt` → `jankurai init --level agents --yes` → first advisory `jankurai audit` | Scaffolds `AGENTS.md`, ownership map, proof lanes; establishes a starting score |
 | `/build-next` (per-task) | `jankurai kickoff --intent "<acceptance>"` before coding | Bounds the change — names read-first files, ownership boundaries, forbidden paths, proof lane |
-| `hooks/post-build-gate.ps1` (per-task close) | `jankurai audit --changed-fast` (advisory) + `jankurai witness` against baseline if present (hard fail on regression) | Inner-loop scan; merge witness ratchets only after a baseline has been accepted |
+| `hooks/post-build-gate.{sh,ps1}` (per-task close) | `jankurai audit --changed-fast` (advisory) + `jankurai witness` against baseline if present (hard fail on regression) | Inner-loop scan; merge witness ratchets only after a baseline has been accepted |
 
 Adoption is staged: start at **observe** + **agents** (read-only inventory and AGENTS.md), then accept a baseline at `agent/baselines/main.repo-score.json` in a dedicated commit once the first few tasks close cleanly, then enable **ratchet** mode in CI.
 

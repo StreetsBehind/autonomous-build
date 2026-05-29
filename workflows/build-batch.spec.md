@@ -336,7 +336,8 @@ Merge-And-Close(beadId):
 
     # Post-merge gate on main. THIS is the defense-in-depth check.
     print "[GATE] post-merge gate on main (bead $beadId)"
-    gateOutput = & "hooks/post-build-gate.ps1"
+    # Resolve cross-platform: post-build-gate.sh on Linux/macOS, .ps1 (via pwsh) on Windows.
+    gateOutput = runGate("hooks/post-build-gate")   # picks .sh or .ps1 by OS
     if exitCode != 0:
       # Gate failed. Undo the merge, block the bead.
       git reset --hard HEAD~1

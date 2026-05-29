@@ -345,7 +345,7 @@ You are a beads-builder worker. Your contract is in CLAUDE.md and the beads-buil
 - The bead is ALREADY claimed and the worktree is ALREADY created. Do NOT re-claim, do NOT re-create.
 - Work inside ${p.worktreePath}. The branch is ${p.branch}.
 - Implement the bead per its acceptance criteria. Honor the kickoff if Jankurai is configured; if not, proceed.
-- Run hooks/post-build-gate.ps1 (or its symlink). On red, retry once; on second red, block.
+- Run the quality gate (resolve cross-platform: prefer \`<repo-root>/hooks/post-build-gate.{sh,ps1}\`, else the sibling \`../autonomous-build/hooks/\`; run \`post-build-gate.sh\` on Linux/macOS, \`pwsh -NoProfile -File post-build-gate.ps1\` on Windows). On red, retry once; on second red, block.
 - Commit with explicit \`git add\` (no \`-A\`). Commit message: "<bead title> (bd: <beadId>)".
 - Do NOT merge to main, do NOT close the bead — the orchestrator owns those steps.
 - Write \`<worktree>/.bd-build-complete.json\` AND return the same payload as structured output.
@@ -415,7 +415,7 @@ Steps (all from the repo root: \`git rev-parse --show-toplevel\`):
    - \`git merge --abort\`.
    - \`bd update ${p.beadId} --status=blocked --notes "merge conflict against main" --append-notes "<merge output>"\`.
    - Return { "ok": false, "reason": "merge-conflict" }.
-4. Run \`hooks/post-build-gate.ps1\` (or its symlink, e.g. \`./hooks/post-build-gate.ps1\`). If exit≠0:
+4. Run the quality gate (resolve cross-platform: prefer \`<repo-root>/hooks/post-build-gate.{sh,ps1}\`, else the sibling \`../autonomous-build/hooks/\`; \`post-build-gate.sh\` on Linux/macOS, \`pwsh -NoProfile -File post-build-gate.ps1\` on Windows). If exit≠0:
    - \`git reset --hard HEAD~1\` (undo the merge — main returns to its pre-merge head).
    - \`bd update ${p.beadId} --status=blocked --notes "post-merge gate failed on main" --append-notes "<gate output>"\`.
    - Return { "ok": false, "reason": "gate-failed" }.
