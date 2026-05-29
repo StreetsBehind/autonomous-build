@@ -1,6 +1,6 @@
 # autonomous-build
 
-Workflow infrastructure for going from a `vision.md` file to a shipped app, with the human as autopilot supervisor rather than pilot. Uses [beads (`bd`)](https://github.com/gastownhall/beads) for task tracking, Claude Code skills for the per-stage workflows, and `/loop` to drive autonomous execution.
+Workflow infrastructure for going from a `vision.md` file to a shipped app, with the human as autopilot supervisor rather than pilot. Uses [beads (`bd`)](https://github.com/steveyegge/beads) for task tracking, Claude Code skills for the per-stage workflows, and `/loop` to drive autonomous execution.
 
 ## The pipeline
 

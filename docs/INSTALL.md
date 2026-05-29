@@ -4,7 +4,7 @@ One-time setup for the workflow infrastructure, then per-app setup whenever you 
 
 ## Prerequisites
 
-- `bd` (beads) on PATH. Verify: `bd --help`. If missing, see https://github.com/gastownhall/beads.
+- `bd` (beads) on PATH. Verify: `bd --help`. If missing, see https://github.com/steveyegge/beads (see [Troubleshooting bd install](#troubleshooting-bd-install) below).
 - `jankurai` on PATH. Verify: `jankurai version`. Install from source: `git clone https://github.com/neverhuman/jankurai && cd jankurai && cargo install --path crates/jankurai --locked`. Or use the release installer at https://github.com/neverhuman/jankurai/releases. Jankurai is the [quality standard](../README.md#quality-standard) every app this workflow builds is held to — required, not optional.
 - Claude Code installed and configured.
 - Git.
@@ -84,3 +84,20 @@ jankurai version   # should print CLI + standard + schema versions
 If `bd formula list` is empty inside a `bd init`'d project, the formula symlink isn't being picked up — check `~/.beads/formulas/` exists and points where you expect.
 
 If `jankurai version` fails, the rest of the pipeline will refuse to run (`/compose` pre-flight check #5). Reinstall before continuing.
+
+## Troubleshooting bd install
+
+The canonical beads module path is **`github.com/steveyegge/beads`**. An older `github.com/gastownhall/beads` URL appears in some docs and links; it is stale and will break a `go install` because the declared module path no longer matches.
+
+Working install line:
+
+```sh
+go install github.com/steveyegge/beads/cmd/bd@latest
+```
+
+Failure symptoms that mean you used the wrong path:
+
+- `go install`/`go get` fails with a **module-path mismatch** — e.g. `module declares its path as: github.com/steveyegge/beads / but was required as: github.com/gastownhall/beads`.
+- `bd: command not found` after a `go install` that appeared to succeed against `gastownhall/beads` (it never produced a `bd` binary).
+
+If you hit either, re-run the install line above with the `steveyegge` path and confirm with `bd --help`.
