@@ -253,10 +253,18 @@ $remaining = (bd ready --json | ConvertFrom-Json | Where-Object { $_.issue_type 
 ```
 
 - `$remaining > 0` → "READY: $remaining remaining" — loop should wake in 60–180s
-- `$remaining == 0` and blocked present → invoke `/escalate`, then "BLOCKED: <count>" — loop should exit
+- `$remaining == 0` and blocked present → **resume-poll, do not exit** (see below). On the *first* drain-to-blocked (or whenever the blocked set has changed since the last notification), invoke `/escalate`. Then emit `"BLOCKED-POLL: <count> — re-checking bd ready every ~20–30min"` so the loop keeps waking on a long interval and resumes the instant the human unblocks something.
 - `$remaining == 0` and no blocked → invoke `/retro` (the build is done; generate the workflow performance report and file improvements), then "DONE" — loop should exit
 
 Note: if this tick exited at Step 3.5 with "STALE: $id", the loop should wake immediately — there's still real work in the queue and the freshness check is cheap.
+
+### Resume-poll on full block (don't strand the unattended window)
+
+The whole point of the loop is that the human can hand off a vision and walk away for two days. If the loop *exits* the moment everything is blocked, then a human who unblocks a bead an hour later comes back to a pipeline that has done nothing since — the rest of the window is wasted. So a drain-to-blocked is a **pause, not a stop**:
+
+1. **Notify once per distinct block state.** Invoke `/escalate` on the first drain-to-blocked. Record the set of blocked bead IDs. On a later poll, only re-invoke `/escalate` if that set has *changed* (a new bead blocked, or the reasons changed) — never re-notify the identical set every poll, or the human gets spammed.
+2. **Keep waking on a long interval.** Emit `BLOCKED-POLL` and let `/loop` schedule the next wake ~20–30 min out (long enough not to burn cost spinning, short enough to resume promptly). Each wake re-runs `bd ready` (Step 1). The moment it returns a non-epic bead — because the human ran `bd update <id> --status=open`, or a time-based block cleared — the tick proceeds normally and the loop is back to fast 60–180s cadence.
+3. **Backstop so it can't poll forever.** Stop polling and emit `"DONE: blocked, max wait reached"` when any of: the cumulative session budget is exhausted, a max wall-clock window has elapsed (default ~48h — the unattended window), or the blocked set has been identical across many consecutive polls *and* the window is closing. A backstop exit still leaves one final `/escalate` so the last state is visible.
 
 The DONE-path `/retro` invocation is automatic. The user can also run `/retro` mid-build for a partial review — the skill handles either case.
 

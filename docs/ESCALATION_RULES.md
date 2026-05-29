@@ -38,8 +38,10 @@ The `--notes` line is what `/escalate` puts in the push notification. Keep it sh
 1. Read the push notification.
 2. `bd show <id>` to see the diagnostic detail.
 3. Make the decision — either:
-   - Update the issue: `bd update <id> --status=open --append-notes "decision: <answer>"`, then restart `/loop /build-next`.
+   - Update the issue: `bd update <id> --status=open --append-notes "decision: <answer>"`.
    - Or split the issue: close it and create a more specific child task.
+
+The loop does **not** need a manual restart. After a drain-to-blocked, `/loop /build-next` stays alive in resume-poll mode (re-checking `bd ready` every ~20–30 min — see build-next Step 12 "Resume-poll on full block"), so it picks the bead back up on its next poll the moment you reopen it. A manual `/loop /build-next` is only needed if you explicitly stopped the loop or the backstop window has elapsed.
 
 ## What is NOT a reason to escalate
 
