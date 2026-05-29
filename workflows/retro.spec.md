@@ -49,7 +49,7 @@ Verify the run is viable. Produces a `Context` object the rest of the workflow c
 **Tools:** `Bash`, `Read`
 **Steps:**
 1. `bd info` in `app-path`; fail loud if not bd-initialized.
-2. Resolve `since`/`until`: if `since` not given, query `bd query "status in (in_progress, closed) ORDER BY claimed_at ASC LIMIT 1"` for the first claim timestamp.
+2. Resolve `since`/`until`: if `since` not given, query `bd query "status in (in_progress, closed) ORDER BY created_at ASC LIMIT 1"` for the first timestamp. (bd <=0.55.x emits no `claimed_at` in `.beads/issues.jsonl`, so order by `created_at` — the only reliably-present timestamp — as the window start.)
 3. Compute `app-name` from `app-path` directory basename.
 4. Check `meta-path/.beads/` exists. If not, set `metaAvailable=false` and continue with file-only mode.
 5. If `--self`, set `app-path == meta-path` and `app-name = "autonomous-build"`.
@@ -64,7 +64,7 @@ Six independent agents, one per data source. Each returns a typed JSON blob; not
 
 | Agent | Source | Output shape |
 | --- | --- | --- |
-| `collect-app-beads` | `bd query`, `bd list --label workflow-issue`, `bd blocked`, `bd list --status=in_progress` | `{ closed: [{id, title, type, priority, labels, claimedAt, closedAt, durationSec, retries, parentEpic}], flagged: [...], blocked: [...], inProgress: [...] }` |
+| `collect-app-beads` | `bd query`, `bd list --label workflow-issue`, `bd blocked`, `bd list --status=in_progress` | `{ closed: [{id, title, type, priority, labels, claimedAt, closedAt, created_to_closed_sec, retries, parentEpic}], flagged: [...], blocked: [...], inProgress: [...] }`. If `claimed_at` is absent (bd <=0.55.x), fall back to `created_at` as the start of the duration and name the field `created_to_closed_sec` (= `closedAt − createdAt`) so downstream phases know the metric is created-to-closed, not claimed-to-closed. |
 | `collect-app-git` | `git log --since=$since --until=$until --format=...`, `git log --grep=Revert`, file-level diff inspection | `{ commits: [{sha, ts, subject, author, files: [...]}], reverts: [{sha, revertedSha}], postCloseEdits: [{beadId, loopSha, userSha, hoursAfter, files}], subThirtySecondCloses: [{beadId, durationSec}] }` |
 | `collect-meta-git` | `git log` in `meta-path` for the window, broken out by path category | `{ skills: [{file, shas, subjects}], formulas: [...], hooks: [...], docs: [...], tenets: [...], schemas: [...], templates: [...], other: [...] }` |
 | `collect-interactions` | `.beads/interactions.jsonl`, filtered to window | `{ perBead: { <beadId>: { toolCallCount, toolBreakdown, gateInvocations, gateOutcomes } }, totals: {...} }` |
@@ -170,8 +170,8 @@ Writes the markdown report to `<meta-path>/retros/retro-<app-name>-<YYYY-MM-DD>.
 | Metric | Value |
 | --- | --- |
 | Wall time | ... |
-| Median task duration | ... |
-| p90 task duration | ... |
+| Median task duration | ... |   ← label as "Median created-to-closed" when on the `created_at` fallback (bd <=0.55.x, no `claimed_at`) |
+| p90 task duration | ... |   ← label as "p90 created-to-closed" on the same fallback |
 | Revert rate | ... |
 | Post-close edit rate | ... |
 | Flag rate | ... |
