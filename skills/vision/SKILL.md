@@ -32,6 +32,18 @@ Turn a `vision.md` into a `plan.md` the rest of the pipeline can consume.
 
 6.5. **Build the coverage map.** Turn the must-have→feature notes from step 5 into the `coverage[]` map: one entry per `mustHaveId`, listing the `features` (by `featureOrder[].name`) that deliver it and **`how`**. `how` must state *how* the feature delivers the must-have — concrete, falsifiable evidence, not a restatement of the link. "M2 covered by the Streaks feature" is a bare link and is rejected; "the Streaks feature computes a consecutive-day count from logged completions and renders it per habit" is evidence. This mirrors `/decompose`'s anti-vagueness invariant: a verifier must be able to check the claim against the feature. Every `M`-ID from step 1 gets a coverage entry. (The assertion that no must-have is left uncovered is step 6.6.)
 
+6.6. **Forward-coverage assertion (the gate).** This is what turns the coverage map from documentation into enforcement. Assert that **every** `mustHaves[].id` from step 1 appears in `coverage[]` with **≥1** `features` entry. For each must-have that is missing from `coverage[]` (or present with an empty `features` array), append an `openQuestions[]` entry:
+
+   ```jsonc
+   {
+     "question": "Must-have <Mn> (\"<text>\") maps to no feature — which feature delivers it, or should it move to nice-to-haves (§4)?",
+     "blockingCompose": true,
+     "context": "Forward-coverage gate: every §3 must-have must map to >=1 feature, else it would be silently dropped during the build."
+   }
+   ```
+
+   Any `blockingCompose: true` entry forces `incomplete: true` in the lock (per the schema/`incomplete` rule). No new downstream code is needed: `/decompose` Phase 1 already refuses when `incomplete == true` and prints the blocking `openQuestions` list (`decompose.spec.md` step 4), so a dropped must-have now stops the build with a named reason instead of vanishing. Do **not** paper over an uncovered must-have by inventing a feature to cover it — surface it as the blocking question and let the human decide (add a feature, or demote the must-have). Report PASS/uncovered in the closing summary (see "Closing summary").
+
 7. **Off-stack technical decisions → agent consult, not human.** If a must-have feature needs something outside the pinned stack (e.g. a queue, a websocket gateway, a vector DB, a third-party API integration shape), do **not** add it to "Open questions for human." Instead, spawn a parallel 3-agent consult in a single message:
    - `Agent(subagent_type=Plan, description="Architect: minimal off-stack addition", prompt="Given the Jankurai stack in docs/DEFAULT_STACK.md and feature <X>, propose the minimal addition or an alternative shape that stays on-stack. Argue for your recommendation.")`
    - `Agent(subagent_type=general-purpose, description="Reviewer: risks of going off-stack", prompt="For feature <X> on the Jankurai stack, list the load-bearing risks of any off-stack addition and what we lose by staying on-stack. Be specific.")`
