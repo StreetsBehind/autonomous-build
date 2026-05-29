@@ -24,6 +24,10 @@ These three escalate only when the decision is **unmade**. `/vision` front-loads
 
 The `needs-decision` label is unconditional — it is an explicit "a human must answer this" marker and always blocks.
 
+### Deploy-to-dev is unattended; prod apply is gated (lbq.9)
+
+A `terraform apply` to the **dev** environment is **not** an escalation: it runs in CI with short-lived OIDC credentials, against an auto-created state backend, and is fully reversible (`terraform destroy`) with a throwaway blast radius. The build deploys to dev unattended and runs a post-deploy health/smoke check (`tf-smoke-dev`). A failed smoke is a failed deploy (block + diagnostic), not a silent pass. **Staging/prod apply stays gated** — the `terraform-prod` GitHub Environment keeps a required reviewer, and real prod secrets remain a `touches-secrets` human gate. "Production-ready" means *running in dev and smoke-green*, with a human-approved promotion to prod.
+
 ## Soft stops — block if the formula or plan didn't pre-decide
 
 These usually have a default in the formula, but if the formula leaves them open, escalate rather than guess:

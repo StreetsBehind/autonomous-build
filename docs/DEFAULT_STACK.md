@@ -23,7 +23,7 @@ Production-readiness is **not** something a product must-have has to "happen to"
 
 | App declares… | Mandatory floor capabilities |
 | --- | --- |
-| **Data** (non-empty data model) | `observability` (otel traces/metrics), `audit-log`, `iac-deploy` — the app must be observable, auditable, and deployable |
+| **Data** (non-empty data model) | `observability` (otel traces/metrics), `audit-log`, `iac-deploy` — the app must be observable, auditable, and **actually deployed**: `iac-deploy` is an *unattended* deploy-to-dev (CI OIDC creds, auto-created state backend, `terraform apply -auto-approve` for dev only) plus a post-deploy health/smoke check; prod apply stays human-gated (lbq.9) |
 | **Auth** (auth in stack, an addressed authn/authz concern, or a must-have implying accounts) | additionally `authz` (access-control enforcement) and `abuse-surface` (input-validation / rate-limit on exposed surfaces) |
 | Neither (stateless no-auth tool) | empty floor |
 

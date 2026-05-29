@@ -106,12 +106,13 @@ terraform {
 }
 ```
 
-**Bootstrap chicken-and-egg:** the human must create the state bucket (with versioning + SSE-KMS) and lock table out-of-band before the first `terraform init`. `infra/terraform/bootstrap/README.md` documents this with `aws s3api create-bucket` and `aws dynamodb create-table` snippets plus the recommended bucket policy denying non-TLS PutObject and requiring SSE.
+**Bootstrap chicken-and-egg — unattended for dev (lbq.9):** the state bucket + lock table must exist before the first `terraform init`. For **dev**, this is automated: ship `infra/terraform/bootstrap/bootstrap.sh`, an **idempotent** create-if-absent script (`aws s3api head-bucket || create-bucket` with versioning + SSE-KMS + the deny-non-TLS policy, and `aws dynamodb describe-table || create-table`) that CI runs with its OIDC role before `terraform init`. A walk-away dev deploy never waits on a human for this. For **prod**, the same script exists but the runbook requires a human to run it deliberately (a prod state bucket is a one-time, audited action). `infra/terraform/bootstrap/README.md` documents both paths.
 
 **Acceptance:**
 - `terraform fmt -check` clean
-- `terraform init` (against the real bootstrap bucket) succeeds
-- Bootstrap README explains the manual provisioning steps with verified `aws` CLI snippets
+- `bootstrap.sh` is idempotent — running it twice creates nothing the second time (verified against LocalStack or a real account) and exits 0
+- `terraform init` succeeds after `bootstrap.sh` runs
+- Bootstrap README explains the dev-automated vs prod-deliberate paths with verified `aws` CLI snippets
 """
 
 # =============================================================================
@@ -578,7 +579,11 @@ files = [
   "docs/runbooks/secrets-provisioning.md",
 ]
 description = """
-This is the only step on the touches-secrets escalation track. Loop blocks; human fills in `secrets.tfvars` (kept out of git, ignored via `.gitignore` documented in the runbook) with:
+**Dev is unattended; only real-integration / prod secrets gate (lbq.9).** Split secret provisioning by environment:
+- **dev** (`env_name == "dev"`): generate/derive everything that *can* be without a human — OpenFGA preshared key (`openssl rand -base64 32`), a generated Zitadel client secret, and **stub/sandbox** values for paid integrations (Stripe `sk_test_...` from the project's shared test key in CI secrets, Twilio/Postmark sandbox or fake tokens that let the app boot and pass smoke without sending real traffic). CI writes these into the dev `secrets.tfvars` non-interactively, so the dev deploy never blocks. No `touches-secrets` escalation fires for dev.
+- **prod / staging**: the human fills `secrets.tfvars` with real credentials — THIS is the only path that carries the `touches-secrets` label and blocks the loop.
+
+For dev, the human fills nothing; for prod, the human fills `secrets.tfvars` (kept out of git, ignored via `.gitignore` documented in the runbook) with:
 - Stripe test mode `sk_test_...` and webhook signing secret
 - Twilio account SID + auth token (real account, real test number — per T-14 + plan #14)
 - Postmark server token (real account — per plan #15)
@@ -619,10 +624,43 @@ GitHub Actions workflow that runs on PRs touching `infra/terraform/**`:
 - `tfsec --format compact --soft-fail false` (hard-fail on high-severity)
 - `terraform plan -no-color > plan.txt` against the dev backend, commented on the PR via `actions/github-script`
 
-On merge to main: gated `terraform apply` job that requires a GitHub Environment named `terraform-dev` with a required reviewer (the human). Uses the CI OIDC role from `tf-iam-module`, never long-lived AWS credentials.
+On merge to main, **dev apply is UNATTENDED (lbq.9)**: the `terraform-dev` GitHub Environment has **no required reviewer**, so the job runs `bootstrap.sh` then `terraform apply -auto-approve` against the dev backend automatically, using the CI OIDC role from `tf-iam-module` (short-lived, never long-lived AWS credentials). This is safe because dev is ephemeral and reversible (`terraform destroy`) and the only blast radius is a throwaway environment. **Prod/staging apply stays gated**: the `terraform-prod` Environment keeps a required reviewer, so a human approves before any prod mutation. After a successful dev apply the workflow triggers the `tf-smoke-dev` post-deploy check.
 
 **Acceptance:**
 - `act` (the local GH Actions runner) or a dry-run PR demonstrates fmt/validate/tflint/tfsec pass
 - Plan step posts a comment on a test PR
-- Apply job exists but does NOT run without approval
+- The dev apply job runs WITHOUT manual approval (no required reviewer on `terraform-dev`); the prod apply job requires approval (required reviewer on `terraform-prod`)
+"""
+
+# =============================================================================
+# Post-deploy verification — the deploy isn't "done" until the app responds
+# (lbq.9). "Production-ready" implies running somewhere, not a green test suite.
+# =============================================================================
+
+[[steps]]
+id = "tf-smoke-dev"
+title = "Post-deploy health + smoke check against the running dev environment"
+type = "feature"
+priority = 6
+needs = ["tf-ci"]
+files = [
+  ".github/workflows/post-deploy-smoke.yml",
+  "infra/smoke/smoke.sh",
+  "infra/smoke/README.md",
+]
+description = """
+A deploy that applies Terraform but never confirms the app actually serves is not a deploy. After the unattended dev apply (tf-ci), run an automated post-deploy check against the live environment — this is the bead that turns "Terraform applied" into "the app is running".
+
+`infra/smoke/smoke.sh` (invoked by `post-deploy-smoke.yml` on a successful dev apply, and re-runnable locally against any env's ALB URL):
+1. **Health:** poll the ALB `/health` endpoint until 200 or a timeout (e.g. 24 retries × 5s = 2 min for ECS task start); fail loudly on timeout with the last status + recent CloudWatch log tail.
+2. **Smoke:** exercise the app's primary success-metric path end-to-end against the live URL (e.g. create the core entity → read it back), asserting expected status codes and shape. The smoke covers the §8 success-metric path, not every feature.
+3. **SLO sanity:** assert the health-check latency is under a coarse threshold (e.g. p95 < 1s on `/health`) and that the dashboard/alerting wiring from the otel-bootstrap floor exists (a CloudWatch alarm on 5xx rate and on unhealthy-host count is present).
+4. **Backup sanity:** assert RDS automated backups are enabled (the `tf-rds-module` retention) — a one-line `aws rds describe-db-instances` check, not a restore drill.
+
+On any failure the workflow fails red (a deploy that doesn't serve is a failed deploy, T7) and surfaces the diagnostic; on a real prod deploy the same script runs but a failure additionally pages via the alerting channel.
+
+**Acceptance:**
+- `smoke.sh` runs against a local stand-in (LocalStack / a docker-compose of the app) in CI and passes when the app is healthy, fails fast when it is not
+- The workflow is wired to run automatically after the dev apply and blocks the "deploy succeeded" status on smoke success
+- README documents how to point `smoke.sh` at any environment's ALB URL
 """
