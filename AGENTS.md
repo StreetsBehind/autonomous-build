@@ -6,12 +6,21 @@ This is the **workflow repository**, not an app. Beads issues here track *improv
 
 - **`Workflow improvements` epic** (`bd-1zq` or look up via `bd query "type=epic AND title='Workflow improvements'"`) — anchor for all retro-filed improvement tasks.
 - **Per-retro sub-epics** — each `/retro` run creates one, with the suggested changes as children.
-- **Labels you'll see:** `workflow-improvement`, `from-app:<name>`.
+- **Labels you'll see:** `workflow-improvement`, `from-app:<name>`, `triage`, `needs-app-confirm` (see "Confirm-the-fix" below).
 
 ## How issues get created here
 
 1. **Automatically** by `/retro` against an app repo. The retro analyzes the app's beads + git log, finds patterns (reverts, post-close edits, flagged issues, vague acceptance), and files concrete change-this-file-to-do-that tasks here.
 2. **Manually** when you notice something you want to fix but don't have time to fix now: `bd create "..." --type=task -p 2 --labels workflow-improvement` (`bd create` uses `--labels <comma-separated>`, not `--add-label`). From inside a sibling app you're hand-working, use `/flag --upstream "<observation>"` instead — it files a `triage`-labelled bead straight here (see `docs/META_PATH_RESOLUTION.md`).
+
+## Confirm-the-fix: the from-app bead lifecycle (`needs-app-confirm`)
+
+A `from-app:<X>` bead originated from a defect surfaced in sibling app X. Landing a fix in *this* repo is only half the loop — the fix must be re-validated against app X before the bead is truly done. So a from-app bead carrying a **repro** (reproduction steps + an Expected outcome, e.g. `retros/repro-smbuild-decompose-run2-2026-05-28.md`) closes in two stages:
+
+1. **Fix lands here** → the bead moves to **`needs-app-confirm`** (label, **open, not closed**): "fixed in the meta repo, not yet proven against the app."
+2. **Re-validate** → `/confirm-upstream <bead>` (`skills/confirm-upstream/SKILL.md`) resolves app X, re-runs the recorded repro, and **closes only on green** (Actual now matches Expected), recording `confirmed-fixed vs <X>@<sha>` — the provable loop-closed moment. On red/blocked it leaves the bead `needs-app-confirm` with the failing output.
+
+Do **not** close a from-app bead that has a runnable repro without that green confirmation (bead `autonomous-build-m73`). A from-app bead with no recorded repro is a human-confirm — `/confirm-upstream` will hold it at `needs-app-confirm` rather than close blind. (Auto-routing the build-next close-step into `/confirm-upstream` is a deferred follow-up; for now invoke it explicitly.)
 
 ## How to work on these issues
 
