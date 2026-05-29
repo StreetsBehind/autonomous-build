@@ -262,8 +262,20 @@ if (!Context.dryRun && ParsedPlan.crossDeps.length > 0) {
   for (const r of pourOk) {
     if (r.pourRoot) featureToPourRoot[r.feature] = r.pourRoot;
   }
+  const crossDepSchema = {
+    type: 'object',
+    required: ['attempted', 'verifiedPresent', 'missing', 'skipped', 'errors'],
+    properties: {
+      attempted:       { type: 'number' },
+      verifiedPresent: { type: 'number' },
+      missing:  { type: 'array', items: { type: 'object' } },
+      skipped:  { type: 'array', items: { type: 'object' } },
+      errors:   { type: 'array', items: { type: 'object' } }
+    }
+  };
+
   const depAgent = await agent(`
-You are the cross-dep wiring agent for /decompose Phase 3. Apply each cross-feature dep as a single \`bd dep add\` call. Spec: workflows/decompose.spec.md §"Phase 3" final paragraph.
+You are the cross-dep wiring agent for /decompose Phase 3. Apply each cross-feature dep as a single \`bd dep add\` call, then VERIFY each edge actually landed. (Self-contained: no external spec needed.)
 
 Edges to apply:
 ${JSON.stringify(ParsedPlan.crossDeps, null, 2)}
@@ -272,15 +284,16 @@ Name → pourRoot mapping:
 ${JSON.stringify(featureToPourRoot, null, 2)}
 
 For each edge { blocked, blocker }:
-1. Resolve blocked → blockedId via the map (or pass through if already a bead ID).
-2. Resolve blocker → blockerId same way.
-3. Run \`bd dep add <blockedId> <blockerId>\`.
-4. Capture any errors.
+1. Resolve blocked → blockedId via the map (or pass through if already a bead ID). If the name has no mapping, record it under "skipped" with reason "unresolved name" and move on.
+2. Resolve blocker → blockerId the same way.
+3. Run \`bd dep add <blockedId> <blockerId>\`. Increment "attempted".
+4. VERIFY the edge is present — do NOT trust the add's exit code. Run \`bd show <blockedId> --json\` and confirm <blockerId> appears in its dependency/blocked-by list (try \`bd dep show <blockedId>\` as a fallback if the JSON shape is unclear). Only if the edge is confirmed present do you count it toward "verifiedPresent". If add succeeded but verification shows the edge absent (the smbuild failure mode — likely a pourRoot-vs-molecule-epic ID mismatch), retry the add once with the molecule-epic IDs you can see in \`bd list --status=open --json\`; if still absent, record it under "missing" with the resolved IDs and what you observed.
+5. Capture any command errors under "errors".
 
-Return JSON:
-{ "applied": <n>, "skipped": [{ "edge": {...}, "reason": "..." }], "errors": [{ "edge": {...}, "msg": "..." }] }
-`, { label: 'wire-cross-deps', phase: 'Pour', agentType: 'general-purpose' });
-  log(`Cross-deps wired: ${JSON.stringify(depAgent)}`);
+Report the VERIFIED-PRESENT count, never the attempted count, as the headline. Return JSON:
+{ "attempted": <n>, "verifiedPresent": <n>, "missing": [{ "edge": {...}, "blockedId": "...", "blockerId": "...", "observed": "..." }], "skipped": [{ "edge": {...}, "reason": "..." }], "errors": [{ "edge": {...}, "msg": "..." }] }
+`, { label: 'wire-cross-deps', phase: 'Pour', schema: crossDepSchema, agentType: 'general-purpose' });
+  log(`Cross-deps wired: ${depAgent?.verifiedPresent ?? 0}/${depAgent?.attempted ?? 0} verified present, ${(depAgent?.missing || []).length} missing, ${(depAgent?.errors || []).length} errors`);
 }
 
 // ---------------------------------------------------------------------------

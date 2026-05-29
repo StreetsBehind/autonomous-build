@@ -101,7 +101,7 @@ One agent per feature in `ParsedPlan.features`. Each agent pours its formula, re
 
 **Concurrency:** N agents, capped at the runtime's 16-concurrent limit. For N > 16, the runtime schedules in batches automatically.
 
-After all `pour-feature` agents complete, the orchestrator script also applies `crossDeps` sequentially (one `bd dep add` per cross-feature edge; resolve feature names → pour-root IDs via the union of `PourResult.pourRoot` values).
+After all `pour-feature` agents complete, the orchestrator script also applies `crossDeps` sequentially (one `bd dep add` per cross-feature edge; resolve feature names → pour-root IDs via the union of `PourResult.pourRoot` values). The wiring agent must **verify each edge landed** by re-querying (`bd show <blockedId> --json` / `bd dep show`) rather than trusting the `bd dep add` exit code, and report the **verified-present** count, not the attempted count. An add that "succeeds" but leaves the edge absent (a pourRoot-vs-molecule-epic ID mismatch was the smbuild cause) is retried once against the visible molecule-epic IDs, then recorded as `missing`. Phase 7's dep audit independently reconciles declared vs present edges.
 
 ---
 
