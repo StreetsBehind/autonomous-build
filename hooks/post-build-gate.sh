@@ -359,7 +359,14 @@ if has_cmd jankurai; then
   # into a loud FAIL for app-mode callers via GATE_REQUIRE_BASELINE.
   echo "=== jankurai ratchet (regression-only) ==="
   if [ ! -f "$baseline" ]; then
-    echo "SKIP: jankurai ratchet (no baseline at $baseline — meta mode or pre-baseline; ratchet not live)"
+    if [ "${GATE_REQUIRE_BASELINE:-0}" = "1" ]; then
+      echo "FAIL: jankurai ratchet — no blessed baseline at $baseline, but GATE_REQUIRE_BASELINE=1 (app mode)."
+      echo "      An app build must have a baseline blessed by /decompose before the loop runs; its"
+      echo "      absence is a /decompose bug, not a benign skip. Refusing to ship ungated commits. (igu.3)"
+      failures+=("jankurai-no-baseline")
+    else
+      echo "SKIP: jankurai ratchet (no baseline at $baseline — meta mode or pre-baseline; ratchet not live)"
+    fi
   elif [ -z "$base_ref" ]; then
     echo "SKIP: jankurai ratchet (no resolvable local HEAD to diff against — treated as can't-evaluate, not block)"
   else

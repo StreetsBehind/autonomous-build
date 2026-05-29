@@ -321,7 +321,14 @@ if (Get-Command jankurai -ErrorAction SilentlyContinue) {
     # into a loud FAIL for app-mode callers via GATE_REQUIRE_BASELINE.
     Write-Host "=== jankurai ratchet (regression-only) ==="
     if (-not (Test-Path $baseline)) {
-        Write-Host "SKIP: jankurai ratchet (no baseline at $baseline — meta mode or pre-baseline; ratchet not live)"
+        if ($env:GATE_REQUIRE_BASELINE -eq "1") {
+            Write-Host "FAIL: jankurai ratchet — no blessed baseline at $baseline, but GATE_REQUIRE_BASELINE=1 (app mode)."
+            Write-Host "      An app build must have a baseline blessed by /decompose before the loop runs; its"
+            Write-Host "      absence is a /decompose bug, not a benign skip. Refusing to ship ungated commits. (igu.3)"
+            $failures += "jankurai-no-baseline"
+        } else {
+            Write-Host "SKIP: jankurai ratchet (no baseline at $baseline — meta mode or pre-baseline; ratchet not live)"
+        }
     } elseif (-not $baseRef) {
         Write-Host "SKIP: jankurai ratchet (no resolvable local HEAD to diff against — treated as can't-evaluate, not block)"
     } else {

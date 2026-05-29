@@ -362,7 +362,9 @@ Merge-And-Close(beadId):
     # Post-merge gate on main. THIS is the defense-in-depth check.
     print "[GATE] post-merge gate on main (bead $beadId)"
     # Resolve cross-platform: post-build-gate.sh on Linux/macOS, .ps1 (via pwsh) on Windows.
-    gateOutput = runGate("hooks/post-build-gate")   # picks .sh or .ps1 by OS
+    # GATE_REQUIRE_BASELINE=1: build-batch is always app mode, so a missing Jankurai
+    # baseline is a /decompose bug the gate must hard-fail on, not skip (igu.3).
+    gateOutput = runGate("hooks/post-build-gate", env={GATE_REQUIRE_BASELINE:1})   # picks .sh or .ps1 by OS
     if exitCode != 0:
       # Gate failed. Undo the merge, block the bead.
       git reset --hard HEAD~1
