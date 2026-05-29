@@ -43,7 +43,7 @@ plan.md + plan.lock.json  ──/decompose──▶  blessed beads DAG (epics + 
 | `templates/vision.md` | The form you fill out per app |
 | `templates/tenets.md` | Template `/vision` populates per-app — inherits the workflow tenets and derives app-specific ones from vision + plan.lock |
 | `docs/TENETS.md` | The workflow-level tenets — principles the loop falls back on for build-time judgment calls |
-| `hooks/post-build-gate.{sh,ps1}` | Quality gate (typecheck/lint/test + Jankurai audit/witness) run before every `bd close`. `.sh` on Linux/macOS, `.ps1` (via `pwsh`) on Windows — kept in sync |
+| `hooks/post-build-gate.{sh,ps1}` | Quality gate run before every `bd close`: lint/typecheck, mandatory tests, e2e/integration, SCA (dep-vuln audit), opt-in coverage floor, Jankurai audit/witness — across Node/Python/**Rust**. `.sh` on Linux/macOS, `.ps1` (via `pwsh`) on Windows — kept in sync. Knobs: `GATE_SCA`, `GATE_COVERAGE_MIN` |
 | `retros/` | Markdown retros produced by `/retro` after each app finishes |
 | `.beads/` | This repo's *own* beads DB — tracks workflow improvements (retro-filed) |
 | `docs/` | Architecture, install, escalation rules |

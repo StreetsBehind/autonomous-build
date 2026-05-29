@@ -53,7 +53,7 @@ bd worktree create task-<id>
 ↓
 implement against issue.acceptance          # the formula provides this
 ↓
-hooks/post-build-gate.{sh,ps1}              # typecheck + lint + test
+hooks/post-build-gate.{sh,ps1}              # lint + typecheck + test + e2e + SCA + coverage (Node/Py/Rust)
 ↓
 green?  → git commit, bd close <id>, worktree remove
 red x1? → retry once with failure context
