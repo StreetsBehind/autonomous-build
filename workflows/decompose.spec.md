@@ -344,7 +344,9 @@ After fixes, re-run `/decompose --no-file` to preview the state, then `/decompos
 
 5. If `dryRun`, prefix the report title with `(DRY RUN) ` and skip the "Next steps" section.
 
-**Failure:** if writing the report fails (disk full, path invalid), retry once; on second failure, dump the report to stdout and exit with `verdict='NEEDS-FIX', reportPath=null`. Loud failure, not silent (T7).
+The write-report agent returns a **structured** object (validated by a schema: `{ status, reportPath, verdict, reportMarkdown? }`), not free text — otherwise the orchestrator cannot read `reportPath` back and `finalResult.reportPath` stays `null` even though the file was written (the smbuild symptom). On a successful write, `finalResult.reportPath` is set to the returned path.
+
+**Failure:** if writing the report fails (disk full, path invalid), retry once; on second failure, return `{ status: 'failed', reportPath: null, reportMarkdown }` so the orchestrator can dump the inlined markdown to the log and exit with `verdict='NEEDS-FIX'`. Loud failure, not silent (T7).
 
 ---
 

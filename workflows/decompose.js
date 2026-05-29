@@ -717,6 +717,21 @@ const synthesisPayload = {
   depAudit: DepAuditResult
 };
 
+// Structured return so the orchestrator can read reportPath back. Without a
+// schema the agent returns a bare string and reportResult.reportPath is always
+// undefined → finalResult.reportPath stays null even though the file was written
+// (the smbuild symptom). The schema forces the structured shape.
+const reportSchema = {
+  type: 'object',
+  required: ['status', 'verdict'],
+  properties: {
+    status:         { enum: ['ok', 'failed'] },
+    reportPath:     { type: ['string', 'null'] },
+    verdict:        { type: 'string' },
+    reportMarkdown: { type: 'string' }
+  }
+};
+
 const reportResult = await agent(`
 You are the write-report agent for /decompose Phase 8. (Self-contained: the report schema is inlined below — you run in the app repo cwd, where the workflow spec is not present, so do NOT try to read workflows/decompose.spec.md.)
 
@@ -800,7 +815,13 @@ If Write fails (disk full, permission), retry once. On second failure return:
 { "status": "failed", "verdict": "NEEDS-FIX", "reportPath": null, "reportMarkdown": "<the markdown body inlined>" }
 
 The verdict is already computed — DO NOT recompute. Just render it.
-`, { label: 'write-report', phase: 'Synthesis', agentType: 'general-purpose' });
+`, { label: 'write-report', phase: 'Synthesis', schema: reportSchema, agentType: 'general-purpose' });
+
+// Loud failure if the report could not be written (T7) — surface the inlined
+// markdown so the work isn't silently lost.
+if (!reportResult || reportResult.status !== 'ok' || !reportResult.reportPath) {
+  log(`Report write did NOT succeed (status=${reportResult?.status ?? 'null'}). Inlined report below:\n${reportResult?.reportMarkdown || '<no markdown returned>'}`);
+}
 
 // ---------------------------------------------------------------------------
 // Return final result to runtime
