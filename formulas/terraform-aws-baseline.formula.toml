@@ -610,7 +610,7 @@ Runbook documents:
 id = "tf-ci"
 title = "GitHub Actions workflow (fmt + validate + tflint + tfsec + plan + apply)"
 type = "feature"
-priority = 5
+priority = 4
 needs = ["tf-env-dev"]
 files = [
   ".github/workflows/terraform.yml",
@@ -641,7 +641,7 @@ On merge to main, **dev apply is UNATTENDED (lbq.9)**: the `terraform-dev` GitHu
 id = "tf-smoke-dev"
 title = "Post-deploy health + smoke check against the running dev environment"
 type = "feature"
-priority = 6
+priority = 4
 needs = ["tf-ci"]
 files = [
   ".github/workflows/post-deploy-smoke.yml",
