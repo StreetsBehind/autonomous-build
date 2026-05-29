@@ -54,6 +54,31 @@ Production-readiness is **not** something a product must-have has to "happen to"
 
 The floor is realized by enforcement formulas, the same way `concerns[]` and `nfrs[]` are (no `bd create`; a missing formula surfaces `recommendedFormula` and forces NEEDS-FIX). A capability already delivered by a product feature or an addressed concern is not poured twice. This is what stops a real data-backed app from shipping as skeleton+CRUD with no observability, audit, authz, or deploy path.
 
+### Floor enforcement formulas
+
+Each floor capability resolves to a pinned enforcement formula. `/decompose` Phase 3.5 selects it by **purpose** (it runs `bd formula list` and matches the formula whose purpose enforces that class — there is no hardcoded name table), so the names below are the canonical realizations, not a lookup the code depends on:
+
+| Floor capability | Enforcement formula |
+| --- | --- |
+| `observability` | `otel-bootstrap-rust` |
+| `audit-log` | `audit-chain-rust` |
+| `iac-deploy` | `terraform-aws-baseline` |
+| `authz` | `openfga-model` |
+| `abuse-surface` | `concern-enforcement-abuse-surface` |
+| success-metric end-to-end definition-of-done | `e2e-acceptance` |
+
+Two further concern-enforcement formulas back conditional concerns when an app triggers them: `concern-enforcement-data-lifecycle` (retention / deletion / hard-delete cascade — the `data-lifecycle` concern) and `concern-enforcement-perf` (load / latency-envelope assertion — the `perf-envelope` concern).
+
+### Pinned abuse-surface posture
+
+`abuse-surface` is a mandatory auth-floor item, so — like the other floor items — its default posture is **pinned here, not re-litigated per app**. A per-app rate-limit decision is the exception (an unusual threat model), not the default. The posture below is encoded by `concern-enforcement-abuse-surface` and is a valid `addressed` evidence citation (a `DEFAULT_STACK.md` pin — see `docs/PLAN_CONCERNS.md` §Evidence), so an auth'd app's `abuse-surface` concern resolves `addressed` at vision time instead of blocking at the decidedness gate:
+
+- **Edge:** an AWS WAFv2 web ACL with a **rate-based rule** in front of the ALB (default 2,000 requests / 5-min per source IP — AWS's minimum rate-rule window), shipped as a `terraform-aws-edge-security` module the IaC baseline wires in (this is the WAF layer `terraform-aws-baseline` defers as Phase 2+).
+- **In-app:** a **per-tenant token-bucket** limiter via [`tower-governor`](https://docs.rs/tower-governor) as an Axum layer on every public route (default **10 req/s sustained, burst 20**, keyed on the authenticated tenant; falls back to source IP for unauthenticated routes).
+- **Input bounds:** a request body-size cap (`tower-http` `RequestBodyLimitLayer`, default 1 MiB) plus `validator`-derive bounds on request DTOs (reject malformed/oversized input with 400).
+
+All three are **overridable per app** (a §6 constraint or a vision-time decision can tighten or relax them); in the absence of an app-specific decision they are the default.
+
 ## Why this is pinned, not chosen per-app
 
 The human checkpoint in `/vision` is for **product** (problem, users, must-haves, non-goals, success metric), not **tech**. Re-litigating the stack per app burns the human's time on a decision that almost never changes the product outcome — and inconsistent stacks across apps make the formulas, retros, and shared skills more expensive to maintain.
