@@ -5,7 +5,7 @@ description: Scale harness that grades /vision output against a hand-authored or
 
 # vision-eval
 
-The plan-determinism measurement stage, implemented as a **dynamic workflow** (see https://code.claude.com/docs/en/workflows). It grades the `/vision` stage against the oracle corpus in `tests/vision-eval/` (epic `autonomous-build-4vj`; corpus + manifests are `4vj.1`, already landed). This spec covers `4vj.2` — the **L1–L3 mechanical layers**. L4 (evidence-quality judge fan-out, `4vj.3`), the scorecard + baseline ratchet (`4vj.4`), and L5 (downstream propagation, `4vj.5`) are separate, later beads and are **out of scope here** — but the phase structure leaves room for them.
+The plan-determinism measurement stage, implemented as a **dynamic workflow** (see https://code.claude.com/docs/en/workflows). It grades the `/vision` stage against the oracle corpus in `tests/vision-eval/` (epic `autonomous-build-4vj`; corpus + manifests are `4vj.1`, already landed). This spec covers `4vj.2` (the **L1–L3 mechanical layers** + result table) and `4vj.4` (the **scorecard + blessed-baseline regression ratchet**). L4 (evidence-quality judge fan-out, `4vj.3` — populates `vaguenessRate`) and L5 (downstream propagation, `4vj.5`) are separate, later beads and are **out of scope here** — but the scorecard already reserves `vaguenessRate` so L4 wires in without a schema bump.
 
 ## How this spec runs
 
@@ -27,7 +27,12 @@ The eval grades the **contract** (`plan.lock.json`: `concerns[]`, `coverage[]`, 
 | `--fixtures-dir <path>` | `tests/vision-eval/fixtures` | Corpus root (one `NN-<slug>/` dir per fixture, each with `vision.md` + `expect.json`). |
 | `--k <int>` | `5` | Runs per fixture. The stability metric (L3) needs `k>=2`; `k=1` gives L1+L2 only. |
 | `--only <slug[,slug...]>` | all | Restrict to named fixtures (e.g. a cheap `--only 01-multitenant-saas-web --k 1` smoke). |
-| `--selftest` | false | Run the pure-JS checker unit tests against embedded synthetic locks (NO agents, free) and stop. Used for CI of the harness logic itself. |
+| `--baseline <path>` | `agent/baselines/vision-eval.json` | The blessed-baseline file the ratchet diffs against and (with `--update-baseline`) rewrites. |
+| `--update-baseline` | false | Bless the fresh scorecard AS the baseline: write it to `--baseline` with `blessed:true` and **do not gate**. The deliberate baseline-bump path; commit the result in a dedicated commit. |
+| `--no-gate` | false | Compute + report the ratchet delta but never fail the run (report-only). |
+| `--tol-pass <float>` | `0.15` | Max allowed drop (fraction) in L1/L2 pass-rate below baseline before it's a regression. |
+| `--tol-stability <float>` | `10` | Max allowed drop (pct points) in coverage-/verdict-stability below baseline before it's a regression. |
+| `--selftest` | false | Run the pure-JS checker unit tests (L1/L2/L3 + ratchet) against embedded synthetic data (NO agents, free) and stop. Used for CI of the harness logic itself. |
 
 ### Cost model (read before wiring to CI)
 
@@ -65,7 +70,21 @@ One agent lists the fixture slugs under `--fixtures-dir` (each dir containing bo
 
 ### Phase 3 — Report (sequential, in-script)
 
-Assemble a **per-fixture result table** and `log()` it: fixture, parsed/K, L1 pass/K, L2 pass/K, L2 per-concern + per-gate offenders, coverage-stability %, verdict-stability, entity/feature ranges, and a header line stating corpus scope (`--only`, `--k`) so a restricted run is never read as full coverage. The scorecard artifact + baseline ratchet is `4vj.4`; this phase only emits the table.
+Assemble a **per-fixture result table** and `log()` it: fixture, parsed/K, L1 pass/K, L2 pass/K, L2 per-concern + per-gate offenders, coverage-stability %, verdict-stability, entity/feature ranges, and a header line stating corpus scope (`--only`, `--k`) so a restricted run is never read as full coverage.
+
+### Phase 4 — Scorecard + baseline ratchet (`4vj.4`)
+
+Rolls the rows into a **scorecard** and diffs it against the blessed baseline. Mirrors the jankurai regression-only ratchet in `hooks/post-build-gate.sh` (regression-only; missing/unblessed baseline = quiet SKIP; deliberate-commit-only bump).
+
+1. **Read baseline** (1 agent): reads `--baseline` (`agent/baselines/vision-eval.json`); returns `{found, baseline}` or `{found:false}`. (Agents, not the sandbox, touch the filesystem.)
+2. **Build scorecard** (`buildScorecard`, pure JS): per-fixture `{l1PassRate, l2PassRate, coverageStabilityPct, verdictStable}` + an `aggregate` of `l1PassRate`, `l2PassRate`, `meanCoverageStabilityPct`, `verdictStabilityPct`, and `vaguenessRate` (`null` until L4/`4vj.3`).
+3. **Compare** (`compareToBaseline`, pure JS): regression-only. "Below" metrics (the four pass-rate/stability ones) regress when `current < baseline − tol`; the lone "above" metric `vaguenessRate` regresses when `current > baseline + tol`. Returns `status: 'pass' | 'block' | 'skip'`. **`skip`** when the baseline is missing or `blessed !== true`.
+4. **Write** (1 agent): `--update-baseline` writes the fresh scorecard to `--baseline` with `blessed:true` (the deliberate bump — review + commit separately); otherwise writes a non-blessed copy to `target/vision-eval/scorecard.latest.json` (untracked, for inspection + the CI ratchet runner).
+5. **Gate:** a `block` **throws**, failing the workflow run (the "exit non-zero" CI hook) — *unless* `--no-gate` or `--update-baseline`. A `skip` never gates.
+
+**Baseline file + bless discipline.** `agent/baselines/vision-eval.json` ships as a **seed with `blessed:false`** (ratchet is report-only until blessed — like a missing jankurai baseline). To bless: run the full corpus at a representative `--k` with `--update-baseline`, review the emitted numbers, and commit the rewritten file in a **dedicated commit**. The numbers are inherently noisy (`/vision` is an LLM), so the ratchet is tolerance-banded, not exact-match.
+
+**CI exit codes without agents.** `node tests/vision-eval/ratchet.mjs <scorecard.json> [--baseline <path>]` reuses the same `compareToBaseline` and exits `0=PASS / 1=BLOCK / 2=SKIP` (jankurai convention). CI flow: run the workflow to produce `target/vision-eval/scorecard.latest.json`, then run the ratchet for the process exit code (the workflow's own throw is the in-band gate; this is the out-of-band one).
 
 ## Sync rules
 
@@ -73,8 +92,10 @@ Assemble a **per-fixture result table** and `log()` it: fixture, parsed/K, L1 pa
 - **`CONCERN_IDS` ↔ `docs/PLAN_CONCERNS.md`** — the ten concern ids are inlined as a JS const (mirroring `vision.js`). When the vocabulary changes, update both.
 - **L1 structural checks ↔ `schemas/plan.lock.schema.json`** — the workflow sandbox cannot read files, so L1 hand-codes the schema's hard constraints rather than loading the schema. When the plan.lock schema changes, update `validatePlanLock` in the same commit. (Same documented-sync discipline the repo uses elsewhere instead of runtime SSOT loading.)
 - **`GATE_TOKENS` ↔ `skills/vision/SKILL.md` gates** — the controlled context vocabulary the run agent tags blocks with, and the patterns L2 matches. When a gate's wording changes, keep the token stable.
+- **scorecard shape ↔ `agent/baselines/vision-eval.json`** — `buildScorecard` and the seed/baseline file share the `{schemaVersion, blessed, aggregate{...}, fixtures{...}}` shape; `tests/vision-eval/ratchet.mjs` reads it. Change the three together.
 
 ## Verification
 
-- **Pure-JS checkers** are exported and node-importable (the script guards all `agent()` calls behind `typeof agent === 'function'` and uses no top-level `return`). `--selftest` (and `node tests/vision-eval/selftest.mjs`) runs them against embedded synthetic locks and asserts: a schema-invalid lock fails L1; a lock whose concern decisions contradict a manifest fails L2; **a deliberately wrong manifest fails L2** (the acceptance check); identical locks score 100% stability and a divergent one scores <100%.
-- **Live smoke:** `--only 01-multitenant-saas-web --k 1` runs one real `/vision` pass end-to-end and emits a one-row table (the expensive path; opt-in).
+- **Pure-JS checkers** are node-reachable: the script guards all `agent()` calls behind `typeof agent === 'function'`, uses no top-level `return`, and (in the node branch) publishes the checkers on `globalThis.__visionEval` — the workflow runtime forbids `export` other than `meta`, so a bridge replaces named exports. `--selftest` (and `node tests/vision-eval/selftest.mjs`, 16 checks) asserts: a schema-invalid lock fails L1; **a deliberately wrong manifest fails L2** (the `4vj.2` acceptance check); the adversarial branches (papering-over, fabricated must-haves, gate-token match) behave; identical locks score 100% stability and a divergent one <100%; the scorecard aggregates correctly; and the ratchet SKIPs an unblessed baseline, PASSes an unchanged corpus, and **BLOCKs an injected regression** (the `4vj.4` acceptance check).
+- **CI ratchet runner:** `node tests/vision-eval/ratchet.mjs <scorecard.json> [--baseline <path>]` exits `0/1/2` for PASS/BLOCK/SKIP.
+- **Live smoke:** `--only 01-multitenant-saas-web --k 1` runs one real `/vision` pass end-to-end and emits a one-row table (the expensive path; opt-in). `4vj.2`'s smoke (`--only 01,08,10 --k 1`) confirmed L1 3/3 valid and L2 discriminating (01+10 matched the oracle, 08 flagged a real `authz` divergence).

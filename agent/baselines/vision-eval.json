@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "blessed": false,
+  "_note": "Seed baseline for the vision-eval ratchet (autonomous-build-4vj.4). blessed:false makes the ratchet a quiet SKIP (report-only) — exactly like a missing jankurai baseline. To BLESS: run the workflow over the full corpus at a representative K and bless the result, e.g. `Workflow vision-eval --k 5 --update-baseline`; review the emitted numbers; then commit the rewritten file in a DEDICATED commit (mirrors the jankurai baseline discipline in hooks/post-build-gate.sh). --update-baseline overwrites this whole object with a real scorecard carrying blessed:true. Until then no regression can trip the gate, because there is no blessed reference to regress against.",
+  "scope": null,
+  "fixtureCount": 0,
+  "aggregate": {
+    "l1PassRate": null,
+    "l2PassRate": null,
+    "meanCoverageStabilityPct": null,
+    "verdictStabilityPct": null,
+    "vaguenessRate": null
+  },
+  "fixtures": {}
+}

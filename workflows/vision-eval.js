@@ -3,9 +3,10 @@ export const meta = {
   description: 'Scale harness that grades /vision output against the hand-authored oracle corpus in tests/vision-eval/. Runs each fixture vision.md through /vision K times, then scores the plan.lock.json with three pure-JS (no-LLM) layers — L1 contract validation, L2 expectation assertions vs the manifest, L3 K-run stability — and emits a per-fixture result table. Implements autonomous-build-4vj.2.',
   whenToUse: 'When you want a numbers-on-a-dashboard answer to "is /vision deterministic / in line with the oracle?". Cheap grading, but the inputs are heavy: a full run is fixtures*k /vision passes (10*5=50 by default). Use --k 1 / --only for a cheap smoke, --selftest to CI the harness logic with no agents.',
   phases: [
-    { title: 'Enumerate',     detail: 'List fixture slugs under the corpus root (1 agent)' },
-    { title: 'Run + grade',   detail: 'Per fixture: read manifest, run /vision K times headless, grade L1/L2/L3 in pure JS' },
-    { title: 'Report',        detail: 'Assemble + log the per-fixture result table (scorecard/ratchet is 4vj.4)' }
+    { title: 'Enumerate',          detail: 'List fixture slugs under the corpus root (1 agent)' },
+    { title: 'Run + grade',        detail: 'Per fixture: read manifest, run /vision K times headless, grade L1/L2/L3 in pure JS' },
+    { title: 'Report',             detail: 'Assemble + log the per-fixture result table' },
+    { title: 'Scorecard + ratchet', detail: 'Build scorecard, diff vs blessed baseline, write artifact, fail on regression' }
   ]
 };
 
@@ -17,13 +18,28 @@ const rawArgs =
   (typeof userArgs !== 'undefined') ? userArgs :
   (typeof input !== 'undefined') ? input : '';
 
+// Default ratchet tolerances (autonomous-build-4vj.4). Declared before parseArgs so
+// its defaults can reference it. "below" metrics (pass-rates, stability) may not drop
+// more than this below baseline; vaguenessRate may not rise more than `vague` above it.
+// pass-rates are fractions (0..1); stability is percentage points.
+const DEFAULT_TOLS = { pass: 0.15, stability: 10, vague: 0.1 };
+
 function parseArgs(s) {
-  const out = { fixturesDir: 'tests/vision-eval/fixtures', k: 5, only: null, selftest: false };
+  const out = {
+    fixturesDir: 'tests/vision-eval/fixtures', k: 5, only: null, selftest: false,
+    baselinePath: 'agent/baselines/vision-eval.json', updateBaseline: false, noGate: false,
+    tolPass: DEFAULT_TOLS.pass, tolStability: DEFAULT_TOLS.stability
+  };
   const tokens = (typeof s === 'string') ? s.trim().split(/\s+/).filter(Boolean) : (Array.isArray(s) ? s : []);
   for (let i = 0; i < tokens.length; i++) {
     if (tokens[i] === '--fixtures-dir' && tokens[i + 1]) { out.fixturesDir = tokens[++i]; }
     else if (tokens[i] === '--k' && tokens[i + 1]) { const n = parseInt(tokens[++i], 10); if (Number.isFinite(n) && n > 0) out.k = n; }
     else if (tokens[i] === '--only' && tokens[i + 1]) { out.only = tokens[++i].split(',').map(x => x.trim()).filter(Boolean); }
+    else if (tokens[i] === '--baseline' && tokens[i + 1]) { out.baselinePath = tokens[++i]; }
+    else if (tokens[i] === '--update-baseline') { out.updateBaseline = true; }
+    else if (tokens[i] === '--no-gate') { out.noGate = true; }
+    else if (tokens[i] === '--tol-pass' && tokens[i + 1]) { const n = parseFloat(tokens[++i]); if (Number.isFinite(n) && n >= 0) out.tolPass = n; }
+    else if (tokens[i] === '--tol-stability' && tokens[i + 1]) { const n = parseFloat(tokens[++i]); if (Number.isFinite(n) && n >= 0) out.tolStability = n; }
     else if (tokens[i] === '--selftest') { out.selftest = true; }
   }
   return out;
@@ -321,9 +337,92 @@ function renderTable(rows, scope) {
 }
 
 // ===========================================================================
-// --selftest: pure-JS unit checks (NO agents). Exercises L1/L2/L3 against
-// embedded synthetic locks, including the acceptance check "a wrong manifest
-// fails L2". Importable + runnable via node tests/vision-eval/selftest.mjs.
+// Scorecard + baseline ratchet (autonomous-build-4vj.4). Mirrors the jankurai
+// regression-only ratchet (hooks/post-build-gate.sh): a blessed baseline lives
+// at agent/baselines/vision-eval.json, the gate fails ONLY on a drop beyond
+// tolerance, a missing/unblessed baseline is a quiet SKIP, and the baseline is
+// bumped only in a deliberate --update-baseline commit. Pure JS, no agents.
+// (DEFAULT_TOLS is defined up in the constants block — parseArgs needs it.)
+// ===========================================================================
+
+// Roll the per-fixture rows into a scorecard (per-fixture + aggregate metrics).
+function buildScorecard(rows, scope) {
+  const clean = (rows || []).filter(isObj);
+  const fixtures = {};
+  let l1PassSum = 0, l2PassSum = 0, runSum = 0;
+  const covs = [], verdicts = [];
+  for (const r of clean) {
+    const l1Rate = r.k ? r.l1Pass / r.k : null;
+    const l2Rate = r.k ? r.l2Pass / r.k : null;
+    fixtures[r.slug] = {
+      l1PassRate: l1Rate, l2PassRate: l2Rate,
+      coverageStabilityPct: r.coverageStabilityPct, verdictStable: r.verdictStable
+    };
+    l1PassSum += r.l1Pass; l2PassSum += r.l2Pass; runSum += r.k;
+    if (typeof r.coverageStabilityPct === 'number') covs.push(r.coverageStabilityPct);
+    if (typeof r.verdictStable === 'boolean') verdicts.push(r.verdictStable);
+  }
+  const mean = (a) => a.length ? Math.round((a.reduce((x, y) => x + y, 0) / a.length) * 10) / 10 : null;
+  return {
+    schemaVersion: 1,
+    blessed: false,
+    scope: scope || null,
+    fixtureCount: clean.length,
+    aggregate: {
+      l1PassRate: runSum ? Math.round((l1PassSum / runSum) * 1000) / 1000 : null,
+      l2PassRate: runSum ? Math.round((l2PassSum / runSum) * 1000) / 1000 : null,
+      meanCoverageStabilityPct: mean(covs),
+      verdictStabilityPct: verdicts.length ? Math.round((verdicts.filter(Boolean).length / verdicts.length) * 1000) / 10 : null,
+      vaguenessRate: null // L4 (autonomous-build-4vj.3) populates this; gated here once present.
+    },
+    fixtures
+  };
+}
+
+// Compare a fresh scorecard to a blessed baseline. Regression-only:
+//   status 'skip'  — no/ unblessed baseline (can't evaluate; quiet, like jankurai)
+//   status 'block' — some gated metric regressed beyond tolerance
+//   status 'pass'  — within tolerance of (or better than) the baseline
+// "below" metrics (pass-rates, stability) regress when current < baseline - tol;
+// the lone "above" metric (vaguenessRate) regresses when current > baseline + tol.
+function compareToBaseline(scorecard, baseline, tols = DEFAULT_TOLS) {
+  const t = Object.assign({}, DEFAULT_TOLS, tols || {});
+  if (!isObj(baseline) || baseline.blessed !== true) {
+    return { status: 'skip', reason: !isObj(baseline) ? 'no baseline file' : 'baseline not blessed (blessed!=true)', regressions: [], deltas: {} };
+  }
+  const cur = (scorecard && scorecard.aggregate) || {};
+  const base = (baseline && baseline.aggregate) || {};
+  const regressions = [], deltas = {};
+  const below = [
+    ['l1PassRate', t.pass], ['l2PassRate', t.pass],
+    ['meanCoverageStabilityPct', t.stability], ['verdictStabilityPct', t.stability]
+  ];
+  for (const [m, tol] of below) {
+    const b = base[m], c = cur[m];
+    if (typeof b !== 'number' || typeof c !== 'number') { deltas[m] = { baseline: b ?? null, current: c ?? null, skipped: true }; continue; }
+    const delta = Math.round((c - b) * 1000) / 1000;
+    deltas[m] = { baseline: b, current: c, delta, tol };
+    if (c < b - tol) regressions.push({ metric: m, baseline: b, current: c, delta, tol });
+  }
+  // vaguenessRate: "above" metric, only meaningful once L4 populates it.
+  {
+    const b = base.vaguenessRate, c = cur.vaguenessRate, tol = t.vague;
+    if (typeof b === 'number' && typeof c === 'number') {
+      const delta = Math.round((c - b) * 1000) / 1000;
+      deltas.vaguenessRate = { baseline: b, current: c, delta, tol };
+      if (c > b + tol) regressions.push({ metric: 'vaguenessRate', baseline: b, current: c, delta, tol });
+    } else {
+      deltas.vaguenessRate = { baseline: b ?? null, current: c ?? null, skipped: true };
+    }
+  }
+  return { status: regressions.length ? 'block' : 'pass', reason: regressions.length ? `${regressions.length} metric(s) regressed` : 'within tolerance', regressions, deltas };
+}
+
+// ===========================================================================
+// --selftest: pure-JS unit checks (NO agents). Exercises L1/L2/L3 + the
+// scorecard ratchet against embedded synthetic data, including the acceptance
+// checks "a wrong manifest fails L2" and "an injected regression trips the
+// gate". Importable + runnable via node tests/vision-eval/selftest.mjs.
 // ===========================================================================
 function runSelftest() {
   const results = [];
@@ -407,6 +506,33 @@ function runSelftest() {
   drift.concerns.find(c => c.concernId === 'observability').reason = 'flipped';
   const unstable = computeStability([goodLock, drift]);
   check('L3 scores a divergent run <100% coverage-stability', unstable.coverageStabilityPct < 100);
+
+  // 9-13. Scorecard + baseline ratchet (autonomous-build-4vj.4).
+  const rowsA = [
+    { slug: '01', k: 5, l1Pass: 5, l2Pass: 5, coverageStabilityPct: 100, verdictStable: true },
+    { slug: '08', k: 5, l1Pass: 5, l2Pass: 4, coverageStabilityPct: 90, verdictStable: true }
+  ];
+  const scA = buildScorecard(rowsA, 'k=5');
+  check('scorecard aggregates pass-rates + stability',
+    scA.aggregate.l1PassRate === 1 && scA.aggregate.l2PassRate === 0.9 &&
+    scA.aggregate.meanCoverageStabilityPct === 95 && scA.aggregate.verdictStabilityPct === 100);
+
+  const blessedBase = Object.assign({}, scA, { blessed: true });
+  check('ratchet SKIPs when there is no baseline', compareToBaseline(scA, null).status === 'skip');
+  check('ratchet SKIPs when the baseline is not blessed', compareToBaseline(scA, scA).status === 'skip');
+  check('ratchet PASSes an unchanged corpus vs a blessed baseline', compareToBaseline(scA, blessedBase).status === 'pass');
+
+  const scRegress = buildScorecard([
+    { slug: '01', k: 5, l1Pass: 5, l2Pass: 2, coverageStabilityPct: 100, verdictStable: true },
+    { slug: '08', k: 5, l1Pass: 5, l2Pass: 2, coverageStabilityPct: 90, verdictStable: true }
+  ], 'k=5'); // l2PassRate 0.4 vs blessed 0.9, drop 0.5 > tol 0.15
+  check('ratchet BLOCKs an injected L2 regression', compareToBaseline(scRegress, blessedBase).status === 'block');
+
+  const scDip = buildScorecard([
+    { slug: '01', k: 5, l1Pass: 5, l2Pass: 5, coverageStabilityPct: 100, verdictStable: true },
+    { slug: '08', k: 5, l1Pass: 5, l2Pass: 3, coverageStabilityPct: 90, verdictStable: true }
+  ], 'k=5'); // l2PassRate 0.8 vs 0.9, dip 0.1 < tol 0.15
+  check('ratchet tolerates a sub-tolerance dip', compareToBaseline(scDip, blessedBase).status === 'pass');
 
   const passed = results.filter(r => r.pass).length;
   return { passed, total: results.length, ok: passed === results.length, results };
@@ -510,8 +636,49 @@ Read ${A.fixturesDir}/${slug}/expect.json and return it verbatim as {"manifest":
   const l2Total = clean.reduce((a, r) => a + r.l2Pass, 0);
   const runTotal = clean.reduce((a, r) => a + r.k, 0);
   log(`vision-eval summary: L1 ${l1Total}/${runTotal} runs valid · L2 ${l2Total}/${runTotal} runs match oracle · scope: ${scope}`);
-  log('NOTE: scorecard artifact + baseline ratchet is autonomous-build-4vj.4; L4 evidence-judge is 4vj.3; L5 propagation is 4vj.5.');
-  return { rows: clean, scope };
+
+  // ---- Phase 4: scorecard + baseline ratchet ----
+  phase('Scorecard + ratchet');
+  const baseRead = await agent(`
+Read the file ${A.baselinePath} if it exists.
+- If it exists and parses as JSON, return {"found": true, "baseline": <the parsed object>}.
+- If it does NOT exist, return {"found": false}.
+Do not create or modify the file.
+`.trim(), { label: 'read-baseline', phase: 'Scorecard + ratchet', schema: { type: 'object', required: ['found'], properties: { found: { type: 'boolean' }, baseline: { type: 'object' } } } });
+
+  const baseline = (baseRead && baseRead.found) ? baseRead.baseline : null;
+  const scorecard = buildScorecard(clean, scope);
+  const cmp = compareToBaseline(scorecard, baseline, { pass: A.tolPass, stability: A.tolStability });
+
+  // Persist: --update-baseline blesses the fresh scorecard AS the baseline (commit it
+  // deliberately); otherwise write a non-blessed inspection copy under target/ (untracked).
+  const writePath = A.updateBaseline ? A.baselinePath : 'target/vision-eval/scorecard.latest.json';
+  const toWrite = JSON.stringify(Object.assign({}, scorecard, { blessed: !!A.updateBaseline }), null, 2);
+  await agent(`
+Write the following content to ${writePath}, byte for byte (run \`mkdir -p\` on its parent dir first; overwrite if present). Write ONLY this JSON, no edits, no commentary:
+
+${toWrite}
+
+Then confirm the path you wrote.
+`.trim(), { label: A.updateBaseline ? 'write-baseline' : 'write-scorecard', phase: 'Scorecard + ratchet' });
+
+  log(`\nvision-eval ratchet: ${cmp.status.toUpperCase()} — ${cmp.reason}`);
+  for (const m of Object.keys(cmp.deltas)) {
+    const d = cmp.deltas[m];
+    if (!d.skipped) log(`  ${m}: baseline=${d.baseline} current=${d.current} delta=${d.delta >= 0 ? '+' : ''}${d.delta} (tol ${d.tol})`);
+  }
+  for (const r of cmp.regressions) log(`  REGRESSION ${r.metric}: ${r.current} below ${r.baseline} - ${r.tol}`);
+  log(A.updateBaseline
+    ? `baseline blessed + written to ${A.baselinePath} — review the numbers and commit it in a DEDICATED commit.`
+    : `scorecard written to ${writePath} (not blessed). ${cmp.status === 'skip' ? 'No blessed baseline yet → ratchet is report-only.' : ''}`);
+  log('NOTE: L4 evidence-judge (vaguenessRate) is autonomous-build-4vj.3; L5 propagation is 4vj.5.');
+
+  // The gate: a regression fails the run (the "exit non-zero" CI hook). Skip when
+  // blessing a new baseline or when --no-gate is set.
+  if (cmp.status === 'block' && !A.noGate && !A.updateBaseline) {
+    throw new Error(`vision-eval REGRESSION vs baseline: ${cmp.regressions.map(r => `${r.metric} ${r.current}<${r.baseline}-${r.tol}`).join('; ')}`);
+  }
+  return { rows: clean, scope, scorecard, ratchet: cmp };
 }
 
 // Entry point — guarded so `node`/`import` (for the selftest harness checks) never
@@ -530,6 +697,7 @@ if (typeof agent === 'function') {
   // node (`agent` undefined) we expose them on globalThis for tests/vision-eval/selftest.mjs.
   globalThis.__visionEval = {
     extractJson, validatePlanLock, gradeAgainstManifest, computeStability,
-    gradeFixture, renderTable, runSelftest, CONCERN_IDS, GATE_TOKENS
+    gradeFixture, renderTable, buildScorecard, compareToBaseline, runSelftest,
+    CONCERN_IDS, GATE_TOKENS, DEFAULT_TOLS
   };
 }
