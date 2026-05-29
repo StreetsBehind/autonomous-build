@@ -44,8 +44,8 @@ plan.md + plan.lock.json  ──/decompose──▶  blessed beads DAG (epics + 
 | Path | What it is |
 | --- | --- |
 | `formulas/` | beads workflow templates — the reusable intellectual property |
-| `skills/` | Turn-by-turn Claude Code skills (`vision`, `build-next`, `escalate`, `flag`) |
-| `workflows/` | Dynamic-workflow specs (`<name>.spec.md`) and their canonical scripts (`<name>.js`). `decompose`, `build-batch`, and `retro` live here. `decompose.js` and `build-batch.js` are hand-authored (load-bearing); `retro.js` is first-run-generated then saved. |
+| `skills/` | Claude Code skills: `build-next`, `escalate`, `flag`, `orchestrate`, and the thin `vision` shell — the conversational front-end of the hybrid `/vision` (its planning engine is the `vision` dynamic workflow). |
+| `workflows/` | Dynamic-workflow specs (`<name>.spec.md`) and their canonical scripts (`<name>.js`). `vision` (the engine half of the hybrid `/vision`), `decompose`, `build-batch`, `retro`, and `vision-eval` live here. All are hand-authored (load-bearing) and kept in lockstep with their `.spec.md` in the same commit. |
 | `templates/vision.md` | The form you fill out per app |
 | `templates/tenets.md` | Template `/vision` populates per-app — inherits the workflow tenets and derives app-specific ones from vision + plan.lock |
 | `docs/TENETS.md` | The workflow-level tenets — principles the loop falls back on for build-time judgment calls |

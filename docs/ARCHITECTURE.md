@@ -10,19 +10,22 @@
 
 ## Stage-by-stage
 
-### `/vision` — vision.md → plan.md + plan.lock.json
+### `/vision` — vision.md → plan.md + plan.lock.json + tenets.md
+
+Implemented as a **hybrid** (epic `autonomous-build-ih5`): a thin skill shell (`skills/vision/SKILL.md`) holds the human-present product conversation, and a **dynamic workflow** (`workflows/vision.spec.md` + `workflows/vision.js`) is the deterministic planning engine. The shell reads `vision.md`, quotes back must-haves/non-goals/constraints/success-metric for correction, helps fill missing product sections, runs the off-stack agent consult, then invokes the workflow and presents the gate (COMPLETE → coverage/concerns tables; NEEDS-INPUT → blocking questions + edit-vision-and-rerun). The shell carries no planning logic; the workflow owns it.
 
 Inputs: `templates/vision.md` filled out by the user.
-Outputs: a paired `plan.md` (human narrative) and `plan.lock.json` (machine-readable mirror), both containing:
-- Tech stack decision with one-line reasoning per choice
+Outputs: a paired `plan.md` (human narrative) and `plan.lock.json` (schemaVersion 2 machine-readable mirror), plus `tenets.md` (T1–T10 inherited + app-specific), containing:
+- Tech stack decision with one-line reasoning per choice (resolved from `docs/DEFAULT_STACK.md`, never negotiated with the user)
 - Data model (entities, fields, relationships)
 - Feature list ranked by dependency
 - Formula picks (which `formulas/*.formula.toml` to pour, with variable bindings)
+- `coverage[]` (every must-have → the feature(s) that deliver it + how) and `concerns[]` (each cross-cutting concern from `docs/PLAN_CONCERNS.md` decided: addressed-with-evidence or excluded-with-reason), the latter produced by the workflow's concern fan-out — one agent per applicable concern over a frozen skeleton
 - Escalation budget (e.g. "block on >$5/day API spend")
 
-The lock is validated against [`schemas/plan.lock.schema.json`](../schemas/plan.lock.schema.json) before being written; field reference is in [`docs/PLAN_LOCK.md`](PLAN_LOCK.md). The lock is the source of truth `/decompose` consumes — `plan.md` exists for human review and as a fallback for repos that pre-date the lock.
+The workflow runs four gates (forward-coverage, reverse-trace, decidedness, must-have↔non-goal) plus a required+excluded contradiction scan; any blocking question flips `incomplete: true`. The lock is built and validated against [`schemas/plan.lock.schema.json`](../schemas/plan.lock.schema.json) in pure JS before being written; field reference is in [`docs/PLAN_LOCK.md`](PLAN_LOCK.md). The lock is the source of truth `/decompose` consumes — `plan.md` exists for human review and as a fallback for repos that pre-date the lock; an `incomplete: true` lock is refused at `/decompose` pre-flight.
 
-This stage runs *with the user in the loop*. The plan is a contract — the loop won't second-guess it later.
+This stage runs *with the user in the loop* (the shell holds the conversation; the workflow is headless). The plan is a contract — the loop won't second-guess it later.
 
 ### `/decompose` — plan.lock.json → blessed beads DAG
 
