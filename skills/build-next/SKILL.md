@@ -109,7 +109,14 @@ The stale path is especially important when /retro has filed beads in batches �
 
 ### Step 4: escalation pre-check
 
-Before writing any code, check the issue against `docs/ESCALATION_RULES.md`:
+Before writing any code, check the issue against the escalation rules. **Resolve the rules file the way Step 8 resolves the gate** — the rules live in the workflow repo and are *not* copied into app repos, so a bare `docs/ESCALATION_RULES.md` resolves to the app cwd where it does not exist. Try the app repo root first, then the sibling `autonomous-build` checkout:
+
+```bash
+rules="$(git rev-parse --show-toplevel)/docs/ESCALATION_RULES.md"
+[ -f "$rules" ] || rules="$(cd "$(git rev-parse --show-toplevel)/.." && pwd)/autonomous-build/docs/ESCALATION_RULES.md"
+```
+
+Then check the issue against the rules in `$rules`:
 - Does this introduce a paid third-party API? → block
 - Cumulative session cost over budget? → block
 - Does this require a **new** auth/authz model, secrets, or migration decision? → block — **unless** that decision was front-loaded in `plan.lock.json` `concerns[]` (authn/authz/secrets/data-lifecycle `addressed` with evidence). If the relevant concern is `addressed`, the decision already exists: **implement the decided model and proceed, do not block.** Only block when the concern is absent/`excluded`, or the bead needs a decision *beyond* what the plan decided. A bare `touches-auth` label is not a block when the auth concern is decided (lbq.3).
