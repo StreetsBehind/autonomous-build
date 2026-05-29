@@ -19,7 +19,10 @@ const rawArgs =
   (typeof input !== 'undefined') ? input : '';
 
 function parseArgs(s) {
-  const out = { visionPath: 'vision.md', skeletonPath: null, outPath: 'plan.lock.json', dryRun: false, selftest: false };
+  // replanFrom: when set, this is /replan (epic 0ms) — a scoped re-run that FREEZES phases < N
+  // (already built) and re-derives phases >= N with the prior build's outcomes + /retro as context.
+  // null = a normal from-scratch /vision.
+  const out = { visionPath: 'vision.md', skeletonPath: null, outPath: 'plan.lock.json', dryRun: false, selftest: false, replanFrom: null };
   const tokens = (typeof s === 'string') ? s.trim().split(/\s+/).filter(Boolean) : (Array.isArray(s) ? s : []);
   for (let i = 0; i < tokens.length; i++) {
     if (tokens[i] === '--vision' && tokens[i + 1]) { out.visionPath = tokens[++i]; }
@@ -27,6 +30,7 @@ function parseArgs(s) {
     else if (tokens[i] === '--out' && tokens[i + 1]) { out.outPath = tokens[++i]; }
     else if (tokens[i] === '--no-file') { out.dryRun = true; }
     else if (tokens[i] === '--selftest') { out.selftest = true; }
+    else if (tokens[i] === '--replan-from' && tokens[i + 1]) { const n = parseInt(tokens[++i], 10); if (Number.isInteger(n) && n >= 1) out.replanFrom = n; }
   }
   return out;
 }
@@ -782,6 +786,49 @@ function assembleLock(a) {
   return lock;
 }
 
+// /replan (epic 0ms): merge a freshly re-derived lock with the existing one, scoped at phase N.
+// Phases < N are BUILT — frozen verbatim from `existing` (status forced to 'built'); phases >= N are taken
+// from the re-derived lock (re-cut: add/drop/reorder/merge of downstream provisional phases). Global fields
+// (stack, concerns, escalationBudget, ...) come from the re-derivation. The freeze is enforced HERE in pure
+// JS, so it holds regardless of what the skeleton agent re-proposed for the already-built phases.
+// A must-have that existed at phase >= N in the OLD lock but is ABSENT from the re-derivation is a DROP — a
+// loud blocking openQuestion (a product decision, never a silent edit), not a deferral. Returns { lock, dropped }.
+function mergeReplan(existing, rederived, replanFrom) {
+  const N = (Number.isInteger(replanFrom) && replanFrom >= 1) ? replanFrom : 1;
+  const ex = isObj(existing) ? existing : {};
+  const rd = isObj(rederived) ? rederived : {};
+  const phOf = (e) => (isObj(e) && Number.isInteger(e.phase)) ? e.phase : 1;
+
+  const frozenMH = (isArr(ex.mustHaves) ? ex.mustHaves : []).filter((m) => phOf(m) < N);
+  const newMH    = (isArr(rd.mustHaves) ? rd.mustHaves : []).filter((m) => phOf(m) >= N);
+  const frozenFO = (isArr(ex.featureOrder) ? ex.featureOrder : []).filter((f) => phOf(f) < N);
+  const newFO    = (isArr(rd.featureOrder) ? rd.featureOrder : []).filter((f) => phOf(f) >= N);
+  const frozenPhases = (isArr(ex.phases) ? ex.phases : []).filter((p) => isObj(p) && p.id < N).map((p) => ({ ...p, status: 'built', provisional: false }));
+  const newPhases    = (isArr(rd.phases) ? rd.phases : []).filter((p) => isObj(p) && p.id >= N);
+
+  const newIds = new Set(newMH.map((m) => m.id));
+  const dropped = (isArr(ex.mustHaves) ? ex.mustHaves : [])
+    .filter((m) => isObj(m) && phOf(m) >= N && nonEmptyStr(m.id) && !newIds.has(m.id))
+    .map((m) => ({ id: m.id, text: m.text, fromPhase: phOf(m) }));
+
+  const frozenMHIds = new Set(frozenMH.map((m) => m.id));
+  const frozenCov = (isArr(ex.coverage) ? ex.coverage : []).filter((c) => isObj(c) && frozenMHIds.has(c.mustHaveId));
+  const newCov    = (isArr(rd.coverage) ? rd.coverage : []).filter((c) => isObj(c) && newIds.has(c.mustHaveId));
+
+  const mergedPhases = [...frozenPhases, ...newPhases];
+  const lock = { ...rd, mustHaves: [...frozenMH, ...newMH], featureOrder: [...frozenFO, ...newFO], coverage: [...frozenCov, ...newCov] };
+  if (mergedPhases.length > 1) lock.phases = mergedPhases; else delete lock.phases;
+
+  const droppedGates = dropped.map((d) => ({
+    question: `Replan dropped must-have ${d.id} ("${d.text}"), previously assigned to phase ${d.fromPhase} — confirm the removal in vision.md or restore it. Dropping a must-have is a product decision, not a silent edit.`,
+    blockingCompose: true,
+    context: `replan-dropped-musthave: ${d.id} was phase ${d.fromPhase}`
+  }));
+  lock.openQuestions = [...(isArr(rd.openQuestions) ? rd.openQuestions : []), ...droppedGates];
+  lock.incomplete = lock.openQuestions.some((q) => q && q.blockingCompose === true);
+  return { lock, dropped };
+}
+
 // Strict schema validation (a superset of vision-eval.js validatePlanLock: same checks + additionalProperties
 // + stack-key-enum). Returns { ok, errors[] }. A non-empty errors[] on an assembled lock is a workflow bug.
 function validateLock(pl, concernIds = CONCERN_IDS) {
@@ -1023,16 +1070,19 @@ Return ONLY the structured object (its schema is enforced).
 `.trim();
 }
 
-function skeletonPrompt(intake, A) {
+function skeletonPrompt(intake, A, replan) {
   const validated = JSON.stringify({ mustHaves: intake.mustHaves, sections: intake.sections }, null, 2);
   const headlessNote = intake.skeleton
     ? `A skeleton was already built by the skill shell — NORMALIZE it into the shape below; do NOT re-derive (the human already had that conversation). The provided skeleton:\n${JSON.stringify(intake.skeleton, null, 2)}`
     : `No skeleton was provided — DERIVE it headlessly from the validated vision below. There is NO human to ask.`;
+  const replanNote = (isObj(replan) && nonEmptyStr(replan.note))
+    ? `\nREPLAN MODE (epic 0ms) — this is /replan --replan-from ${replan.from}. Phases < ${replan.from} are BUILT and FROZEN: the workflow keeps them verbatim no matter what you output, so do NOT re-litigate them. Re-derive phases >= ${replan.from}, RE-CUTTING the downstream provisional phases (add / drop / reorder / merge) in light of what actually shipped — keep already-built must-haves' ids stable. Prior plan + build outcomes / retro context:\n${replan.note}\n`
+    : '';
   return `
 You are the SKELETON agent for the /vision workflow (Phase 2). You run in the APP repo's cwd. Build the FROZEN skeleton the concern fan-out will reason against. NEVER invent product content (must-haves, users, features) to fill a gap — if a must-have has no matching formula, record a block, do not paper it (T1).
 
 ${headlessNote}
-
+${replanNote}
 VALIDATED VISION (must-have ids already assigned — keep them VERBATIM):
 ${validated}
 
@@ -1534,6 +1584,55 @@ function runSelftest() {
   check('derivePhases: an all-phase-1 must-have set is single-phase (returns null)',
     derivePhases([{ id: 'M1', text: 'a' }, { id: 'M2', text: 'b' }], [], {}) === null);
 
+  // ---- /replan (epic 0ms / autonomous-build-0ms.4): freeze phases < N, re-derive phases >= N ----
+  const existingForReplan = JSON.parse(JSON.stringify(asmPhased.lock)); // a valid 2-phase lock (M1 phase 1, M2 phase 2)
+  const rederived = JSON.parse(JSON.stringify(asmPhased.lock));
+  rederived.mustHaves = [
+    { id: 'M1', text: 'REWRITTEN phase-1 must-have (must be discarded by the freeze)', phase: 1 },
+    { id: 'M2', text: 'Members create and assign tasks (revised)', phase: 2 },
+    { id: 'M3', text: 'New phase-3 capability', phase: 3 }
+  ];
+  rederived.featureOrder = [
+    { name: 'Platform', formulas: ['app-skeleton-rust-cargo'], phase: 1 },
+    { name: 'Auth', formulas: ['oidc-client-rust'], phase: 1 },
+    { name: 'Tasks2', formulas: ['crud-feature-rust'], phase: 2 },
+    { name: 'NewThing', formulas: ['crud-feature-rust'], phase: 3 }
+  ];
+  rederived.phases = [
+    { id: 1, name: 'Walking skeleton', goal: 'g1', status: 'active', provisional: false },
+    { id: 2, name: 'Streaks revised', goal: 'g2', status: 'planned', provisional: true },
+    { id: 3, name: 'New phase', goal: 'g3', status: 'planned', provisional: true }
+  ];
+  rederived.coverage = [
+    { mustHaveId: 'M1', features: ['Auth'], how: 'rewritten cover' },
+    { mustHaveId: 'M2', features: ['Tasks2'], how: 'revised cover' },
+    { mustHaveId: 'M3', features: ['NewThing'], how: 'new cover' }
+  ];
+  rederived.openQuestions = []; rederived.incomplete = false;
+  const { lock: replanned, dropped: drop0 } = mergeReplan(existingForReplan, rederived, 2);
+  check('Replan VERIFY: phases < N are FROZEN verbatim from the existing lock (re-derived phase-1 text discarded)',
+    replanned.mustHaves.find((m) => m.id === 'M1').text === existingForReplan.mustHaves.find((m) => m.id === 'M1').text
+    && replanned.mustHaves.find((m) => m.id === 'M1').text !== rederived.mustHaves.find((m) => m.id === 'M1').text);
+  check('Replan VERIFY: a phase < N is marked built (status=built, non-provisional)',
+    replanned.phases.find((p) => p.id === 1).status === 'built' && replanned.phases.find((p) => p.id === 1).provisional === false);
+  check('Replan VERIFY: phases >= N are re-derived (M2 revised + new M3/phase 3 carried from the re-derivation)',
+    replanned.mustHaves.find((m) => m.id === 'M2').text === 'Members create and assign tasks (revised)'
+    && replanned.mustHaves.some((m) => m.id === 'M3' && m.phase === 3) && replanned.phases.some((p) => p.id === 3));
+  check('Replan: the merged lock is schema-valid and clean (no drops here)',
+    validateLock(replanned).ok && drop0.length === 0 && replanned.incomplete === false);
+
+  // Dropped must-have: existing M2 (phase 2) absent from the re-derivation, not deferred -> loud blocking gate.
+  const rederivedDrop = JSON.parse(JSON.stringify(rederived));
+  rederivedDrop.mustHaves = rederivedDrop.mustHaves.filter((m) => m.id !== 'M2');
+  rederivedDrop.featureOrder = rederivedDrop.featureOrder.filter((f) => f.name !== 'Tasks2');
+  rederivedDrop.coverage = rederivedDrop.coverage.filter((c) => c.mustHaveId !== 'M2');
+  const { lock: replannedDrop, dropped: drop1 } = mergeReplan(existingForReplan, rederivedDrop, 2);
+  check('Replan VERIFY: a dropped (not deferred) must-have is a loud blocking gate, not a silent edit',
+    drop1.some((d) => d.id === 'M2') && replannedDrop.incomplete === true
+    && replannedDrop.openQuestions.some((q) => q.blockingCompose === true && /replan-dropped-musthave/.test(q.context)));
+  check('Replan: --replan-from 1 freezes nothing — everything is re-derived',
+    mergeReplan(existingForReplan, rederived, 1).lock.mustHaves.find((m) => m.id === 'M1').text === rederived.mustHaves.find((m) => m.id === 'M1').text);
+
   const passed = results.filter((r) => r.pass).length;
   return { results, passed, total: results.length, ok: passed === results.length };
 }
@@ -1544,7 +1643,29 @@ function runSelftest() {
 // ===========================================================================
 async function main() {
   const A = parsedArgs;
-  log(`vision starting — vision=${A.visionPath}${A.skeletonPath ? ` skeleton=${A.skeletonPath}` : ' (headless skeleton)'}${A.dryRun ? ' [dry-run]' : ''}`);
+  log(`vision starting — vision=${A.visionPath}${A.skeletonPath ? ` skeleton=${A.skeletonPath}` : ' (headless skeleton)'}${A.replanFrom ? ` [replan-from ${A.replanFrom}]` : ''}${A.dryRun ? ' [dry-run]' : ''}`);
+
+  // ---- Replan pre-load (epic 0ms): /replan --replan-from N loads the existing lock + latest retro so the
+  // re-derivation builds on what shipped. The pure-JS mergeReplan (Phase 4) enforces the phase freeze. ----
+  let priorLock = null;
+  let replan = null;
+  if (A.replanFrom) {
+    phase('Intake');
+    const loadRes = await agent(`
+You are the replan-load agent for /vision --replan-from ${A.replanFrom} (epic 0ms). Load what already shipped so the re-derivation builds on it.
+1. Read ${A.outPath} (the existing plan.lock.json). Return its parsed JSON object under "lock". If it is missing or not valid JSON, return { "status": "failed", "failedReason": "no existing ${A.outPath} to replan from — run /vision first" }.
+2. Find the most recent retro for the just-built phase (look for retros/*.md, a phase-${A.replanFrom - 1} retro, or decomposeReport.md). Summarize the findings relevant to phases >= ${A.replanFrom} into "retroSummary" (a few sentences). If none exists, set "retroSummary": "".
+Return { "status": "ok", "lock": <parsed lock object>, "retroSummary": "<text>" }. Use Read, Bash, Glob.
+`, { label: 'replan-load', phase: 'Intake', schema: { type: 'object', required: ['status'], properties: { status: { enum: ['ok', 'failed'] }, lock: { type: 'object' }, retroSummary: { type: 'string' }, failedReason: { type: 'string' } } } });
+    if (!loadRes || loadRes.status !== 'ok' || !isObj(loadRes.lock)) {
+      log(`vision: FAILED — replan could not load ${A.outPath}: ${loadRes && loadRes.failedReason ? loadRes.failedReason : 'no lock returned'}`);
+      return { status: 'failed', reason: (loadRes && loadRes.failedReason) ? loadRes.failedReason : 'replan-load failed' };
+    }
+    priorLock = loadRes.lock;
+    const frozenPhases = (isArr(priorLock.phases) ? priorLock.phases : []).filter((p) => isObj(p) && p.id < A.replanFrom);
+    replan = { from: A.replanFrom, note: `Frozen (built) phases < ${A.replanFrom}: ${JSON.stringify(frozenPhases)}\nPrior must-haves: ${JSON.stringify(isArr(priorLock.mustHaves) ? priorLock.mustHaves : [])}\nRetro / build outcomes: ${nonEmptyStr(loadRes.retroSummary) ? loadRes.retroSummary : '(none found)'}` };
+    log(`vision: replan-from ${A.replanFrom} — loaded prior lock (${isArr(priorLock.phases) ? priorLock.phases.length : 0} phase(s), ${isArr(priorLock.mustHaves) ? priorLock.mustHaves.length : 0} must-have(s)).`);
+  }
 
   // ---- Phase 1: intake + validate ----
   phase('Intake');
@@ -1562,7 +1683,7 @@ async function main() {
 
   // ---- Phase 2: skeleton + applicability ----
   phase('Skeleton');
-  const skelRaw = await agent(skeletonPrompt(intake, A), { label: 'skeleton', phase: 'Skeleton', schema: SKELETON_SCHEMA });
+  const skelRaw = await agent(skeletonPrompt(intake, A, replan), { label: 'skeleton', phase: 'Skeleton', schema: SKELETON_SCHEMA });
   const { skeleton, errors } = normalizeSkeleton(skelRaw && skelRaw.skeleton);
   if (errors.length) {
     log(`vision: FAILED — skeleton malformed: ${errors.slice(0, 6).join('; ')}`);
@@ -1614,31 +1735,45 @@ async function main() {
     return { status: 'failed', incomplete: asm.incomplete, lock: asm.lock, validationErrors: asm.validationErrors, openQuestions: asm.openQuestions, dryRun: A.dryRun };
   }
 
-  const verdict = asm.incomplete ? 'needs-input' : 'ok';
-  const tokens = asm.openQuestions.map((q) => String(q.context || '').split(':')[0]).filter(Boolean);
+  // Replan merge (epic 0ms): freeze phases < N from the prior lock, keep re-derived phases >= N. The
+  // freeze is enforced here in pure JS, so it holds regardless of what the skeleton agent re-proposed.
+  let final = asm;
+  if (A.replanFrom && priorLock) {
+    const { lock: mergedLock, dropped } = mergeReplan(priorLock, asm.lock, A.replanFrom);
+    const v = validateLock(mergedLock);
+    if (!v.ok) {
+      log(`vision: FAILED — merged replan lock is schema-invalid (workflow bug): ${v.errors.slice(0, 6).join('; ')}`);
+      return { status: 'failed', incomplete: mergedLock.incomplete, lock: mergedLock, validationErrors: v.errors, openQuestions: mergedLock.openQuestions, dryRun: A.dryRun };
+    }
+    final = { ok: true, validationErrors: [], incomplete: mergedLock.incomplete, lock: mergedLock, openQuestions: mergedLock.openQuestions, tenetsMd: asm.tenetsMd, planMd: renderPlanMd(mergedLock) };
+    log(`vision: replan merged — froze phases < ${A.replanFrom}, re-derived >= ${A.replanFrom}${dropped.length ? `; ${dropped.length} dropped must-have(s) gated for human decision: ${dropped.map((d) => d.id).join(', ')}` : ''}.`);
+  }
+
+  const verdict = final.incomplete ? 'needs-input' : 'ok';
+  const tokens = final.openQuestions.map((q) => String(q.context || '').split(':')[0]).filter(Boolean);
   const planMdPath = siblingPath(A.outPath, 'plan.md');
   const tenetsPath = siblingPath(A.outPath, 'tenets.md');
   const reportPaths = { planLock: A.outPath, planMd: planMdPath, tenets: tenetsPath };
 
   // Dry-run: return the would-be lock + verdict without writing (the --no-file inspection path).
   if (A.dryRun) {
-    log(`vision: ${asm.incomplete ? 'NEEDS-INPUT' : 'COMPLETE'} (dry-run, nothing written) — ${asm.lock.concerns.length} concern(s) decided, ${asm.lock.coverage.length}/${asm.lock.mustHaves.length} must-have(s) covered${asm.incomplete ? `, ${asm.openQuestions.length} blocking question(s): ${tokens.join(', ')}` : ''}.`);
-    return { status: verdict, incomplete: asm.incomplete, lock: asm.lock, openQuestions: asm.openQuestions, reportPaths, dryRun: true };
+    log(`vision: ${final.incomplete ? 'NEEDS-INPUT' : 'COMPLETE'} (dry-run, nothing written) — ${final.lock.concerns.length} concern(s) decided, ${final.lock.coverage.length}/${final.lock.mustHaves.length} must-have(s) covered${final.incomplete ? `, ${final.openQuestions.length} blocking question(s): ${tokens.join(', ')}` : ''}.`);
+    return { status: verdict, incomplete: final.incomplete, lock: final.lock, openQuestions: final.openQuestions, reportPaths, dryRun: true };
   }
 
   // Write the three files via the lone Phase-4 agent (the sandbox has no filesystem). The lock is incomplete:true
   // when blocked, so /decompose pre-flight refuses it cleanly — the same gate the must-have path uses.
   const writeRes = await agent(
-    assemblePrompt({ outPath: A.outPath, planMdPath, tenetsPath, lockJson: JSON.stringify(asm.lock, null, 2), planMd: asm.planMd, tenetsMd: asm.tenetsMd }),
+    assemblePrompt({ outPath: A.outPath, planMdPath, tenetsPath, lockJson: JSON.stringify(final.lock, null, 2), planMd: final.planMd, tenetsMd: final.tenetsMd }),
     { label: 'assemble', phase: 'Assemble', schema: ASSEMBLE_SCHEMA }
   );
   const written = (writeRes && isArr(writeRes.written)) ? writeRes.written : [];
   if (!writeRes || writeRes.status !== 'ok') {
     log(`vision: assemble agent did not confirm all writes — ${writeRes && writeRes.failedReason ? writeRes.failedReason : 'no ok status'} (wrote: ${written.join(', ') || 'none'}).`);
   }
-  log(`vision: ${asm.incomplete ? 'NEEDS-INPUT' : 'COMPLETE'} — wrote ${written.length} file(s)${asm.incomplete ? `; incomplete:true, ${asm.openQuestions.length} blocking question(s): ${tokens.join(', ')}` : `; ${asm.lock.concerns.length} concerns decided, ${asm.lock.coverage.length}/${asm.lock.mustHaves.length} must-have(s) covered`}.`);
+  log(`vision: ${final.incomplete ? 'NEEDS-INPUT' : 'COMPLETE'} — wrote ${written.length} file(s)${final.incomplete ? `; incomplete:true, ${final.openQuestions.length} blocking question(s): ${tokens.join(', ')}` : `; ${final.lock.concerns.length} concerns decided, ${final.lock.coverage.length}/${final.lock.mustHaves.length} must-have(s) covered`}.`);
 
-  return { status: verdict, incomplete: asm.incomplete, lock: asm.lock, openQuestions: asm.openQuestions, reportPaths, written, dryRun: false };
+  return { status: verdict, incomplete: final.incomplete, lock: final.lock, openQuestions: final.openQuestions, reportPaths, written, dryRun: false };
 }
 
 // Entry point — guarded so `node`/`import` (for the selftest harness) never triggers agent calls.
@@ -1659,7 +1794,7 @@ if (typeof agent === 'function') {
     normalizeSkeleton, detectOffEnumPicks, runSelftest,
     concernBlock, isDecided, concernInputs, normalizeConcernResult,
     standardExclusion, reconcileConcerns, buildCoverage, reverseTraceOrphans,
-    phaseOf, featurePhase, derivePhases,
+    phaseOf, featurePhase, derivePhases, mergeReplan,
     musthaveNongoalConflicts, parseEscalationBudget, mapStack, runGatesV4,
     assembleLock, validateLock, renderTenets, renderPlanMd, reconcileAndAssemble, siblingPath,
     intakePrompt, skeletonPrompt, concernPrompt, assemblePrompt, parseArgs,

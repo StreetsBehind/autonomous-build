@@ -48,8 +48,18 @@ The workflow accepts these arguments (parsed from the invocation; all optional):
 | `--skeleton <path>` | none | A frozen skeleton JSON produced by the skill shell (Steps 2–5). When present, Phases 1–2 validate it instead of re-deriving; when absent, the workflow builds the skeleton headlessly (the `vision-eval` path). |
 | `--out <path>` | `plan.lock.json` in cwd | Where the assembled lock is written. `plan.md` + `tenets.md` are written next to it. |
 | `--no-file` | false | Dry-run: run all four phases and return the would-be lock + verdict, but write nothing. Used to inspect a derivation before it lands. |
+| `--replan-from <N>` | none | **/replan** (epic `autonomous-build-0ms`): a scoped re-run. Loads the existing lock + the latest retro, **freezes** phases `< N` (already built) verbatim, and **re-derives** phases `>= N` (re-cut: add/drop/reorder/merge of downstream provisional phases) with the prior build's outcomes as context. See "Replan" below. |
 
 The workflow expects to run **in the app repo's root** (where `vision.md` lives), not in `autonomous-build`. There is no `--self` analog — there is no `vision.md` for the workflow repo itself.
+
+## Replan (`--replan-from N`, epic 0ms)
+
+`/replan` is implemented as a **scoped re-run of `/vision`**, not a separate engine — it reuses the same skeleton/concern/gate/assemble machinery and only changes the boundary conditions:
+
+1. **Pre-load** (a `replan-load` agent, Phase 1): read the existing `plan.lock.json` + the most recent retro for the just-built phase. The frozen phases (`< N`) and prior must-haves + the retro summary are passed into the Phase-2 skeleton prompt as context.
+2. **Re-derive** Phases 1–4 normally. The skeleton agent is told phases `< N` are BUILT + FROZEN (do not re-litigate) and to re-cut phases `>= N` in light of what shipped.
+3. **Merge** (pure-JS `mergeReplan(existing, rederived, N)`, Phase 4): phases `< N` are taken **verbatim from the existing lock** (status forced to `built`); phases `>= N` come from the re-derivation. **The freeze is enforced here in pure JS** — it holds no matter what the skeleton agent re-proposed for the built phases. Global fields (stack, concerns, escalationBudget) come from the re-derivation. Validated against the schema like any assembled lock.
+4. **Dropped-must-have gate:** a must-have that existed at phase `>= N` in the OLD lock but is **absent** from the re-derivation (and not deferred) is a **loud blocking `openQuestion`** (`replan-dropped-musthave:` context), not a silent edit — dropping a must-have is a product decision the human must confirm (the lock comes back `incomplete: true`, so `/decompose` refuses it until resolved). `--replan-from 1` (or below) freezes nothing and is a full re-derivation.
 
 ---
 

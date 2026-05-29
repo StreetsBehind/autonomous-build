@@ -50,6 +50,7 @@ Workflow(name: "vision", args: "--vision vision.md")
 
 - Add `--no-file` to dry-run the derivation and inspect the would-be lock + verdict before anything lands.
 - Pass `--skeleton <path>` only when step 3 produced a frozen skeleton to inject a consult decision; otherwise the workflow builds the skeleton headlessly from `vision.md`.
+- **Replan** (epic 0ms): `Workflow(name: "vision", args: "--replan-from N")` is `/replan` — a scoped re-run that **freezes** built phases `< N` and **re-derives** phases `>= N` using the prior build's outcomes + the latest retro. Use it between phases of a phased build (driven by `/orchestrate`). A must-have dropped (not deferred) during the re-cut comes back as a blocking `replan-dropped-musthave` openQuestion — a product decision to confirm at the gate, not a silent edit. Present the revised phase split (`plan.md` §Phases) at the same human gate `/vision` uses.
 
 The workflow returns:
 
