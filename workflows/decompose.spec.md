@@ -71,8 +71,8 @@ Extract the structured feature list and cross-feature deps from the plan. Bootst
    - `bd hooks install`
    - `jankurai adopt . --profile auto --mode observe --out target/jankurai/adoption-plan.json --md target/jankurai/adoption-plan.md`
    - `jankurai init . --level agents --yes` (creates `AGENTS.md` at repo root)
-   - `jankurai audit . --mode advisory --json target/jankurai/repo-score.json --md target/jankurai/repo-score.md`
-   - **Populate the witness baseline so the ratchet is LIVE for the build (lbq.14):** `mkdir -p agent/baselines && cp target/jankurai/repo-score.json agent/baselines/main.repo-score.json` (or `jankurai`'s dedicated baseline-accept command if present), then commit it on its own (`chore: accept initial jankurai witness baseline`). This is the scaffold's score — the floor the build must not regress below. The per-task gate enforces `jankurai witness` only when this file exists; shipping it `{}`/absent left the enforcer advisory during exactly the unattended window. A non-parseable/`{}` score is a FAIL, not an acceptable baseline.
+   - `jankurai audit . --mode advisory --json target/jankurai/repo-score.json --md target/jankurai/repo-score.md` (this **measures** the scaffold score, advisory-only, into the gitignored `target/jankurai/`).
+   - **Do NOT accept a baseline here (igu.2, supersedes lbq.14).** lbq.14 used to auto-stamp this score as `agent/baselines/main.repo-score.json` and commit it *before* the verdict — freezing a never-blessed floor in the unattended window, even on runs that turn out NEEDS-FIX. Baseline acceptance now rides the BLESSED verdict in **Phase 8** (after synthesis): accepted only on BLESSED, after the human-review gate (attended) or with a loud trusted-by-policy note (`--auto-bless` walk-away). This step writes nothing under `agent/`.
 4. Create the app-level epic: `bd create "<appName>" --type=epic --priority=1 --description "See plan.md"`. Capture `appEpicId`.
 5. If `Context.dryRun`, skip steps 3 + 4 (do not mutate bd or filesystem); set `appEpicId='<dry-run>'`.
 
@@ -299,8 +299,15 @@ Aggregate Phase 3–7 outputs, compute the overall verdict, write `decomposeRepo
 2. Compute verdict:
    - **BLESSED** iff: every `PourResult.status == 'ok'` AND `AtomizeSummary.persistentlyOversized.length == 0` AND `AtomizeSummary.unsplittable.length == 0` AND every bead in every `EpicScoreResult.scores` has `score >= 95` AND the quality pass actually covered the beads (`scoredCount > 0` when `totalOpenNonEpic > 0`, and `scoredCount >= totalOpenNonEpic`) AND `FidelityResult.bin == 'pass'` AND `DepAuditResult.cycles.length == 0` AND `DepAuditResult.emptyReady == false`. The "every bead ≥ 95" check is vacuously true on an empty score set, so the coverage clause is load-bearing — a run that scored zero beads is NEEDS-FIX, never a silent pass.
    - **NEEDS-FIX** otherwise. The report explains exactly which condition failed.
-3. Write `decomposeReport.md` in cwd per the schema below.
-4. Return `{ verdict, reportPath, summary }` to the runtime.
+3. **Baseline acceptance** (igu.2, separate `accept-baseline` agent; runs only when `verdict == BLESSED` AND not a dry run). Confidence/`autoChain` are computed *before* this so it knows whether the run is attended or a walk-away:
+   - Capture a fresh **whole-repo** audit straight to the baseline path: `jankurai audit . --json agent/baselines/main.repo-score.json` (full, not `--changed-fast`; its exit code is advisory — nonzero on a sub-85 scaffold is expected). Validate the receipt has a numeric top-level `score`; a `{}`/non-parseable score is a FAIL (the lbq.14 trap), not an acceptable baseline.
+   - Write `agent/audit-policy.toml` from `jankurai govern` (govern emits JSON → translate the recommended `minimum_score`/`fail_on`/`advisory_on`/timebox into TOML). **Documentation/tracking only** — the gate's BLOCK decision reads only the ratchet and ignores this floor (rule 9), so the 85 `minimum_score` never blocks in v1. Best-effort: skip if govern errors.
+   - `.gitignore` care: ensure tracked `agent/` artifacts are NOT swallowed while `target/jankurai/` stays ignored; verify with `git check-ignore`.
+   - Commit the tracked artifacts in their OWN commit (explicit `git add`, never `-A`). **Attended path** (`autoChain == false`): `chore: accept initial jankurai baseline (blessed at decompose)` — the human blesses the floor by reviewing `decomposeReport.md` before `/build-batch`. **Walk-away path** (`autoChain == true`, `--auto-bless`): `chore: accept jankurai baseline [TRUSTED-BY-POLICY, NOT BY HUMAN]` + a conspicuous report note — no human read the report before this floor armed the ratchet; auto-accepted because a never-accepted baseline means a ratchet that never fires in exactly the unattended window.
+   - On a BLESSED run where acceptance fails, the DAG verdict is NOT flipped (the DAG is sound), but `baselineAccepted=false` is recorded and logged loudly — the gate will then SKIP (not block) the ratchet on early beads.
+   - **High-water-mark advance (rule 7)** is owned by the *gate*, not decompose: on a green commit where the new whole-repo score exceeds `baseline_score`, `hooks/post-build-gate.{sh,ps1}` re-stamps the baseline upward (one-way, never lowered; `GATE_RESTAMP=off` suppresses it for build-batch's parallel workers). Decompose only sets the trusted *starting* line.
+4. Write `decomposeReport.md` in cwd per the schema below (includes a "Jankurai baseline" section rendering the acceptance result + trust note).
+5. Return `{ verdict, confidence, autoChain, baselineAccepted, baselineScore, baselineTrustedByPolicy, reportPath, ... }` to the runtime.
 
 ### Report schema
 
@@ -360,6 +367,13 @@ Aggregate Phase 3–7 outputs, compute the overall verdict, write `decomposeRepo
 - Ready set on launch: <count> non-epic beads
 - Implicit conflicts (filesTouched overlap, no dep): <list>
 
+## Jankurai baseline (Phase 8)
+<omit if NEEDS-FIX or dryRun>
+- Baseline accepted: <yes/no> — whole-repo scaffold score <N>/100 (the regression-ratchet starting floor)
+- Trust: <**⚠ TRUSTED-BY-POLICY, NOT BY HUMAN** (auto-accepted on --auto-bless; no human reviewed the floor) | blessed via this human-review gate>
+- Tracking policy (`agent/audit-policy.toml` from `jankurai govern`): <written/skipped> (documentation only; 85 floor never blocks in v1 — rule 9)
+- <if not accepted: **⚠ ratchet NOT armed** — <reason>; gate SKIPs the ratchet on early beads until a baseline exists>
+
 ## Next steps
 <if BLESSED:>
 The DAG is ready. To start the build:
@@ -367,6 +381,7 @@ The DAG is ready. To start the build:
     /build-batch --workers <suggested-N>
 
 Suggested workers: <min(4, ready_count)>. Higher values yield diminishing returns once the merge queue dominates.
+<if baseline trusted-by-policy: ⚠ baseline was auto-accepted WITHOUT human review (--auto-bless); inspect agent/baselines/main.repo-score.json to re-bless the starting line.>
 
 <if NEEDS-FIX:>
 The DAG is not ready. Resolve in this order:
@@ -388,7 +403,7 @@ The write-report agent returns a **structured** object (validated by a schema: `
 ## Run-completion behavior
 
 When the workflow finishes:
-- Returns to the conversation: `{ verdict, confidence, advisoryWarnings, autoChain, suggestedBuildBatch, reportPath, appEpicId, beadCount, failedPhases: [...] }`.
+- Returns to the conversation: `{ verdict, confidence, advisoryWarnings, autoChain, suggestedBuildBatch, baselineAccepted, baselineScore, baselineTrustedByPolicy, reportPath, appEpicId, beadCount, failedPhases: [...] }`.
 - The orchestrator turn prints a one-line summary:
   - BLESSED: `"Decompose: BLESSED (confidence=<high|review-recommended>) — <N> beads under <appEpicId>. <auto-chaining | Run /build-batch when ready>. Report: <path>"`
   - NEEDS-FIX: `"Decompose: NEEDS-FIX — <reason>. Report: <path>"`
@@ -397,6 +412,7 @@ When the workflow finishes:
 
 - **Confidence.** `BLESSED` is mechanical (all phase checks pass). `confidence` adds a second bar: `high` = BLESSED **and** zero advisory warnings (no implicit `filesTouched` conflicts, no missing cross-dep edges); `review-recommended` = BLESSED with advisories present; `n/a` = NEEDS-FIX.
 - **`--auto-bless`.** When passed AND `confidence == 'high'` AND not a dry run, the workflow sets `autoChain: true` and returns `suggestedBuildBatch`. The **orchestrator / calling turn** then runs that build — `/decompose` itself never spawns `/build-batch` (no recursive workflow nesting; "one orchestrator at a time"). A `review-recommended` BLESSED never auto-chains even with `--auto-bless`; it falls back to the human gate. Without the flag, `autoChain` is always `false`.
+- **Baseline trust on the walk-away path (igu.2 / D2).** On `autoChain`, Phase 8's baseline acceptance auto-accepts the scaffold score as the ratchet floor with a loud `[TRUSTED-BY-POLICY, NOT BY HUMAN]` commit + report note (`baselineTrustedByPolicy: true`). On the attended path the same floor is blessed by the human reviewing the report before `/build-batch` (`baselineTrustedByPolicy: false`). Either way the ratchet is armed before the first feature bead builds — the never-accepted-baseline gap lbq.14 reopened is closed.
 
 ---
 
@@ -420,7 +436,7 @@ When the workflow finishes:
 - Do not bless a DAG with `unsplittable` or `persistentlyOversized` beads via a workaround. The seam was genuinely missing or the formula is wrong; escalate, do not improvise.
 - Do not skip Phase 6 cross-check because the pours looked clean. Single-pass coverage checks have a track record of false-positives; the adversarial pattern is the load-bearing reason this workflow exists.
 - Do not call `bd create` outside of `bd mol pour` (T6: formula precedence). If a feature needs a bead the formula library doesn't produce, surface in the report as "Missing formula" and recommend a new formula in `autonomous-build/formulas/` — do not improvise the bead by hand.
-- Do not commit `target/jankurai/` receipts. Phase 2's `jankurai init` adds them to `.gitignore`; verify.
+- Do not commit `target/jankurai/` receipts — they are local generated outputs and must stay `.gitignore`d. The tracked exceptions are the Phase 8 baseline artifacts `agent/baselines/main.repo-score.json` and `agent/audit-policy.toml`, which ARE committed (in their own commit); Phase 8's `.gitignore` care keeps `target/jankurai/` ignored while ensuring `agent/` is not swallowed — verify with `git check-ignore`.
 - Do not auto-invoke `/build-batch` on BLESSED. The human gate between decompose and build is intentional.
 - Do not run Phase 4 atomize on closed beads. The atomize candidate set is scoped to open beads only (a `superseded` bead from a prior iteration is closed by definition).
 

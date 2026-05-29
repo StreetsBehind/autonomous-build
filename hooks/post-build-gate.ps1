@@ -32,6 +32,10 @@
 # Env knobs:
 #   GATE_SCA            on (default) | advisory | off   — software-composition analysis
 #   GATE_COVERAGE_MIN   integer percent (default 0=off) — minimum coverage floor
+#   GATE_RESTAMP        on (default) | off              — Jankurai baseline high-water
+#                       re-stamp on green (rule 7). build-batch's PARALLEL per-worker
+#                       gates set this off so divergent worker branches never collide
+#                       on the shared baseline at merge time; the serial paths advance it.
 
 $ErrorActionPreference = 'Stop'
 
@@ -107,6 +111,7 @@ function Ratchet-Eval {
 if (-not $env:GATE_SCA) { $env:GATE_SCA = "on" }
 $covMin = 0
 if ($env:GATE_COVERAGE_MIN -match '^\d+$') { $covMin = [int]$env:GATE_COVERAGE_MIN }
+if (-not $env:GATE_RESTAMP) { $env:GATE_RESTAMP = "on" }
 
 $failures = @()
 
@@ -329,6 +334,57 @@ if (Get-Command jankurai -ErrorAction SilentlyContinue) {
     }
 } else {
     Write-Host "SKIP: jankurai (not installed — see docs for install)"
+}
+
+# --- Jankurai baseline re-stamp (high-water mark, rule 7 / igu.2) ---
+# On a GREEN commit, advance the trusted baseline UPWARD only. A baseline frozen
+# at decompose-time goes stale: once the app climbs to 80, a regression 80->70
+# still reads as +N vs the frozen ~44 and the ratchet dies. Re-stamping the
+# baseline up keeps the high-water mark current and bounds cumulative drift to
+# TOLERANCE against the peak (not TOLERANCE * commits). ONE-WAY: never lowers the
+# baseline — the human/policy blessed the STARTING line; the machine only ratchets
+# it up. Best-effort: a re-stamp failure NEVER blocks an already-green commit.
+#
+# App-mode only (gated on baseline presence — meta mode never has one). Skipped by
+# build-batch's PARALLEL per-worker gates (GATE_RESTAMP=off): parallel workers
+# committing the shared baseline on divergent branches would collide at merge time
+# and block good beads. The serial paths own the advance — build-next's gate (one
+# bead per tick) and build-batch's serialized post-merge gate on main.
+$restampBaseline = "agent/baselines/main.repo-score.json"
+if (($env:GATE_RESTAMP -ne "off") -and ($failures.Count -eq 0) -and
+    (Get-Command jankurai -ErrorAction SilentlyContinue) -and (Test-Path $restampBaseline)) {
+    Write-Host "=== jankurai baseline re-stamp (high-water mark) ==="
+    $restampCur = "target/jankurai/repo-score-current.json"
+    New-Item -ItemType Directory -Force -Path "target/jankurai" | Out-Null
+    # Fresh WHOLE-REPO audit (not --changed-fast): the baseline is a whole-repo
+    # artifact, so the comparison must be whole-repo to whole-repo. Exit code is
+    # advisory here (nonzero on a sub-85 tree is expected); we read `score`.
+    Start-Process -FilePath "pwsh" -ArgumentList "-NoProfile", "-Command", "jankurai audit . --json $restampCur" -NoNewWindow -PassThru -Wait | Out-Null
+    if (Test-Path $restampCur) {
+        $bScore = $null; $cScore = $null
+        try { $bScore = (Get-Content $restampBaseline -Raw | ConvertFrom-Json).score } catch {}
+        try { $cScore = (Get-Content $restampCur     -Raw | ConvertFrom-Json).score } catch {}
+        $bNum = ($bScore -is [int] -or $bScore -is [double] -or $bScore -is [long])
+        $cNum = ($cScore -is [int] -or $cScore -is [double] -or $cScore -is [long])
+        if (-not $bNum) {
+            Write-Host "SKIP: re-stamp (baseline score unreadable)"
+        } elseif (-not $cNum) {
+            Write-Host "SKIP: re-stamp (current score unreadable)"
+        } elseif ($cScore -gt $bScore) {
+            Copy-Item $restampCur $restampBaseline -Force
+            git add $restampBaseline 2>$null | Out-Null
+            git commit -q -m "chore: ratchet jankurai baseline upward ($bScore->$cScore)" 2>$null | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host "RE-STAMP: baseline advanced $bScore->$cScore (committed)"
+            } else {
+                Write-Host "RE-STAMP: baseline advanced $bScore->$cScore (file updated; commit skipped — no git identity or nothing to commit)"
+            }
+        } else {
+            Write-Host "SKIP: re-stamp (hold $cScore<=$bScore — baseline is monotonic, never lowered)"
+        }
+    } else {
+        Write-Host "SKIP: re-stamp (whole-repo audit produced no receipt)"
+    }
 }
 
 if ($failures.Count -gt 0) {

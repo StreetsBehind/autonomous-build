@@ -37,6 +37,10 @@
 # Env knobs:
 #   GATE_SCA            on (default) | advisory | off   — software-composition analysis
 #   GATE_COVERAGE_MIN   integer percent (default 0=off) — minimum coverage floor
+#   GATE_RESTAMP        on (default) | off              — Jankurai baseline high-water
+#                       re-stamp on green (rule 7). build-batch's PARALLEL per-worker
+#                       gates set this off so divergent worker branches never collide
+#                       on the shared baseline at merge time; the serial paths advance it.
 
 set -uo pipefail
 
@@ -48,6 +52,7 @@ runner=""   # Python runner prefix ("uv run "/"poetry run "/""), set in Python b
 GATE_SCA="${GATE_SCA:-on}"
 GATE_COVERAGE_MIN="${GATE_COVERAGE_MIN:-0}"
 case "$GATE_COVERAGE_MIN" in (''|*[!0-9]*) GATE_COVERAGE_MIN=0 ;; esac
+GATE_RESTAMP="${GATE_RESTAMP:-on}"
 
 # run_sca <name> <command> — software-composition analysis with severity gating.
 # Honors GATE_SCA: off skips entirely, advisory warns without failing, on hard-fails.
@@ -367,6 +372,63 @@ if has_cmd jankurai; then
   fi
 else
   echo "SKIP: jankurai (not installed — see docs for install)"
+fi
+
+# --- Jankurai baseline re-stamp (high-water mark, rule 7 / igu.2) ---
+# On a GREEN commit, advance the trusted baseline UPWARD only. A baseline frozen
+# at decompose-time goes stale: once the app climbs to 80, a regression 80->70
+# still reads as +N vs the frozen ~44 and the ratchet dies. Re-stamping the
+# baseline up keeps the high-water mark current and bounds cumulative drift to
+# TOLERANCE against the peak (not TOLERANCE * commits). ONE-WAY: never lowers the
+# baseline — the human/policy blessed the STARTING line; the machine only ratchets
+# it up. Best-effort: a re-stamp failure NEVER blocks an already-green commit.
+#
+# App-mode only (gated on baseline presence — meta mode never has one). Skipped by
+# build-batch's PARALLEL per-worker gates (GATE_RESTAMP=off): parallel workers
+# committing the shared baseline on divergent branches would collide at merge time
+# and block good beads. The serial paths own the advance — build-next's gate (one
+# bead per tick) and build-batch's serialized post-merge gate on main.
+restamp_baseline="agent/baselines/main.repo-score.json"
+if [ "$GATE_RESTAMP" != "off" ] \
+   && [ "${#failures[@]}" -eq 0 ] \
+   && has_cmd jankurai \
+   && has_cmd python3 \
+   && [ -f "$restamp_baseline" ]; then
+  echo "=== jankurai baseline re-stamp (high-water mark) ==="
+  restamp_cur="target/jankurai/repo-score-current.json"
+  mkdir -p target/jankurai
+  # Fresh WHOLE-REPO audit (not --changed-fast): the baseline is a whole-repo
+  # artifact, so the comparison must be whole-repo to whole-repo. Exit code is
+  # advisory here (nonzero on a sub-85 tree is expected); we read `score`.
+  jankurai audit . --json "$restamp_cur" >/dev/null 2>&1 || true
+  if [ -f "$restamp_cur" ]; then
+    restamp_msg="$(python3 - "$restamp_baseline" "$restamp_cur" <<'PY'
+import json, sys
+def score(p):
+    try: return json.load(open(p)).get("score")
+    except Exception: return None
+b, c = score(sys.argv[1]), score(sys.argv[2])
+if not isinstance(b, (int, float)) or isinstance(b, bool): print("baseline score unreadable"); sys.exit(2)
+if not isinstance(c, (int, float)) or isinstance(c, bool): print("current score unreadable"); sys.exit(2)
+print(f"{b}->{c}" if c > b else f"hold {c}<={b}"); sys.exit(0 if c > b else 1)
+PY
+)"; restamp_rc=$?
+    case "$restamp_rc" in
+      0)
+        cp "$restamp_cur" "$restamp_baseline"
+        if git add "$restamp_baseline" >/dev/null 2>&1 \
+           && git commit -q -m "chore: ratchet jankurai baseline upward ($restamp_msg)" >/dev/null 2>&1; then
+          echo "RE-STAMP: baseline advanced $restamp_msg (committed)"
+        else
+          echo "RE-STAMP: baseline advanced $restamp_msg (file updated; commit skipped — no git identity or nothing to commit)"
+        fi
+        ;;
+      1) echo "SKIP: re-stamp ($restamp_msg — baseline is monotonic, never lowered)" ;;
+      *) echo "SKIP: re-stamp ($restamp_msg)" ;;
+    esac
+  else
+    echo "SKIP: re-stamp (whole-repo audit produced no receipt)"
+  fi
 fi
 
 if [ "${#failures[@]}" -gt 0 ]; then

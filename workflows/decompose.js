@@ -10,6 +10,7 @@ export const meta = {
     { title: 'Quality scoring',      detail: 'Per-epic agent scores every child against the buildability rubric' },
     { title: 'Fidelity cross-check', detail: 'Three independent verifiers (plan→dag, dag→plan, must-have→dag) + reconciler' },
     { title: 'Dep audit',            detail: 'Cycles, ready-set sanity, implicit conflicts, cross-deps applied' },
+    { title: 'Baseline',             detail: 'On BLESSED: accept scaffold jankurai baseline (loud auto-accept on --auto-bless)' },
     { title: 'Synthesis',            detail: 'Aggregate, compute verdict, write decomposeReport.md' }
   ]
 };
@@ -163,7 +164,7 @@ Steps:
    e. \`jankurai adopt . --profile auto --mode observe --out target/jankurai/adoption-plan.json --md target/jankurai/adoption-plan.md\`
    f. \`jankurai init . --level agents --yes\`
    g. \`jankurai audit . --mode advisory --json target/jankurai/repo-score.json --md target/jankurai/repo-score.md\`
-   h. **Populate the witness baseline so the ratchet is LIVE during the build (lbq.14).** The per-task gate only enforces \`jankurai witness\` if \`agent/baselines/main.repo-score.json\` exists; shipping it empty/absent leaves the marquee enforcer advisory-only during exactly the unattended window. So promote the freshly-measured score to the baseline: \`mkdir -p agent/baselines\` then copy the audit output to it — \`cp target/jankurai/repo-score.json agent/baselines/main.repo-score.json\` (if jankurai has a dedicated \`jankurai baseline accept\`/\`witness --write-baseline\` command, prefer that; otherwise the copy is the baseline). This is the scaffold's score — the floor the build must not regress below. **Commit it in its own commit** (\`git add agent/baselines/main.repo-score.json && git commit -m "chore: accept initial jankurai witness baseline"\`) so the ratchet is in place before the first feature bead builds. If the audit produced no parseable score (e.g. \`{}\`), FAIL — a \`{}\` baseline is the bug, not an acceptable state.
+   h. **Do NOT accept a baseline here (superseded by igu.2).** Step (g) only *measures* the scaffold score (advisory, into the gitignored \`target/jankurai/\`). lbq.14 used to auto-stamp that score as \`agent/baselines/main.repo-score.json\` and commit it *before* the verdict — freezing a never-blessed floor in exactly the unattended window, on runs that might be NEEDS-FIX. Baseline acceptance now rides the BLESSED verdict: the dedicated Baseline phase (Phase 8, after synthesis) accepts it only on a BLESSED run, after a human-review gate (attended) or with a loud trusted-by-policy note (\`--auto-bless\` walk-away). Leave \`target/jankurai/repo-score.json\` on disk for that phase; do not write or commit anything under \`agent/\` in this step.
 3. Create the app-level epic (skip if Context.dryRun): \`bd create "${Context.appName}" --type=epic --priority=1 --description "See plan.md"\`. Capture the returned ID.
 4. If Context.dryRun, set appEpicId to "<dry-run>".
 
@@ -884,9 +885,9 @@ Return JSON:
 log(`Dep audit: cycles=${(DepAuditResult?.cycles || []).length}, emptyReady=${DepAuditResult?.emptyReady}, implicitConflicts=${(DepAuditResult?.implicitConflicts || []).length}`);
 
 // ---------------------------------------------------------------------------
-// Phase 8 — Synthesis & verdict (sequential, 1 agent)
+// Phase 8 — Synthesis & verdict (verdict + autoChain in JS, then the Baseline
+// phase, then the write-report agent under the Synthesis phase).
 // ---------------------------------------------------------------------------
-phase('Synthesis');
 
 // Verdict computation — done in JS so it's mechanical and auditable.
 // allBeadsAt95 alone is not enough: `every()` is vacuously true on an empty
@@ -916,12 +917,146 @@ const blessed =
 
 const verdict = blessed ? 'BLESSED' : 'NEEDS-FIX';
 
+// ---------------------------------------------------------------------------
+// Confidence + auto-chain (lbq.1) — computed BEFORE baseline acceptance + the
+// report so both can see whether this is an attended run or an --auto-bless
+// walk-away. BLESSED is mechanical; "high confidence" additionally means zero
+// advisory warnings (no implicit filesTouched conflicts, no missing cross-dep
+// edges). A BLESSED-with-advisories never auto-chains even under --auto-bless —
+// the human-review gate stays the DEFAULT; --auto-bless is the opt-in that lets
+// a clean BLESSED flow straight into the build. decompose does NOT spawn
+// /build-batch itself (no recursive workflow nesting) — it emits the signal.
+// ---------------------------------------------------------------------------
+const advisoryWarnings =
+  (DepAuditResult?.implicitConflicts || []).length +
+  (DepAuditResult?.missingCrossDeps || []).length;
+const confidence = !blessed ? 'n/a' : (advisoryWarnings === 0 ? 'high' : 'review-recommended');
+const autoChain = parsedArgs.autoBless && confidence === 'high' && !Context.dryRun;
+// beadCount proxies the ready non-epic beads at launch; the worker count is a hint.
+const blessedBeadCount = pourOk.reduce((n, r) => n + (r.children?.length || 0), 0);
+const suggestedWorkers = Math.min(4, Math.max(1, blessedBeadCount || 1));
+const suggestedBuildBatch = `/build-batch --workers ${suggestedWorkers}`;
+
+// ---------------------------------------------------------------------------
+// Baseline acceptance (igu.2, supersedes lbq.14 / D2 + rule 7).
+// The Jankurai regression ratchet in hooks/post-build-gate.{sh,ps1} only fires
+// when agent/baselines/main.repo-score.json exists. We accept the scaffold's
+// whole-repo audit as that baseline — but ONLY on a BLESSED verdict (a never-
+// blessed floor was the lbq.14 bug) and ONLY when not a dry run. On the attended
+// path the human blesses the floor by reviewing decomposeReport.md before running
+// /build-batch; on the --auto-bless walk-away path (autoChain) we auto-accept and
+// record a conspicuous "trusted-by-policy, not by human" note, because a never-
+// accepted baseline means a ratchet that never fires in exactly the unattended
+// window we are trying to protect.
+// ---------------------------------------------------------------------------
+phase('Baseline');
+
+const baselineSchema = {
+  type: 'object',
+  required: ['status', 'accepted'],
+  properties: {
+    status:          { enum: ['ok', 'failed'] },
+    accepted:        { type: 'boolean' },
+    baselineScore:   { type: ['number', 'null'] },
+    trustedByPolicy: { type: 'boolean' },
+    policyWritten:   { type: 'boolean' },
+    note:            { type: ['string', 'null'] },
+    failedReason:    { type: ['string', 'null'] }
+  }
+};
+
+let baselineResult = {
+  status: 'ok',
+  accepted: false,
+  baselineScore: null,
+  trustedByPolicy: false,
+  policyWritten: false,
+  note: null,
+  failedReason: blessed ? (Context.dryRun ? 'dry run — no baseline written' : null) : 'verdict NEEDS-FIX — no baseline accepted'
+};
+
+if (blessed && !Context.dryRun) {
+  baselineResult = await agent(`
+You are the baseline-acceptance agent for /decompose Phase 8. You run ONLY on a BLESSED verdict. (Self-contained: all instructions are inline; you run in the app repo cwd, where the workflow spec is not present — do NOT try to read workflows/decompose.spec.md.)
+
+Context:
+- App: ${Context.appName}
+- Path: ${autoChain
+    ? 'WALK-AWAY (--auto-bless, high-confidence BLESSED). NO human will read decomposeReport.md before this baseline becomes the regression-ratchet floor.'
+    : 'ATTENDED. A human reviews decomposeReport.md and blesses the floor by choosing to run /build-batch; this run does not auto-chain.'}
+
+Goal: accept the scaffold's whole-repo Jankurai audit as agent/baselines/main.repo-score.json — the trusted starting floor the build must not regress below. This happens AFTER the BLESSED verdict (superseding lbq.14, which froze a never-blessed floor before the verdict).
+
+Steps:
+1. \`mkdir -p agent/baselines target/jankurai\`.
+2. Capture a fresh WHOLE-REPO audit straight to the baseline path:
+   \`jankurai audit . --json agent/baselines/main.repo-score.json --md target/jankurai/repo-score.md\`
+   This is a full audit (NOT --changed-fast). Its EXIT CODE may be nonzero on a sub-85 scaffold — that is EXPECTED and is NOT a failure here; you only need the receipt on disk.
+3. Validate the receipt: it must parse as JSON and have a numeric top-level \`score\` field. If it is \`{}\` or has no numeric score, that is the bug lbq.14 warned about — return { "status": "failed", "accepted": false, "failedReason": "baseline audit produced no parseable score" }. Capture the numeric score as baselineScore.
+4. Write the tracking policy from \`jankurai govern\` (documentation only — JANKURAI_GATING_PROPOSAL rule 9: the gate's BLOCK decision reads only the ratchet and IGNORES this floor, so the 85 minimum_score never blocks in v1):
+   a. \`jankurai govern . --out target/jankurai/govern-policy.json\` (govern emits JSON).
+   b. Read that JSON and translate its recommended policy into \`agent/audit-policy.toml\` as valid TOML, with this exact header comment block then the keys from the govern JSON (minimum_score, fail_on, advisory_on, and the exception timebox days from exception_policy.timebox_days):
+\`\`\`toml
+# agent/audit-policy.toml — derived from \`jankurai govern\` at /decompose (igu.2).
+# TRACKING / DOCUMENTATION ONLY. The post-build gate's BLOCK decision reads only
+# the ratchet (score_delta / new_hard_findings / new_caps) and IGNORES this
+# minimum_score floor (docs/JANKURAI_GATING_PROPOSAL.md rule 9). Do NOT wire the
+# floor into the gate without revisiting that decision — a flat 85 floor deadlocks
+# a sub-85 scaffold (the lbq.14 / witness trap).
+minimum_score = <govern.minimum_score>
+fail_on = [<govern.fail_on quoted>]
+advisory_on = [<govern.advisory_on quoted>]
+exception_timebox_days = <govern.exception_policy.timebox_days>
+\`\`\`
+   c. If \`jankurai govern\` is unavailable or errors, SKIP the policy (set policyWritten=false) — it is non-blocking. Otherwise set policyWritten=true.
+5. .gitignore care: the tracked artifacts under \`agent/\` must NOT be swallowed, while \`target/jankurai/\` (generated receipts) MUST stay ignored. Ensure cwd \`.gitignore\` ignores \`target/\` (or at minimum \`target/jankurai/\`). If any pattern would ignore \`agent/\` (e.g. a broad \`agent\` or \`*/\` rule), add an explicit negation (\`!agent/\`, \`!agent/baselines/\`, \`!agent/audit-policy.toml\`). VERIFY with git: \`git check-ignore agent/baselines/main.repo-score.json agent/audit-policy.toml\` must report NEITHER as ignored, and \`git check-ignore target/jankurai/repo-score.md\` MUST report it ignored. Fix .gitignore until both hold.
+6. Commit the tracked baseline artifacts in their OWN commit, staging EXPLICITLY (never \`git add -A\`/\`--all\`):
+   \`git add agent/baselines/main.repo-score.json .gitignore\` (and \`git add agent/audit-policy.toml\` if written).
+   Commit message depends on the path:
+   ${autoChain ? `   WALK-AWAY path — use a HEREDOC body and the loud marker:
+       chore: accept jankurai baseline [TRUSTED-BY-POLICY, NOT BY HUMAN]
+
+       Auto-accepted on the --auto-bless walk-away path: NO human read
+       decomposeReport.md before this score-<N> whole-repo baseline became the
+       regression-ratchet floor for the build. Trusted by policy, not by review.
+       Re-inspect agent/baselines/main.repo-score.json if this run is later audited.
+   Set note to "[TRUSTED-BY-POLICY, NOT BY HUMAN] baseline auto-accepted at score <N> on the --auto-bless walk-away path" and trustedByPolicy=true.`
+    : `   ATTENDED path:
+       chore: accept initial jankurai baseline (blessed at decompose)
+
+       Whole-repo scaffold score <N> accepted as the regression-ratchet starting
+       floor. Blessed via the /decompose human-review gate (verdict BLESSED): the
+       human blesses this floor by reviewing decomposeReport.md before /build-batch.
+   Set note to null and trustedByPolicy=false.`}
+   If the commit fails (no git identity / nothing staged), do NOT crash — set accepted=true only if the file exists; capture the git error in failedReason but still return status "ok" with accepted reflecting whether agent/baselines/main.repo-score.json is on disk (a written-but-uncommitted baseline is still better than none).
+7. Return: { "status": "ok", "accepted": true, "baselineScore": <N>, "trustedByPolicy": ${autoChain}, "policyWritten": <bool>, "note": <string|null>, "failedReason": <string|null> }.
+
+On an unrecoverable error (audit unparseable per step 3): return { "status": "failed", "accepted": false, "failedReason": "<message>" }. Do not swallow exceptions (T7).
+`, { label: 'accept-baseline', phase: 'Baseline', schema: baselineSchema, agentType: 'general-purpose' });
+}
+
+// Loud surfacing: a BLESSED DAG whose baseline could not be accepted means the
+// ratchet won't be live for the first beads (the exact gap igu reopens). We do
+// NOT retroactively flip the DAG verdict (the DAG itself is sound), but we record
+// and log it so the report and the orchestrator can see the ratchet is not armed.
+const baselineAccepted = !!baselineResult?.accepted;
+if (blessed && !Context.dryRun && !baselineAccepted) {
+  log(`[WARN] BLESSED but baseline NOT accepted (${baselineResult?.failedReason || 'unknown'}) — the Jankurai ratchet will SKIP (not block) on early beads until a baseline exists.`);
+} else if (baselineAccepted) {
+  log(`[BASELINE] accepted at score ${baselineResult?.baselineScore ?? '?'}${baselineResult?.trustedByPolicy ? ' [TRUSTED-BY-POLICY, NOT BY HUMAN — --auto-bless walk-away]' : ' (blessed at decompose)'}`);
+}
+
+phase('Synthesis');
+
 const synthesisPayload = {
   appName: Context.appName,
   appEpicId: ParsedPlan.appEpicId,
   planSource: Context.planSource,
   dryRun: Context.dryRun,
   verdict,
+  confidence,
+  autoChain,
+  baseline: { ...baselineResult, accepted: baselineAccepted },
   pours: { ok: pourOk, failed: pourFailed },
   concernEnforcement,
   atomize: AtomizeSummary,
@@ -1031,6 +1166,14 @@ Steps:
 - Ready set on launch: <count> non-epic beads
 - Implicit conflicts (filesTouched overlap, no dep): <list>
 
+## Jankurai baseline (Phase 8)
+<render from baseline; omit this whole section if verdict is NEEDS-FIX or dryRun>
+- Baseline accepted: <baseline.accepted — yes/no>
+- Whole-repo scaffold score: <baseline.baselineScore>/100 (the regression-ratchet starting floor; the build must not regress below it — see hooks/post-build-gate)
+- Trust: <if baseline.trustedByPolicy: **⚠ TRUSTED-BY-POLICY, NOT BY HUMAN** — auto-accepted on the --auto-bless walk-away path; no human reviewed this floor before it armed the ratchet. else: blessed via this human-review gate (you bless it by proceeding to /build-batch).>
+- Tracking policy (agent/audit-policy.toml from \`jankurai govern\`): <baseline.policyWritten — written/skipped> (documentation only; its 85 floor never blocks in v1 — ratchet rule 9)
+- <if baseline.accepted is false: **⚠ ratchet NOT armed** — <baseline.failedReason>; the gate will SKIP (not block) the ratchet on early beads until a baseline exists>
+
 ## Next steps
 <if BLESSED:>
 The DAG is ready. To start the build:
@@ -1038,6 +1181,7 @@ The DAG is ready. To start the build:
     /build-batch --workers <suggested-N>
 
 Suggested workers: <min(4, ready_count)>. Higher values yield diminishing returns once the merge queue dominates.
+<if baseline.trustedByPolicy: ⚠ This run auto-accepted the Jankurai baseline WITHOUT human review (--auto-bless). The score-<N> floor now arms the regression ratchet for the whole build — glance at agent/baselines/main.repo-score.json if you want to re-bless the starting line.>
 <if confidence == 'high'>: This is a HIGH-confidence BLESSED (no advisory warnings). Re-running /decompose with `--auto-bless` (or driving via the orchestrator) would chain straight into the build without stopping here — use it for a true walk-away run.
 <if confidence == 'review-recommended'>: BLESSED, but advisory warnings are present (implicit conflicts / missing cross-deps below) — `--auto-bless` deliberately will NOT auto-chain this; glance at the warnings first.
 
@@ -1067,28 +1211,9 @@ if (!reportResult || reportResult.status !== 'ok' || !reportResult.reportPath) {
 }
 
 // ---------------------------------------------------------------------------
-// Confidence + auto-chain (lbq.1)
-// BLESSED is mechanical; "high confidence" additionally means zero advisory
-// warnings — no implicit filesTouched conflicts and no missing cross-dep edges.
-// A BLESSED-with-advisories is still worth a human glance, so it never
-// auto-chains even under --auto-bless. The human-review gate stays the DEFAULT;
-// --auto-bless is the opt-in that lets a clean BLESSED flow straight into the
-// build so a walk-away run actually produces app code. decompose does NOT spawn
-// /build-batch itself (no recursive workflow nesting) — it emits the signal and
-// the orchestrator / calling turn runs the build.
-// ---------------------------------------------------------------------------
-const advisoryWarnings =
-  (DepAuditResult?.implicitConflicts || []).length +
-  (DepAuditResult?.missingCrossDeps || []).length;
-const confidence = !blessed ? 'n/a' : (advisoryWarnings === 0 ? 'high' : 'review-recommended');
-const autoChain = parsedArgs.autoBless && confidence === 'high' && !Context.dryRun;
-// beadCount proxies the ready non-epic beads at launch; the worker count is a hint.
-const blessedBeadCount = pourOk.reduce((n, r) => n + (r.children?.length || 0), 0);
-const suggestedWorkers = Math.min(4, Math.max(1, blessedBeadCount || 1));
-const suggestedBuildBatch = `/build-batch --workers ${suggestedWorkers}`;
-
-// ---------------------------------------------------------------------------
 // Return final result to runtime
+// (confidence / autoChain / advisoryWarnings / suggested* were computed before
+// the Baseline phase so the baseline-accept agent and the report could see them.)
 // ---------------------------------------------------------------------------
 const finalResult = {
   verdict,
@@ -1096,6 +1221,9 @@ const finalResult = {
   advisoryWarnings,
   autoChain,                  // true only when --auto-bless AND high-confidence BLESSED
   suggestedBuildBatch,        // the command the orchestrator/turn should run on autoChain
+  baselineAccepted,           // false when NEEDS-FIX/dry-run, or when accept failed on a BLESSED run
+  baselineScore: baselineResult?.baselineScore ?? null,
+  baselineTrustedByPolicy: !!baselineResult?.trustedByPolicy,  // --auto-bless walk-away: no human blessed the floor
   reportPath: reportResult?.reportPath || null,
   appEpicId: ParsedPlan.appEpicId,
   beadCount: pourOk.reduce((n, r) => n + (r.children?.length || 0), 0),
@@ -1115,6 +1243,9 @@ const finalResult = {
 log(`Decompose ${verdict} (confidence=${confidence}, advisories=${advisoryWarnings}) — ${finalResult.beadCount} beads, report=${finalResult.reportPath}`);
 if (autoChain) {
   log(`[AUTO-BLESS] high-confidence BLESSED + --auto-bless → orchestrator should chain into: ${suggestedBuildBatch}`);
+  if (baselineResult?.trustedByPolicy) {
+    log(`[AUTO-BLESS] baseline auto-accepted at score ${baselineResult?.baselineScore ?? '?'} [TRUSTED-BY-POLICY, NOT BY HUMAN] — no human reviewed the ratchet floor`);
+  }
 } else if (verdict === 'BLESSED') {
   log(`[GATE] BLESSED${confidence === 'review-recommended' ? ' (review recommended — advisory warnings present)' : ''} — human gate: review ${finalResult.reportPath}, then run ${suggestedBuildBatch}${parsedArgs.autoBless ? ' (--auto-bless did not chain: advisory warnings present)' : ''}`);
 }

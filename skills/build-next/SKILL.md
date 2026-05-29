@@ -202,7 +202,7 @@ if (-not (Test-Path $gate)) { $gate = Join-Path (Resolve-Path "../autonomous-bui
 pwsh -NoProfile -File $gate
 ```
 
-Exits 0 on green, nonzero with summary on red. The gate now includes a Jankurai pass: `jankurai audit --changed-fast` (advisory — prints findings, does not fail the gate by itself) and `jankurai witness` against `agent/baselines/main.repo-score.json` if that baseline exists (hard fail on regression).
+Exits 0 on green, nonzero with summary on red. The gate's Jankurai pass is: `jankurai audit --changed-fast` (advisory — prints findings, does not fail the gate by itself) plus a **regression-only ratchet** parsed from the audit receipt's `decision.ratchet` (igu.1, supersedes the old `jankurai witness` exit-code gate) — it hard-fails only on `score_delta < -TOLERANCE`, new hard findings, or new caps, and only when `agent/baselines/main.repo-score.json` exists. On a **green** commit in app mode (baseline present), the gate may also **re-stamp the baseline upward** (high-water mark, igu.2) — a one-way advance that creates its own `chore: ratchet jankurai baseline upward (...)` commit. The serial build-next path leaves the re-stamp on; only build-batch's parallel workers disable it (`GATE_RESTAMP=off`).
 
 On red — the retry budget is **not** a hardcoded "once" (that biases surviving output toward easy beads and strands hard, load-bearing ones, lbq.19). Compute the gate-attempt budget for this bead:
 
