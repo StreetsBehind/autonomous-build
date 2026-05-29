@@ -40,7 +40,6 @@ version = 1
 
 [vars.grammar_version]
 description = "Closed-grammar version this scaffold targets (composer/grammar/v{N}/ directory). Phase 1 ships v1; Phase 4 reopens boot.rs to add additional version arms inside the same locked-signature fn. Integer only — appears in paths and in match arms."
-required = true
 default = "1"
 
 [vars.cache_ttl_secs]
