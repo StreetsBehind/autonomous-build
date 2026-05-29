@@ -13,8 +13,12 @@ plan.md + plan.lock.json  ──/decompose──▶  blessed beads DAG (epics + 
     Subsumes the old /compose + /quality-pass + /split skills.)
    tenets.md ─ read by /build-next for build-time judgment calls
                                   │
-                          human review
-                   (authorize the blessed DAG before build)
+                      human review  ◀─ DEFAULT gate
+            (authorize the blessed DAG before build)
+                                  │
+        ┄┄┄ /decompose --auto-bless ┄┄┄▶ on a HIGH-confidence BLESSED
+            (no advisory warnings) the orchestrator chains straight
+            through this gate into the build — opt-in, for walk-away runs
                                   │
                                   ▼
         ┌──── /build-batch  (or /loop /build-next) ────┐

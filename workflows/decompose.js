@@ -30,12 +30,16 @@ const parsedArgs = parseArgs(rawArgs);
 log(`decompose args: ${JSON.stringify(parsedArgs)}`);
 
 function parseArgs(s) {
-  const out = { plan: 'plan.md', dryRun: false };
+  const out = { plan: 'plan.md', dryRun: false, autoBless: false };
   if (!s) return out;
   const tokens = (typeof s === 'string') ? s.trim().split(/\s+/).filter(Boolean) : (Array.isArray(s) ? s : []);
   for (let i = 0; i < tokens.length; i++) {
     if (tokens[i] === '--plan' && tokens[i + 1]) { out.plan = tokens[++i]; }
     else if (tokens[i] === '--no-file') { out.dryRun = true; }
+    // --auto-bless: opt-in. On a HIGH-confidence BLESSED (no advisory warnings),
+    // signal auto-chain into /build-batch instead of stopping at the human gate.
+    // Default (flag absent) keeps the human-review gate. (lbq.1)
+    else if (tokens[i] === '--auto-bless') { out.autoBless = true; }
   }
   return out;
 }
@@ -1000,6 +1004,8 @@ The DAG is ready. To start the build:
     /build-batch --workers <suggested-N>
 
 Suggested workers: <min(4, ready_count)>. Higher values yield diminishing returns once the merge queue dominates.
+<if confidence == 'high'>: This is a HIGH-confidence BLESSED (no advisory warnings). Re-running /decompose with `--auto-bless` (or driving via the orchestrator) would chain straight into the build without stopping here — use it for a true walk-away run.
+<if confidence == 'review-recommended'>: BLESSED, but advisory warnings are present (implicit conflicts / missing cross-deps below) — `--auto-bless` deliberately will NOT auto-chain this; glance at the warnings first.
 
 <if NEEDS-FIX:>
 The DAG is not ready. Resolve in this order:
@@ -1027,10 +1033,35 @@ if (!reportResult || reportResult.status !== 'ok' || !reportResult.reportPath) {
 }
 
 // ---------------------------------------------------------------------------
+// Confidence + auto-chain (lbq.1)
+// BLESSED is mechanical; "high confidence" additionally means zero advisory
+// warnings — no implicit filesTouched conflicts and no missing cross-dep edges.
+// A BLESSED-with-advisories is still worth a human glance, so it never
+// auto-chains even under --auto-bless. The human-review gate stays the DEFAULT;
+// --auto-bless is the opt-in that lets a clean BLESSED flow straight into the
+// build so a walk-away run actually produces app code. decompose does NOT spawn
+// /build-batch itself (no recursive workflow nesting) — it emits the signal and
+// the orchestrator / calling turn runs the build.
+// ---------------------------------------------------------------------------
+const advisoryWarnings =
+  (DepAuditResult?.implicitConflicts || []).length +
+  (DepAuditResult?.missingCrossDeps || []).length;
+const confidence = !blessed ? 'n/a' : (advisoryWarnings === 0 ? 'high' : 'review-recommended');
+const autoChain = parsedArgs.autoBless && confidence === 'high' && !Context.dryRun;
+// beadCount proxies the ready non-epic beads at launch; the worker count is a hint.
+const blessedBeadCount = pourOk.reduce((n, r) => n + (r.children?.length || 0), 0);
+const suggestedWorkers = Math.min(4, Math.max(1, blessedBeadCount || 1));
+const suggestedBuildBatch = `/build-batch --workers ${suggestedWorkers}`;
+
+// ---------------------------------------------------------------------------
 // Return final result to runtime
 // ---------------------------------------------------------------------------
 const finalResult = {
   verdict,
+  confidence,                 // 'high' | 'review-recommended' | 'n/a'
+  advisoryWarnings,
+  autoChain,                  // true only when --auto-bless AND high-confidence BLESSED
+  suggestedBuildBatch,        // the command the orchestrator/turn should run on autoChain
   reportPath: reportResult?.reportPath || null,
   appEpicId: ParsedPlan.appEpicId,
   beadCount: pourOk.reduce((n, r) => n + (r.children?.length || 0), 0),
@@ -1047,5 +1078,10 @@ const finalResult = {
   ].filter(Boolean)
 };
 
-log(`Decompose ${verdict} — ${finalResult.beadCount} beads, report=${finalResult.reportPath}`);
+log(`Decompose ${verdict} (confidence=${confidence}, advisories=${advisoryWarnings}) — ${finalResult.beadCount} beads, report=${finalResult.reportPath}`);
+if (autoChain) {
+  log(`[AUTO-BLESS] high-confidence BLESSED + --auto-bless → orchestrator should chain into: ${suggestedBuildBatch}`);
+} else if (verdict === 'BLESSED') {
+  log(`[GATE] BLESSED${confidence === 'review-recommended' ? ' (review recommended — advisory warnings present)' : ''} — human gate: review ${finalResult.reportPath}, then run ${suggestedBuildBatch}${parsedArgs.autoBless ? ' (--auto-bless did not chain: advisory warnings present)' : ''}`);
+}
 return finalResult;

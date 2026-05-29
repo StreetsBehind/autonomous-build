@@ -29,6 +29,7 @@ The workflow accepts these arguments (parsed from the `/decompose` invocation; a
 | --- | --- | --- |
 | `--plan <path>` | `plan.md` in cwd | Path to plan.md. `plan.lock.json` is resolved next to it. |
 | `--no-file` | false | Dry-run: skip Phase 3 pours and Phase 4 mutations; emit the report describing what *would* be poured. Used for spec changes the human wants to inspect before mutating bd. |
+| `--auto-bless` | false | Opt-in: on a **high-confidence** BLESSED (no advisory warnings), set `autoChain: true` so the orchestrator chains straight into `/build-batch` instead of stopping at the human-review gate. Never auto-chains a `review-recommended` BLESSED or a dry run. See "Run-completion behavior". |
 
 The workflow expects to run **in the app repo's root**, not in `autonomous-build`. There is no `--self` analog for decompose — there is no plan.md for the workflow repo itself.
 
@@ -384,12 +385,15 @@ The write-report agent returns a **structured** object (validated by a schema: `
 ## Run-completion behavior
 
 When the workflow finishes:
-- Returns to the conversation: `{ verdict: 'BLESSED' | 'NEEDS-FIX', reportPath, appEpicId, beadCount, failedPhases: [...] }`.
+- Returns to the conversation: `{ verdict, confidence, advisoryWarnings, autoChain, suggestedBuildBatch, reportPath, appEpicId, beadCount, failedPhases: [...] }`.
 - The orchestrator turn prints a one-line summary:
-  - BLESSED: `"Decompose: BLESSED — <N> beads under <appEpicId>. Run /build-batch when ready. Report: <path>"`
+  - BLESSED: `"Decompose: BLESSED (confidence=<high|review-recommended>) — <N> beads under <appEpicId>. <auto-chaining | Run /build-batch when ready>. Report: <path>"`
   - NEEDS-FIX: `"Decompose: NEEDS-FIX — <reason>. Report: <path>"`
 
-There is **no auto-chain into `/build-batch`**. The human reads the report and decides whether to invoke the build. This gate is deliberate — a bad plan can burn N workers' worth of Opus tokens before producing visible damage.
+**Auto-chain is opt-in; the human-review gate is the default (lbq.1).** By default there is no auto-chain into `/build-batch` — the human reads the report and decides. That gate is deliberate: a bad plan can burn N workers' worth of Opus tokens. But it must not be the *only* path, or a walk-away run returns with zero app code written. So:
+
+- **Confidence.** `BLESSED` is mechanical (all phase checks pass). `confidence` adds a second bar: `high` = BLESSED **and** zero advisory warnings (no implicit `filesTouched` conflicts, no missing cross-dep edges); `review-recommended` = BLESSED with advisories present; `n/a` = NEEDS-FIX.
+- **`--auto-bless`.** When passed AND `confidence == 'high'` AND not a dry run, the workflow sets `autoChain: true` and returns `suggestedBuildBatch`. The **orchestrator / calling turn** then runs that build — `/decompose` itself never spawns `/build-batch` (no recursive workflow nesting; "one orchestrator at a time"). A `review-recommended` BLESSED never auto-chains even with `--auto-bless`; it falls back to the human gate. Without the flag, `autoChain` is always `false`.
 
 ---
 
