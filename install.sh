@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
-# install.sh -- link autonomous-build/skills, autonomous-build/formulas, and
-# autonomous-build/workflows into the user-global locations Claude Code and bd
-# look in. The POSIX counterpart to install.ps1 (which is Windows-only).
+# install.sh -- link autonomous-build/skills, autonomous-build/formulas,
+# autonomous-build/workflows, and autonomous-build/.claude/agents into the
+# user-global locations Claude Code and bd look in. The POSIX counterpart to
+# install.ps1 (which is Windows-only).
 #
-#   skills/<name>      ->  ~/.claude/skills/<name>     (symlink)
-#   formulas/<file>    ->  ~/.beads/formulas/<file>    (symlink)
-#   workflows/<f>.js   ->  ~/.claude/workflows/<f>.js  (symlink)
+#   skills/<name>        ->  ~/.claude/skills/<name>      (symlink)
+#   formulas/<file>      ->  ~/.beads/formulas/<file>     (symlink)
+#   workflows/<f>.js     ->  ~/.claude/workflows/<f>.js   (symlink)
+#   .claude/agents/<f>.md->  ~/.claude/agents/<f>.md      (symlink)
+#
+# Agents matter because /build-batch dispatches the `beads-builder` agent by
+# name; without the global agent definition, workers silently fall back to a
+# generic agent that lacks the escalation pre-check and safety rules.
 #
 # Workflow .spec.md files are NOT distributed -- they live in the repo for spec
 # authoring only. Only the canonical .js scripts ship to the runtime location.
@@ -44,13 +50,15 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILLS_SRC="$REPO_ROOT/skills"
 FORMULAS_SRC="$REPO_ROOT/formulas"
 WORKFLOWS_SRC="$REPO_ROOT/workflows"
+AGENTS_SRC="$REPO_ROOT/.claude/agents"
 SKILLS_DST="$HOME/.claude/skills"
 FORMULAS_DST="$HOME/.beads/formulas"
 WORKFLOWS_DST="$HOME/.claude/workflows"
+AGENTS_DST="$HOME/.claude/agents"
 
 [ -d "$SKILLS_SRC" ]   || { echo "skills source missing: $SKILLS_SRC" >&2; exit 1; }
 [ -d "$FORMULAS_SRC" ] || { echo "formulas source missing: $FORMULAS_SRC" >&2; exit 1; }
-# workflows/ is optional -- a fresh repo may have no saved .js yet.
+# workflows/ and .claude/agents/ are optional -- a fresh repo may have neither yet.
 
 linked=0; ok=0; skipped=0; forced=0; cleaned=0
 
@@ -94,6 +102,7 @@ echo "  repo:          $REPO_ROOT"
 echo "  skills dst:    $SKILLS_DST"
 echo "  formulas dst:  $FORMULAS_DST"
 echo "  workflows dst: $WORKFLOWS_DST"
+echo "  agents dst:    $AGENTS_DST"
 [ "$DRY_RUN" = 1 ] && echo "  mode:          DRY-RUN (no changes)"
 [ "$FORCE" = 1 ]   && echo "  mode:          FORCE (overwrite mismatched)"
 echo
@@ -129,6 +138,24 @@ if [ -d "$WORKFLOWS_SRC" ]; then
   fi
 else
   echo "  (workflows/ directory absent; skipping)"
+fi
+
+echo
+echo ".claude/agents/ -> ~/.claude/agents/"
+if [ -d "$AGENTS_SRC" ]; then
+  shopt -s nullglob
+  agents=("$AGENTS_SRC"/*.md)
+  shopt -u nullglob
+  if [ "${#agents[@]}" -eq 0 ]; then
+    echo "  (no agent .md files yet)"
+  else
+    for f in "${agents[@]}"; do
+      name="$(basename "$f")"
+      link agent "$name" "$f" "$AGENTS_DST/$name"
+    done
+  fi
+else
+  echo "  (.claude/agents/ directory absent; skipping)"
 fi
 
 echo

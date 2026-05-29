@@ -1,9 +1,15 @@
-# install.ps1 -- link autonomous-build/skills, autonomous-build/formulas, and
-# autonomous-build/workflows into the user-global locations Claude Code and bd look in.
+# install.ps1 -- link autonomous-build/skills, autonomous-build/formulas,
+# autonomous-build/workflows, and autonomous-build/.claude/agents into the
+# user-global locations Claude Code and bd look in.
 #
-#   skills/<name>      ->  ~/.claude/skills/<name>     (directory junction; no admin)
-#   formulas/<file>    ->  ~/.beads/formulas/<file>    (NTFS hard link; no admin)
-#   workflows/<f>.js   ->  ~/.claude/workflows/<f>.js  (NTFS hard link; no admin)
+#   skills/<name>        ->  ~/.claude/skills/<name>      (directory junction; no admin)
+#   formulas/<file>      ->  ~/.beads/formulas/<file>     (NTFS hard link; no admin)
+#   workflows/<f>.js     ->  ~/.claude/workflows/<f>.js   (NTFS hard link; no admin)
+#   .claude/agents/<f>.md->  ~/.claude/agents/<f>.md      (NTFS hard link; no admin)
+#
+# Agents matter because /build-batch dispatches the `beads-builder` agent by
+# name; without the global agent definition, workers silently fall back to a
+# generic agent that lacks the escalation pre-check and safety rules.
 #
 # Workflow .spec.md files are NOT distributed -- they live in the repo for spec
 # authoring only. Only the canonical .js scripts ship to the runtime location.
@@ -45,9 +51,11 @@ $repoRoot         = $PSScriptRoot
 $skillsSrc        = Join-Path $repoRoot 'skills'
 $formulasSrc      = Join-Path $repoRoot 'formulas'
 $workflowsSrc     = Join-Path $repoRoot 'workflows'
+$agentsSrc        = Join-Path $repoRoot '.claude\agents'
 $skillsDest       = Join-Path $env:USERPROFILE '.claude\skills'
 $formulasDest     = Join-Path $env:USERPROFILE '.beads\formulas'
 $workflowsDest    = Join-Path $env:USERPROFILE '.claude\workflows'
+$agentsDest       = Join-Path $env:USERPROFILE '.claude\agents'
 
 if (-not (Test-Path $skillsSrc))   { throw "skills source missing: $skillsSrc" }
 if (-not (Test-Path $formulasSrc)) { throw "formulas source missing: $formulasSrc" }
@@ -161,6 +169,7 @@ Write-Host "  repo:          $repoRoot"
 Write-Host "  skills dst:    $skillsDest"
 Write-Host "  formulas dst:  $formulasDest"
 Write-Host "  workflows dst: $workflowsDest"
+Write-Host "  agents dst:    $agentsDest"
 if ($DryRun) { Write-Host "  mode:          DRY-RUN (no changes)" }
 if ($Force)  { Write-Host "  mode:          FORCE (overwrite mismatched)" }
 Write-Host ""
@@ -198,6 +207,24 @@ if (Test-Path $workflowsSrc) {
     }
 } else {
     Write-Host "  (workflows/ directory absent; skipping)"
+}
+
+Write-Host ""
+Write-Host ".claude/agents/ -> ~/.claude/agents/"
+if (Test-Path $agentsSrc) {
+    $agentFiles = Get-ChildItem $agentsSrc -File -Filter '*.md' | Sort-Object Name
+    if ($agentFiles.Count -eq 0) {
+        Write-Host "  (no agent .md files yet)"
+    } else {
+        $agentFiles | ForEach-Object {
+            $name = $_.Name
+            $src  = $_.FullName
+            $dst  = Join-Path $agentsDest $name
+            Link-HardLink 'agent' $name $src $dst
+        }
+    }
+} else {
+    Write-Host "  (.claude/agents/ directory absent; skipping)"
 }
 
 Write-Host ""

@@ -341,9 +341,13 @@ Run these serialized (one bead at a time) — concurrent bd writes can race on t
 beadId: ${p.beadId}
 worktree: ${p.worktreePath}
 
-You are a beads-builder worker. Your contract is in CLAUDE.md and the beads-builder agent definition. Summary:
+You are a beads-builder worker. Your full contract is the beads-builder agent definition; these safeguards are inlined so they bind even if that definition did not load:
 - The bead is ALREADY claimed and the worktree is ALREADY created. Do NOT re-claim, do NOT re-create.
 - Work inside ${p.worktreePath}. The branch is ${p.branch}.
+- ESCALATION PRE-CHECK (before writing code): read docs/ESCALATION_RULES.md in the worktree and block (set status "blocked", \`bd update ${p.beadId} --status=blocked --notes "<reason>"\`, exit) if the bead touches any hard-stop: schema migration on a populated table, an auth/authz model decision, a new paid third-party API, secrets handling, public-facing copy/branding, acceptance you cannot self-verify, or a bead that already failed the gate twice. Do NOT work around an escalation rule.
+- Do NOT edit the bead's acceptance criteria to make a failing build pass. Acceptance is the contract; if it's wrong, that's a block, not an edit.
+- TESTS: if \`metadata.testPlanFile\` is set on the bead, EXTEND that file — do not create a new singleton test file for this bead. A detected stack with no runnable test suite is a hard fail at the gate, not a pass.
+- Stay inside the kickoff's ownership boundaries (if Jankurai is configured); do not edit forbidden paths or files outside the bead's scope (that's a "scope creep" block).
 - Implement the bead per its acceptance criteria. Honor the kickoff if Jankurai is configured; if not, proceed.
 - Run the quality gate (resolve cross-platform: prefer \`<repo-root>/hooks/post-build-gate.{sh,ps1}\`, else the sibling \`../autonomous-build/hooks/\`; run \`post-build-gate.sh\` on Linux/macOS, \`pwsh -NoProfile -File post-build-gate.ps1\` on Windows). On red, retry once; on second red, block.
 - Commit with explicit \`git add\` (no \`-A\`). Commit message: "<bead title> (bd: <beadId>)".
