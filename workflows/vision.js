@@ -1,12 +1,12 @@
 export const meta = {
   name: 'vision',
-  description: 'Workflow half of the hybrid /vision (epic autonomous-build-ih5). Turns a filled vision.md into the frozen skeleton + per-concern decisions the rest of the pipeline builds against. Phase 1 intake validates the product brief (NEEDS-INPUT, never invents content, when §1/§3/§8 are unfilled); Phase 2 builds the frozen skeleton (data model + feature order + stack-native formula picks) and emits the observable signals from which a pure-JS deriveApplicability resolves each of the ten concerns; Phase 3 fans out one agent per APPLICABLE concern over the frozen skeleton, each seeing ONLY its own concern bar — addressed-with-falsifiable-evidence or excluded-with-reason, undecidable -> a concern-decidedness block. Reconcile/assemble (Phase 4) is appended by autonomous-build-ih5.4. SYNC: spec is workflows/vision.spec.md (edit in lockstep, T3); CONCERN_IDS / CONCERN_BARS / EVIDENCE_BAR / GATE_TOKENS mirror docs/PLAN_CONCERNS.md + vision-eval.js; DEFAULT_STACK mirrors docs/DEFAULT_STACK.md.',
-  whenToUse: 'Invoked by the /vision skill shell for the concern-derivation engine, or directly (Workflow vision) for a headless run over a vision.md (the path vision-eval grades). Use --no-file to derive without writing, --selftest to CI the pure-JS intake/applicability/skeleton/concern logic with NO agents.',
+  description: 'Workflow half of the hybrid /vision (epic autonomous-build-ih5). Turns a filled vision.md into plan.lock.json (schemaVersion 2) + plan.md + tenets.md. Phase 1 intake validates the product brief (NEEDS-INPUT, never invents content, when §1/§3/§8 are unfilled); Phase 2 builds the frozen skeleton (data model + feature order + stack-native formula picks) and emits the observable signals from which a pure-JS deriveApplicability resolves each of the ten concerns; Phase 3 fans out one agent per APPLICABLE concern over the frozen skeleton, each seeing ONLY its own concern bar — addressed-with-falsifiable-evidence or excluded-with-reason, undecidable -> a concern-decidedness block; Phase 4 reconciles (folds in excluded-by-default concerns) + runs the four gates (decidedness, forward-coverage, reverse-trace, musthave-nongoal) + the required+excluded contradiction scan, computes the decidedness verdict, and BUILDS + VALIDATES the lock/plan.md/tenets.md in pure JS (the lone agent only writes the files). SYNC: spec is workflows/vision.spec.md (edit in lockstep, T3); CONCERN_IDS / CONCERN_BARS / EVIDENCE_BAR / GATE_TOKENS mirror docs/PLAN_CONCERNS.md + vision-eval.js; validateLock is a superset of vision-eval.js L1; lock shape mirrors schemas/plan.lock.schema.json; TENETS_INHERITED_MD mirrors templates/tenets.md + docs/TENETS.md; DEFAULT_STACK mirrors docs/DEFAULT_STACK.md.',
+  whenToUse: 'Invoked by the /vision skill shell for the concern-derivation engine, or directly (Workflow vision) for a headless run over a vision.md (the path vision-eval grades). Use --no-file to derive without writing, --selftest to CI the pure-JS intake/applicability/skeleton/concern/reconcile/assemble logic with NO agents.',
   phases: [
     { title: 'Intake',   detail: 'Read + validate vision.md; NEEDS-INPUT on unfilled §1/§3/§8 (1 agent)' },
     { title: 'Skeleton', detail: 'Build the frozen skeleton + observable signals; derive applicability in pure JS (1 agent)' },
-    { title: 'Concerns', detail: 'Fan out 1 agent per applicable concern over the frozen skeleton (addressed+evidence | excluded+reason | block)' }
-    // Phase 4 (reconcile + four gates + decidedness verdict + assemble lock/tenets/plan.md) is appended by autonomous-build-ih5.4.
+    { title: 'Concerns', detail: 'Fan out 1 agent per applicable concern over the frozen skeleton (addressed+evidence | excluded+reason | block)' },
+    { title: 'Assemble', detail: 'Reconcile + four gates + decidedness verdict; build+validate lock/plan.md/tenets.md in pure JS; 1 agent writes the files' }
   ]
 };
 
@@ -407,6 +407,513 @@ function normalizeConcernResult(raw, concernId, applicability) {
 }
 
 // ===========================================================================
+// Phase 4 (reconcile + four gates + decidedness verdict + assemble) — consts + pure helpers.
+// The lock object, plan.md, and tenets.md are BUILT + VALIDATED in pure JS (deterministic +
+// selftestable — the same discipline the spec applies to the gates); the lone Phase-4 agent only
+// WRITES the three files (the sandbox has no filesystem). A schema-invalid assembled lock is a
+// workflow bug surfaced LOUD — there is no agent to retry an object the workflow built, so we fail
+// rather than paper it (T7). validateLock is a strict SUPERSET of vision-eval.js's L1 validatePlanLock
+// (same checks + the additionalProperties / stack-key-enum constraints the schema enforces).
+// ===========================================================================
+
+// The standard exclusion reason folded in for each excluded-by-default concern the vision did NOT
+// elevate (no agent is spawned for these — Phase 4 records them directly; PLAN_CONCERNS.md §Applicability).
+const STANDARD_EXCLUSIONS = {
+  'authn':         'no must-have implies user accounts or login (single-user / unauthenticated v1).',
+  'authz':         'no authentication or multi-principal / cross-user data — nothing to authorize.',
+  'secrets':       'no auth, external integration, or privacy constraint requiring managed secrets in v1.',
+  'perf-envelope': 'the success metric names no scale / latency / throughput target (no perf envelope in v1).',
+  'abuse-surface': 'no public or unauthenticated network surface exposed.'
+};
+function standardExclusion(concernId) {
+  return STANDARD_EXCLUSIONS[concernId] || `concern ${concernId} does not apply (excluded by default, not elevated by the vision).`;
+}
+
+// Concerns whose 'required' applicability means "required to DECIDE", not "required to ADDRESS" — excluding
+// them WITH a reason is a valid decision (external-integrations "none"; data-model "stateless CLI"; error-handling),
+// NOT a contradiction. The required+excluded scan (the acceptance's contradiction check) fires only for the
+// SIGNAL-elevated concerns the product actually needs (authn/authz/secrets/data-lifecycle/observability/perf/abuse).
+const DECIDE_ONLY_CONCERNS = new Set(['data-model', 'error-handling', 'external-integrations']);
+
+// schemas/plan.lock.schema.json stack.propertyNames enum — the ONLY keys the lock's stack may carry.
+const STACK_ENUM = ['language', 'backend', 'frontend', 'database', 'orm', 'auth', 'hosting', 'tests', 'lint'];
+// Map the skeleton's DEFAULT_STACK layer names (normalized lowercase) onto those enum keys. Layers with no
+// enum slot (cross-language contracts, ai/data sidecar) are DROPPED from the lock's stack and live in plan.md
+// prose instead — the lock stays schema-valid (stack has no REQUIRED keys, only an allowed-key enum).
+const STACK_KEY_MAP = {
+  'core/services': 'backend', 'core': 'backend', 'services': 'backend', 'backend': 'backend', 'server': 'backend',
+  'product surface': 'frontend', 'product-surface': 'frontend', 'frontend': 'frontend', 'ui': 'frontend', 'web': 'frontend',
+  'language': 'language',
+  'database': 'database', 'db': 'database',
+  'orm': 'orm',
+  'auth': 'auth', 'authn': 'auth', 'authentication': 'auth',
+  'tests': 'tests', 'test': 'tests', 'testing': 'tests',
+  'lint': 'lint', 'lint/format': 'lint', 'lint-format': 'lint', 'format': 'lint', 'formatting': 'lint',
+  'hosting': 'hosting'
+};
+
+// reverse-trace allowlist: a feature with no mustHaveId is NOT scope creep if it pours infra / auth /
+// observability (it delivers a cross-cutting concern, not a product must-have). Conservative by design —
+// reverse-trace should flag only obvious orphans, never a legitimate platform feature.
+const TRACED_FORMULA_RX = /(app-skeleton|oidc-client|openfga-model|otel-bootstrap|terraform|migration|tenant-boot|audit-chain|grpc-tonic|composer-grammar|integration-http|background-job)/i;
+
+const DEFAULT_ESCALATION = { maxSessionCostUsd: 25, maxFailuresPerTask: 2 };
+
+// Inherited workflow tenets, inlined verbatim from templates/tenets.md (the agent runs in the app cwd and
+// cannot read the template/doc). SYNC with templates/tenets.md + docs/TENETS.md when the tenet set changes.
+const TENETS_INHERITED_MD = `## How to use this document
+
+1. Check the source-of-truth ordering below — most "judgment calls" are unread spec.
+2. Check the inherited workflow tenets (T1–T10) — they cover the universal cases.
+3. Check the app-specific tenets (A1+) — they cover what this app's vision/plan locked in.
+4. If no tenet covers the question, escalate via \`bd update <id> --status=blocked\`.
+
+---
+
+## Source of truth ordering
+
+When two signals disagree, the higher item wins. Always.
+
+1. The quality gate (\`hooks/post-build-gate.{sh,ps1}\` from autonomous-build).
+2. **This app's** \`plan.lock.json\`.
+3. **This app's** \`plan.md\` (narrative only; lock wins where they disagree).
+4. The bead spec (description + acceptance criteria + testPlan + filesTouched).
+5. Formula output from \`bd mol pour\`.
+6. **This app's** \`tenets.md\` (this file) — for judgment calls the above don't cover.
+7. The workflow-level \`docs/TENETS.md\` in autonomous-build.
+8. \`docs/DEFAULT_STACK.md\` in autonomous-build (stack decisions only).
+9. Existing code in this repo (context, not contract).
+10. Model intuition (last resort; treat as a guess).
+
+---
+
+## Inherited workflow tenets
+
+These come from autonomous-build/docs/TENETS.md and apply to every build. One-line summaries below; read the source doc for rationale and how-to-apply.
+
+- **T1. Escalate over guess** — when in doubt, block the bead and let \`/escalate\` page the human.
+- **T2. The gate is the contract** — never weaken or skip gate steps to make a bead pass.
+- **T3. Atomic bead, atomic commit** — one bead = one logical change = one commit.
+- **T4. Scope discipline — build the bead, not the project** — implement exactly the AC; no invented requirements.
+- **T5. Reversibility bias** — escalate irreversible steps even if not on the hard-stop list.
+- **T6. Formula precedence over ad-hoc** — stack and structure come from formulas / DEFAULT_STACK, not improvisation.
+- **T7. Failure visibility** — loud + recoverable beats silent + clean. No swallowed exceptions.
+- **T8. Idempotency by default** — every setup step is safely re-runnable.
+- **T9. Meta vs app discipline** — workflow changes propagate to every app; app changes are local.
+- **T10. plan.lock.json is the contract, plan.md is the narrative** — lock wins.
+
+For the full text, hard-conflict resolutions, and "not tenets" list, see the workflow doc.`;
+
+// Top-level + nested allowed-key sets, mirroring the schema's additionalProperties:false.
+const LOCK_TOP_KEYS = ['schemaVersion', 'app', 'mustHaves', 'successMetric', 'stack', 'dataModel', 'featureOrder', 'coverage', 'concerns', 'crossFeatureDependencies', 'escalationBudget', 'openQuestions', 'incomplete', 'nfrs', 'agentConsults'];
+
+function extraKeys(obj, allowed) {
+  return isObj(obj) ? Object.keys(obj).filter((k) => !allowed.includes(k)) : [];
+}
+
+function siblingPath(outPath, name) {
+  const s = String(outPath || '');
+  const idx = s.lastIndexOf('/');
+  return idx >= 0 ? s.slice(0, idx + 1) + name : name;
+}
+
+// Reconcile Phase-3 results with the excluded-by-default fold-in into the lock's concerns[] (status is
+// addressed|excluded ONLY — undecided concerns can't be represented in the lock, so they surface as
+// blocking openQuestions instead). Also flags the required+excluded contradiction (the acceptance's scan).
+function reconcileConcerns(phase3, applicability) {
+  const byId = {};
+  (isArr(phase3) ? phase3 : []).forEach((c) => { if (isObj(c) && nonEmptyStr(c.concernId)) byId[c.concernId] = c; });
+  const lockConcerns = [];
+  const undecided = [];
+  const contradictions = [];
+  for (const id of CONCERN_IDS) {
+    const appl = (isObj(applicability) ? applicability[id] : undefined) || 'excluded-by-default';
+    if (appl === 'excluded-by-default') {
+      lockConcerns.push({ concernId: id, status: 'excluded', reason: standardExclusion(id) });
+      continue;
+    }
+    const r = byId[id];
+    const hasBQ = r && isObj(r.blockingQuestion) && nonEmptyStr(r.blockingQuestion.question);
+    if (!r || r.status === 'failed' || hasBQ) {
+      const q = hasBQ ? r.blockingQuestion.question : `concern ${id} was not decided by the fan-out`;
+      const ctx = (hasBQ && nonEmptyStr(r.blockingQuestion.context)) ? r.blockingQuestion.context : `concern-decidedness: ${q}`;
+      undecided.push({ concernId: id, question: q, context: ctx });
+      continue;
+    }
+    if (r.status === 'addressed' && nonEmptyStr(r.evidence)) {
+      lockConcerns.push({ concernId: id, status: 'addressed', evidence: r.evidence });
+    } else if (r.status === 'excluded' && nonEmptyStr(r.reason)) {
+      lockConcerns.push({ concernId: id, status: 'excluded', reason: r.reason });
+      if (appl === 'required' && !DECIDE_ONLY_CONCERNS.has(id)) contradictions.push({ concernId: id, reason: r.reason });
+    } else {
+      const q = `concern ${id} returned status ${JSON.stringify(r.status)} without ${r.status === 'addressed' ? 'evidence' : 'a reason'}`;
+      undecided.push({ concernId: id, question: q, context: `concern-decidedness: ${q}` });
+    }
+  }
+  return { lockConcerns, undecided, contradictions };
+}
+
+// Forward-coverage map: each non-deferred must-have -> the feature(s) delivering it (from featureOrder
+// mustHaveId bindings + addressed-concern coverageLinks) + a falsifiable HOW. Returns the uncovered ids too.
+function buildCoverage(mustHaves, featureOrder, phase3) {
+  const mh = isArr(mustHaves) ? mustHaves : [];
+  const fo = isArr(featureOrder) ? featureOrder : [];
+  const linkByMh = {};
+  (isArr(phase3) ? phase3 : []).forEach((c) => {
+    const cl = isObj(c) ? c.coverageLink : null;
+    if (cl && nonEmptyStr(cl.mustHaveId) && isArr(cl.features)) {
+      (linkByMh[cl.mustHaveId] = linkByMh[cl.mustHaveId] || []).push(...cl.features.filter(nonEmptyStr));
+    }
+  });
+  const coverage = [];
+  const uncovered = [];
+  for (const m of mh) {
+    if (!isObj(m) || !nonEmptyStr(m.id)) continue;
+    if (m.deferred === true) continue;
+    const fromFeatures = fo.filter((f) => isObj(f) && f.mustHaveId === m.id && nonEmptyStr(f.name)).map((f) => f.name);
+    const features = Array.from(new Set([...fromFeatures, ...(linkByMh[m.id] || [])]));
+    if (!features.length) { uncovered.push(m.id); continue; }
+    const hows = features.map((name) => {
+      const f = fo.find((x) => isObj(x) && x.name === name);
+      const formulas = (f && isArr(f.formulas)) ? f.formulas.filter(nonEmptyStr) : [];
+      return formulas.length ? `${name} (${formulas.join(', ')})` : name;
+    });
+    coverage.push({ mustHaveId: m.id, features, how: `Delivered by ${hows.join('; ')}.` });
+  }
+  return { coverage, uncovered };
+}
+
+// reverse-trace: a featureOrder feature that maps to no must-have and pours no allowlisted infra formula
+// is possible scope creep. Conservative — infra/auth/observability features are exempt (TRACED_FORMULA_RX).
+function reverseTraceOrphans(featureOrder, coverage) {
+  const fo = isArr(featureOrder) ? featureOrder : [];
+  const covered = new Set();
+  (isArr(coverage) ? coverage : []).forEach((c) => (isArr(c.features) ? c.features : []).forEach((n) => covered.add(n)));
+  const orphans = [];
+  for (const f of fo) {
+    if (!isObj(f) || !nonEmptyStr(f.name)) continue;
+    if (nonEmptyStr(f.mustHaveId) || covered.has(f.name)) continue;
+    if (TRACED_FORMULA_RX.test((isArr(f.formulas) ? f.formulas : []).join(' '))) continue;
+    orphans.push(f.name);
+  }
+  return orphans;
+}
+
+// musthave <-> non-goal contradiction (gate 8.6). Conservative substring check: a §5 non-goal forbids a
+// phrase (after stripping a leading negation, split on connectors); a must-have that CONTAINS that phrase
+// (>=6 chars) is requiring what the vision forbade. Substring keeps it precise — it errs toward NOT firing
+// (a false block of a coherent plan is the worse failure for a determinism harness; semantic depth is future work).
+function musthaveNongoalConflicts(mustHaves, nonGoals) {
+  const mh = isArr(mustHaves) ? mustHaves : [];
+  const out = [];
+  const seen = new Set();
+  for (const goal of (isArr(nonGoals) ? nonGoals : [])) {
+    if (!nonEmptyStr(goal)) continue;
+    const stripped = goal.toLowerCase().replace(/^\s*(?:no|not|never|without|don'?t|avoid|exclude[ds]?)\b[:\s-]*/i, '');
+    const phrases = stripped.split(/\b(?:or|and)\b|[,;/]/).map((p) => p.trim()).filter((p) => p.length >= 6);
+    for (const phrase of phrases) {
+      for (const m of mh) {
+        if (!isObj(m) || !nonEmptyStr(m.text)) continue;
+        if (m.text.toLowerCase().includes(phrase)) {
+          const key = `${m.id}|${goal}`;
+          if (!seen.has(key)) { seen.add(key); out.push({ mustHaveId: m.id, nonGoal: goal, phrase }); }
+          break;
+        }
+      }
+    }
+  }
+  return out;
+}
+
+// §9 escalation budget: parse a $ ceiling + a per-task failure count out of the free-text section; defaults
+// (DEFAULT_ESCALATION) when the human left it loose. Always returns a schema-valid {maxSessionCostUsd, maxFailuresPerTask}.
+function parseEscalationBudget(text) {
+  const out = { maxSessionCostUsd: DEFAULT_ESCALATION.maxSessionCostUsd, maxFailuresPerTask: DEFAULT_ESCALATION.maxFailuresPerTask };
+  if (nonEmptyStr(text)) {
+    const dollar = text.match(/\$\s*([0-9]+(?:\.[0-9]+)?)/) || text.match(/([0-9]+(?:\.[0-9]+)?)\s*(?:usd|dollars?)/i);
+    if (dollar) { const n = Number(dollar[1]); if (Number.isFinite(n) && n >= 0) out.maxSessionCostUsd = n; }
+    const fails = text.match(/([0-9]+)\s*(?:failures?|attempts?|retries|tries)/i);
+    if (fails) { const n = parseInt(fails[1], 10); if (Number.isInteger(n) && n >= 1) out.maxFailuresPerTask = n; }
+  }
+  return out;
+}
+
+// Map the skeleton's stack (arbitrary DEFAULT_STACK layer names) onto the schema's enum keys; drop layers
+// with no enum slot (first-wins on collisions). Always returns an object whose keys are a subset of STACK_ENUM.
+function mapStack(skeletonStack) {
+  const out = {};
+  if (!isObj(skeletonStack)) return out;
+  for (const [k, v] of Object.entries(skeletonStack)) {
+    if (!isObj(v)) continue;
+    const enumKey = STACK_KEY_MAP[String(k).trim().toLowerCase()];
+    if (!enumKey || out[enumKey]) continue;
+    if (!nonEmptyStr(v.choice)) continue;
+    out[enumKey] = { choice: v.choice, why: nonEmptyStr(v.why) ? v.why : 'pinned by docs/DEFAULT_STACK.md.' };
+  }
+  return out;
+}
+
+// The four gates -> blocking openQuestions[], each carrying its controlled gate token (GATE_TOKENS) in context.
+function runGatesV4(g) {
+  const oq = [];
+  for (const b of (isArr(g.blocks) ? g.blocks : [])) {
+    if (isObj(b) && nonEmptyStr(b.token)) oq.push(mkBlocking(b.token, nonEmptyStr(b.note) ? b.note : b.token));
+  }
+  for (const u of (isArr(g.undecided) ? g.undecided : [])) oq.push({ question: u.question, blockingCompose: true, context: u.context });
+  for (const c of (isArr(g.contradictions) ? g.contradictions : [])) oq.push(mkBlocking('required-excluded-contradiction', `concern "${c.concernId}" is REQUIRED by the vision but was excluded ("${c.reason}") — correct the vision or confirm the exclusion.`));
+  for (const id of (isArr(g.uncovered) ? g.uncovered : [])) oq.push(mkBlocking('forward-coverage', `must-have ${id} maps to no feature in featureOrder[] — add a feature that delivers it or mark it deferred.`));
+  for (const name of (isArr(g.orphans) ? g.orphans : [])) oq.push(mkBlocking('reverse-trace', `feature "${name}" traces to no must-have or declared infra need (possible scope creep) — bind it to a must-have or drop it.`));
+  for (const c of (isArr(g.nongoalConflicts) ? g.nongoalConflicts : [])) oq.push(mkBlocking('musthave-nongoal-contradiction', `must-have ${c.mustHaveId} appears to require "${c.phrase}", which §5 lists as a non-goal ("${c.nonGoal}") — the vision is internally inconsistent.`));
+  return oq;
+}
+
+// Build the schemaVersion-2 lock OBJECT from the frozen skeleton + reconciled concerns + coverage + the
+// gate openQuestions. This is the mechanical skeleton->lock mapping: drop app.slug, mustHaves[].deferred,
+// successMetric.statement, and featureOrder[].mustHaveId (none are lock keys); decompose successMetric into
+// {id,text} steps; map stack to enum keys. incomplete falls out of the blocking openQuestions (schema def).
+function assembleLock(a) {
+  const f = a.frozen;
+  const sm = isObj(f.successMetric) ? f.successMetric : {};
+  const steps = (isArr(sm.steps) ? sm.steps.filter(nonEmptyStr) : []);
+  const successSteps = steps.length
+    ? steps.map((text, i) => ({ id: `S${i + 1}`, text }))
+    : [{ id: 'S1', text: nonEmptyStr(sm.statement) ? sm.statement : 'Success metric.' }];
+  const featureOrder = (isArr(f.featureOrder) ? f.featureOrder : [])
+    .filter((x) => isObj(x) && nonEmptyStr(x.name) && isArr(x.formulas) && x.formulas.filter(nonEmptyStr).length >= 1)
+    .map((x) => {
+      const out = { name: x.name, formulas: x.formulas.filter(nonEmptyStr) };
+      if (isObj(x.vars) && Object.keys(x.vars).length) out.vars = x.vars;
+      if (nonEmptyStr(x.notes)) out.notes = x.notes;
+      return out;
+    });
+  const dataModel = (isArr(f.dataModel) ? f.dataModel : [])
+    .filter((e) => isObj(e) && nonEmptyStr(e.entity))
+    .map((e) => {
+      const out = { entity: e.entity, fields: isArr(e.fields) ? e.fields.filter(nonEmptyStr) : [] };
+      if (isArr(e.relationships) && e.relationships.length) out.relationships = e.relationships.filter(isStr);
+      if (nonEmptyStr(e.notes)) out.notes = e.notes;
+      return out;
+    });
+  const app = { name: (isObj(f.app) && nonEmptyStr(f.app.name)) ? f.app.name : 'app' };
+  if (isObj(f.app) && nonEmptyStr(f.app.summary)) app.description = f.app.summary;
+  const openQuestions = isArr(a.openQuestions) ? a.openQuestions : [];
+  // Pass through ONLY skill-shell consults that already match the lock schema's four required fields —
+  // never synthesize the missing question/reversalCost (that would invent product decisions, T1). The headless
+  // path emits none; the skill shell (ih5.5) supplies lock-ready entries.
+  const agentConsults = (isArr(f.agentConsults) ? f.agentConsults : [])
+    .filter((c) => isObj(c) && nonEmptyStr(c.question) && nonEmptyStr(c.decision) && nonEmptyStr(c.rationale) && nonEmptyStr(c.reversalCost))
+    .map((c) => ({ question: c.question, decision: c.decision, rationale: c.rationale, reversalCost: c.reversalCost }));
+  const lock = {
+    schemaVersion: 2,
+    app,
+    mustHaves: (isArr(f.mustHaves) ? f.mustHaves : []).filter((m) => isObj(m) && nonEmptyStr(m.id) && nonEmptyStr(m.text)).map((m) => ({ id: m.id, text: m.text })),
+    successMetric: { steps: successSteps },
+    stack: mapStack(f.stack),
+    dataModel,
+    featureOrder,
+    coverage: isArr(a.coverage) ? a.coverage : [],
+    concerns: isArr(a.lockConcerns) ? a.lockConcerns : [],
+    crossFeatureDependencies: [],
+    escalationBudget: parseEscalationBudget(a.sections && a.sections.escalationBudget),
+    openQuestions,
+    incomplete: openQuestions.some((q) => q && q.blockingCompose === true)
+  };
+  if (agentConsults.length) lock.agentConsults = agentConsults;
+  return lock;
+}
+
+// Strict schema validation (a superset of vision-eval.js validatePlanLock: same checks + additionalProperties
+// + stack-key-enum). Returns { ok, errors[] }. A non-empty errors[] on an assembled lock is a workflow bug.
+function validateLock(pl, concernIds = CONCERN_IDS) {
+  const errors = [];
+  if (pl === null) return { ok: false, errors: ['unparseable: not valid JSON'] };
+  if (!isObj(pl)) return { ok: false, errors: ['not an object'] };
+  if (pl.schemaVersion !== 2) errors.push(`schemaVersion must be 2 (got ${JSON.stringify(pl.schemaVersion)})`);
+  const requiredKeys = ['schemaVersion', 'app', 'mustHaves', 'successMetric', 'stack', 'dataModel', 'featureOrder', 'coverage', 'concerns', 'crossFeatureDependencies', 'escalationBudget', 'openQuestions', 'incomplete'];
+  for (const k of requiredKeys) if (!(k in pl)) errors.push(`missing required key: ${k}`);
+  for (const k of extraKeys(pl, LOCK_TOP_KEYS)) errors.push(`unknown top-level key: ${k}`);
+
+  if (!isObj(pl.app) || !nonEmptyStr(pl.app && pl.app.name)) errors.push('app.name missing/empty');
+  else for (const k of extraKeys(pl.app, ['name', 'description'])) errors.push(`app.${k} not allowed`);
+
+  if (!isArr(pl.mustHaves)) errors.push('mustHaves must be an array');
+  else pl.mustHaves.forEach((m, i) => {
+    if (!isObj(m) || !nonEmptyStr(m.id) || !nonEmptyStr(m.text)) errors.push(`mustHaves[${i}] needs {id,text}`);
+    else for (const k of extraKeys(m, ['id', 'text'])) errors.push(`mustHaves[${i}].${k} not allowed`);
+  });
+
+  if (!isObj(pl.successMetric) || !isArr(pl.successMetric.steps)) errors.push('successMetric.steps must be an array');
+  else {
+    for (const k of extraKeys(pl.successMetric, ['steps'])) errors.push(`successMetric.${k} not allowed`);
+    pl.successMetric.steps.forEach((s, i) => { if (!isObj(s) || !nonEmptyStr(s.id) || !isStr(s.text)) errors.push(`successMetric.steps[${i}] needs {id,text}`); });
+  }
+
+  if (!isObj(pl.stack)) errors.push('stack must be an object');
+  else for (const [k, v] of Object.entries(pl.stack)) {
+    if (!STACK_ENUM.includes(k)) errors.push(`stack key "${k}" not in allowed enum`);
+    if (!isObj(v) || !nonEmptyStr(v.choice) || !nonEmptyStr(v.why)) errors.push(`stack.${k} needs {choice,why}`);
+    else for (const kk of extraKeys(v, ['choice', 'why'])) errors.push(`stack.${k}.${kk} not allowed`);
+  }
+
+  if (!isArr(pl.dataModel)) errors.push('dataModel must be an array');
+  else pl.dataModel.forEach((e, i) => {
+    if (!isObj(e) || !nonEmptyStr(e.entity) || !isArr(e.fields)) errors.push(`dataModel[${i}] needs {entity,fields}`);
+    else for (const k of extraKeys(e, ['entity', 'fields', 'relationships', 'notes'])) errors.push(`dataModel[${i}].${k} not allowed`);
+  });
+
+  if (!isArr(pl.featureOrder)) errors.push('featureOrder must be an array');
+  else pl.featureOrder.forEach((f, i) => {
+    if (!isObj(f) || !nonEmptyStr(f.name) || !isArr(f.formulas) || f.formulas.length < 1) errors.push(`featureOrder[${i}] needs {name,formulas>=1}`);
+    else for (const k of extraKeys(f, ['name', 'formulas', 'vars', 'notes'])) errors.push(`featureOrder[${i}].${k} not allowed`);
+  });
+
+  if (!isArr(pl.coverage)) errors.push('coverage must be an array');
+  else pl.coverage.forEach((c, i) => {
+    if (!isObj(c)) { errors.push(`coverage[${i}] not an object`); return; }
+    if (!nonEmptyStr(c.mustHaveId)) errors.push(`coverage[${i}].mustHaveId missing`);
+    if (!isArr(c.features) || c.features.length < 1) errors.push(`coverage[${i}].features needs >=1 entry`);
+    if (!nonEmptyStr(c.how)) errors.push(`coverage[${i}].how missing (anti-vagueness)`);
+    for (const k of extraKeys(c, ['mustHaveId', 'features', 'how'])) errors.push(`coverage[${i}].${k} not allowed`);
+  });
+
+  if (!isArr(pl.concerns)) errors.push('concerns must be an array');
+  else pl.concerns.forEach((c, i) => {
+    if (!isObj(c)) { errors.push(`concerns[${i}] not an object`); return; }
+    if (!nonEmptyStr(c.concernId)) errors.push(`concerns[${i}].concernId missing`);
+    if (c.status !== 'addressed' && c.status !== 'excluded') errors.push(`concerns[${i}].status must be addressed|excluded`);
+    if (c.status === 'addressed' && !nonEmptyStr(c.evidence)) errors.push(`concerns[${i}] addressed but no evidence`);
+    if (c.status === 'excluded' && !nonEmptyStr(c.reason)) errors.push(`concerns[${i}] excluded but no reason`);
+    for (const k of extraKeys(c, ['concernId', 'status', 'evidence', 'reason'])) errors.push(`concerns[${i}].${k} not allowed`);
+  });
+
+  if (!isArr(pl.crossFeatureDependencies)) errors.push('crossFeatureDependencies must be an array');
+  if (!isObj(pl.escalationBudget) || typeof pl.escalationBudget.maxSessionCostUsd !== 'number' || !Number.isInteger(pl.escalationBudget.maxFailuresPerTask)) errors.push('escalationBudget needs {maxSessionCostUsd:number, maxFailuresPerTask:int}');
+  else for (const k of extraKeys(pl.escalationBudget, ['maxSessionCostUsd', 'maxFailuresPerTask', 'additionalBlockTriggers'])) errors.push(`escalationBudget.${k} not allowed`);
+
+  if (!isArr(pl.openQuestions)) errors.push('openQuestions must be an array');
+  else pl.openQuestions.forEach((q, i) => {
+    if (!isObj(q) || !nonEmptyStr(q.question)) errors.push(`openQuestions[${i}].question missing`);
+    if (q && typeof q.blockingCompose !== 'boolean') errors.push(`openQuestions[${i}].blockingCompose must be boolean`);
+    if (isObj(q)) for (const k of extraKeys(q, ['question', 'blockingCompose', 'context'])) errors.push(`openQuestions[${i}].${k} not allowed`);
+  });
+
+  if (typeof pl.incomplete !== 'boolean') errors.push('incomplete must be a boolean');
+  const hasBlocking = isArr(pl.openQuestions) && pl.openQuestions.some((q) => q && q.blockingCompose === true);
+  if (typeof pl.incomplete === 'boolean' && pl.incomplete !== hasBlocking) errors.push(`incomplete (${pl.incomplete}) must equal "any openQuestion.blockingCompose" (${hasBlocking})`);
+
+  if (pl.incomplete === false) {
+    if (isArr(pl.concerns)) {
+      const decided = new Set(pl.concerns.map((c) => c && c.concernId));
+      for (const id of concernIds) if (!decided.has(id)) errors.push(`complete plan leaves concern "${id}" undecided`);
+    }
+    if (isArr(pl.mustHaves) && isArr(pl.coverage)) {
+      const covered = new Set(pl.coverage.filter((c) => isArr(c.features) && c.features.length >= 1).map((c) => c.mustHaveId));
+      for (const m of pl.mustHaves) if (m && !covered.has(m.id)) errors.push(`complete plan leaves must-have "${m.id}" uncovered`);
+    }
+  }
+  return { ok: errors.length === 0, errors };
+}
+
+// Render tenets.md: the inherited T1–T10 block + source ordering (verbatim) + app-specific tenets derived
+// from §5 non-goals + the locked-stack tenet + the escalation budget. (templates/tenets.md, populated.)
+function renderTenets(frozen, sections) {
+  const name = (isObj(frozen.app) && nonEmptyStr(frozen.app.name)) ? frozen.app.name : 'this app';
+  const nonGoals = isArr(frozen.nonGoals) ? frozen.nonGoals.filter(nonEmptyStr) : [];
+  const eb = parseEscalationBudget(sections && sections.escalationBudget);
+  let app = '';
+  if (nonGoals.length) {
+    app += '### From vision.md §5 (non-goals)\n\n> One tenet per non-goal. These prevent scope creep during build.\n\n';
+    nonGoals.forEach((ng, i) => {
+      app += `- **A${i + 1}. Do not build: ${ng}**\n  - **Rule**: Never implement "${ng}".\n  - **Why**: Explicitly excluded in vision.md §5.\n  - **How to apply**: If a bead's AC drifts toward "${ng}", flag with \`/flag\` rather than implementing.\n\n`;
+    });
+  } else {
+    app += '_No non-goal tenets — vision.md §5 was empty._\n\n';
+  }
+  app += '### From plan.lock §stack (locked-in stack)\n\n- **A_stack. The stack is locked at /vision time**\n  - **Rule**: Do not swap layers (database, framework, ORM, auth) during a build. Stack changes require re-running `/vision`.\n  - **Why**: Mid-build stack changes invalidate every prior decision and most prior beads.\n  - **How to apply**: If a bead seems to require a different stack layer, the bead is wrong — flag it.';
+  return [
+    `# Tenets: ${name}`,
+    '',
+    '> Generated by `/vision` from `vision.md` + `plan.lock.json` + the workflow-level `docs/TENETS.md` in autonomous-build.',
+    '> Read this when about to make a judgment call during a build — before guessing, before escalating.',
+    '> This file is hand-editable. If you change it during a build, note why in the commit.',
+    '',
+    '---',
+    '',
+    TENETS_INHERITED_MD,
+    '',
+    '---',
+    '',
+    '## App-specific tenets',
+    '',
+    "> App tenets do **not** override inherited workflow tenets — they complement them. If an app tenet conflicts with a workflow tenet, the workflow tenet wins; flag the conflict with `/flag`.",
+    '',
+    app,
+    '',
+    '---',
+    '',
+    '## Escalation budget',
+    '',
+    `- **Max session cost**: $${eb.maxSessionCostUsd}`,
+    `- **Max failures per task**: ${eb.maxFailuresPerTask}`,
+    ''
+  ].join('\n');
+}
+
+// Render plan.md: the human-readable narrative of the lock (lock wins where they disagree — T10).
+function renderPlanMd(lock) {
+  const L = [];
+  const name = (isObj(lock.app) && nonEmptyStr(lock.app.name)) ? lock.app.name : 'App';
+  L.push(`# ${name} — plan`, '');
+  if (lock.incomplete) {
+    const n = (lock.openQuestions || []).filter((q) => q && q.blockingCompose).length;
+    L.push(`> ⚠️ **INCOMPLETE** — ${n} blocking open question(s). \`/decompose\` will refuse this plan until they are resolved in vision.md and \`/vision\` is re-run.`, '');
+  }
+  if (isObj(lock.app) && nonEmptyStr(lock.app.description)) L.push(lock.app.description, '');
+  L.push('## Must-haves', '');
+  (lock.mustHaves || []).forEach((m) => L.push(`- **${m.id}**: ${m.text}`));
+  L.push('', '## Success metric', '');
+  (lock.successMetric.steps || []).forEach((s) => L.push(`- **${s.id}**: ${s.text}`));
+  L.push('', '## Stack', '');
+  for (const [k, v] of Object.entries(lock.stack || {})) L.push(`- **${k}**: ${v.choice} — ${v.why}`);
+  L.push('', '## Data model', '');
+  (lock.dataModel || []).forEach((e) => L.push(`- **${e.entity}** — fields: ${(e.fields || []).join(', ') || '(none)'}${(e.relationships && e.relationships.length) ? `; relationships: ${e.relationships.join(', ')}` : ''}`));
+  L.push('', '## Feature order', '');
+  (lock.featureOrder || []).forEach((f, i) => L.push(`${i + 1}. **${f.name}** — formulas: ${(f.formulas || []).join(', ')}`));
+  L.push('', '## Coverage (must-have → feature)', '');
+  (lock.coverage || []).forEach((c) => L.push(`- **${c.mustHaveId}** → ${(c.features || []).join(', ')}: ${c.how}`));
+  L.push('', '## Concerns', '');
+  (lock.concerns || []).forEach((c) => L.push(`- **${c.concernId}**: ${c.status} — ${c.status === 'addressed' ? c.evidence : c.reason}`));
+  if ((lock.openQuestions || []).length) {
+    L.push('', '## Open questions', '');
+    lock.openQuestions.forEach((q) => L.push(`- ${q.blockingCompose ? '**[BLOCKING]** ' : ''}${q.question}${q.context ? ` _(${q.context})_` : ''}`));
+  }
+  L.push('', '## Escalation budget', '', `- Max session cost: $${lock.escalationBudget.maxSessionCostUsd}`, `- Max failures per task: ${lock.escalationBudget.maxFailuresPerTask}`, '');
+  return L.join('\n');
+}
+
+// Pure-JS Phase 4 orchestration: reconcile -> coverage -> the four gates -> assemble + validate + render.
+// No agents (the file write is the only agent, dispatched by main()). Returns everything main() needs.
+function reconcileAndAssemble(input) {
+  const frozen = isObj(input.frozen) ? input.frozen : {};
+  const carried = isArr(input.blocks) ? input.blocks.slice() : [];
+  const allFeatures = isArr(frozen.featureOrder) ? frozen.featureOrder : [];
+  const featuresWithFormula = allFeatures.filter((f) => isObj(f) && nonEmptyStr(f.name) && isArr(f.formulas) && f.formulas.filter(nonEmptyStr).length >= 1);
+  for (const f of allFeatures) {
+    if (isObj(f) && nonEmptyStr(f.name) && !(isArr(f.formulas) && f.formulas.filter(nonEmptyStr).length >= 1)) {
+      carried.push({ token: 'no-matching-formula', note: `feature "${f.name}" has no formula bound — pick a stack-native formula or drop the feature.` });
+    }
+  }
+  const { lockConcerns, undecided, contradictions } = reconcileConcerns(input.concerns, input.applicability);
+  const { coverage, uncovered } = buildCoverage(frozen.mustHaves, featuresWithFormula, input.concerns);
+  const orphans = reverseTraceOrphans(featuresWithFormula, coverage);
+  const nongoalConflicts = musthaveNongoalConflicts(frozen.mustHaves, frozen.nonGoals);
+  const openQuestions = runGatesV4({ blocks: carried, undecided, contradictions, uncovered, orphans, nongoalConflicts });
+  const lock = assembleLock({ frozen: { ...frozen, featureOrder: featuresWithFormula }, lockConcerns, coverage, openQuestions, sections: input.sections });
+  const { ok, errors } = validateLock(lock);
+  return { ok, validationErrors: errors, incomplete: lock.incomplete, lock, openQuestions, tenetsMd: renderTenets(frozen, input.sections), planMd: renderPlanMd(lock) };
+}
+
+// ===========================================================================
 // Agent prompts (self-contained — the agents run in the app cwd, no repo docs).
 // ===========================================================================
 function intakePrompt(A) {
@@ -497,6 +1004,34 @@ Return ONLY the structured object (its schema is enforced).
 `.trim();
 }
 
+// The lone Phase-4 agent. The lock/plan.md/tenets.md are ALREADY built + validated by the workflow — the
+// agent is a dumb file-writer (the sandbox has no filesystem). It must write the bytes verbatim, never
+// re-derive or "improve" them (T10 — the lock is the contract; reformatting it would desync it from the verdict).
+function assemblePrompt(A) {
+  return `
+You are the ASSEMBLE agent for the /vision workflow (Phase 4). The plan.lock.json, plan.md, and tenets.md content below has ALREADY been built and schema-validated by the workflow. Your ONLY job is to WRITE each to its path EXACTLY as given — do NOT edit, reformat, re-derive, pretty-print differently, or "improve" any byte (T10: the lock is the machine contract; any drift desyncs it from the computed verdict).
+
+Write these three files (create parent directories if needed), each with the EXACT content shown:
+
+FILE 1 — ${A.outPath}
+\`\`\`json
+${A.lockJson}
+\`\`\`
+
+FILE 2 — ${A.planMdPath}
+\`\`\`markdown
+${A.planMd}
+\`\`\`
+
+FILE 3 — ${A.tenetsPath}
+\`\`\`markdown
+${A.tenetsMd}
+\`\`\`
+
+Use the Write tool once per file. When all three are written, return { "status": "ok", "written": ["${A.outPath}", "${A.planMdPath}", "${A.tenetsPath}"] }. If any write fails, return { "status": "failed", "written": [<paths that succeeded>], "failedReason": "<the error>" } — surface the failure, never report success you did not achieve (T7).
+`.trim();
+}
+
 // ===========================================================================
 // Structured-output schemas (the runtime validates the agent's reply shape).
 // ===========================================================================
@@ -573,6 +1108,17 @@ const CONCERN_SCHEMA = {
     reason: { type: 'string' },
     coverageLink: { type: 'object', required: ['mustHaveId', 'features'], properties: { mustHaveId: { type: 'string' }, features: { type: 'array', items: { type: 'string' } } } },
     blockingQuestion: { type: 'object', required: ['question', 'context'], properties: { question: { type: 'string' }, context: { type: 'string' } } }
+  }
+};
+
+// Phase 4 assemble agent reply — it only reports which files it wrote (the lock content is the workflow's, not the agent's).
+const ASSEMBLE_SCHEMA = {
+  type: 'object',
+  required: ['status', 'written'],
+  properties: {
+    status: { type: 'string', enum: ['ok', 'failed'] },
+    written: { type: 'array', items: { type: 'string' } },
+    failedReason: { type: 'string' }
   }
 };
 
@@ -733,6 +1279,102 @@ function runSelftest() {
   check('fan-out yields exactly one record per applicable concern, all decided',
     fanned.length === ci.length && fanned.every(isDecided) && new Set(fanned.map((r) => r.concernId)).size === ci.length);
 
+  // ---- Phase 4: reconcile + gates + assemble + validate ----
+  check('STANDARD_EXCLUSIONS covers the five excluded-by-default concerns',
+    ['authn', 'authz', 'secrets', 'perf-envelope', 'abuse-surface'].every((id) => nonEmptyStr(standardExclusion(id))));
+
+  // A fully-decided scenario: signals -> authn/authz/secrets/observability applicable; perf+abuse folded.
+  const p4appl = deriveApplicability({ impliesAccounts: true, multipleHumanRoles: true, multiplePrincipals: true, crossUserData: true, productionOperation: true });
+  const p4frozen = deepFreeze({
+    app: { name: 'Tasklane', slug: 'tasklane', summary: 'Multi-tenant task boards.' },
+    mustHaves: [{ id: 'M1', text: 'Admins invite members' }, { id: 'M2', text: 'Members create and assign tasks' }],
+    successMetric: { statement: 'An admin invites a member who logs in and sees a task.', steps: ['admin invites member', 'member logs in', 'member sees task'] },
+    stack: { 'Core/services': { choice: 'Rust', why: 'DEFAULT_STACK core' }, 'Database': { choice: 'PostgreSQL', why: 'DEFAULT_STACK truth layer' }, 'Product surface': { choice: 'TypeScript + React', why: 'DEFAULT_STACK product surface' }, 'AI/data service': { choice: 'n/a', why: 'no model serving' } },
+    dataModel: [{ entity: 'User', fields: ['id', 'email'] }, { entity: 'Task', fields: ['id', 'title'], relationships: ['belongs_to User'] }],
+    featureOrder: [
+      { name: 'Platform', formulas: ['app-skeleton-rust-cargo'] },
+      { name: 'Auth', formulas: ['oidc-client-rust'], vars: { provider: 'zitadel' }, mustHaveId: 'M1' },
+      { name: 'Tasks', formulas: ['crud-feature-rust'], mustHaveId: 'M2' }
+    ],
+    nonGoals: ['No time tracking']
+  });
+  const decidedConcerns = [
+    { concernId: 'data-model', status: 'addressed', evidence: 'User + Task entities in Data model', applicability: 'required' },
+    { concernId: 'authn', status: 'addressed', evidence: "feature 'Auth' via oidc-client-rust", applicability: 'required', coverageLink: { mustHaveId: 'M1', features: ['Auth'] } },
+    { concernId: 'authz', status: 'addressed', evidence: "feature 'Auth' enforces per-tenant access", applicability: 'required' },
+    { concernId: 'secrets', status: 'addressed', evidence: 'OIDC client secret via env; .env gitignored', applicability: 'required' },
+    { concernId: 'data-lifecycle', status: 'addressed', evidence: 'tasks soft-deleted; migrations additive in v1 (T5)', applicability: 'optional' },
+    { concernId: 'error-handling', status: 'addressed', evidence: 'no swallowed exceptions (T7)', applicability: 'required' },
+    { concernId: 'observability', status: 'addressed', evidence: "feature 'Platform' wires otel-bootstrap-rust", applicability: 'required' },
+    { concernId: 'external-integrations', status: 'addressed', evidence: 'OIDC IdP (Zitadel) via oidc-client-rust; no other third-party deps', applicability: 'required' }
+  ];
+  const asmOk = reconcileAndAssemble({ frozen: p4frozen, applicability: p4appl, concerns: decidedConcerns, blocks: [], sections: { escalationBudget: 'Budget < $30/mo; 3 failures per task' } });
+  check('Phase4 VERIFY: a fully-decided plan validates as a COMPLETE v2 lock',
+    asmOk.ok && asmOk.incomplete === false && asmOk.lock.schemaVersion === 2 && asmOk.validationErrors.length === 0);
+  check('Phase4 reconcile folds in excluded-by-default concerns -> all 10 decided',
+    asmOk.lock.concerns.length === CONCERN_IDS.length && CONCERN_IDS.every((id) => asmOk.lock.concerns.some((c) => c.concernId === id)) && asmOk.lock.concerns.some((c) => c.concernId === 'perf-envelope' && c.status === 'excluded'));
+  check('Phase4 assemble strips non-lock fields (app.slug, mustHaves.deferred, successMetric.statement, featureOrder.mustHaveId)',
+    !('slug' in asmOk.lock.app) && asmOk.lock.mustHaves.every((m) => !('deferred' in m)) && !('statement' in asmOk.lock.successMetric) && asmOk.lock.featureOrder.every((f) => !('mustHaveId' in f)));
+  check('Phase4 assemble maps stack to the schema enum keys and drops unmappable layers',
+    Object.keys(asmOk.lock.stack).every((k) => STACK_ENUM.includes(k)) && asmOk.lock.stack.backend && asmOk.lock.stack.frontend && asmOk.lock.stack.database);
+  check('Phase4 builds coverage for every must-have (forward-coverage clean)',
+    asmOk.lock.coverage.length === 2 && asmOk.lock.coverage.every((c) => c.features.length >= 1 && nonEmptyStr(c.how)));
+  check('Phase4 parses the §9 escalation budget ($30, 3 failures)',
+    asmOk.lock.escalationBudget.maxSessionCostUsd === 30 && asmOk.lock.escalationBudget.maxFailuresPerTask === 3);
+  check('Phase4 renders non-empty plan.md + tenets.md (tenets inherit T1..T10)',
+    asmOk.planMd.includes('# Tasklane — plan') && asmOk.tenetsMd.includes('T1. Escalate over guess') && asmOk.tenetsMd.includes('T10.') && asmOk.tenetsMd.includes('Do not build: No time tracking'));
+
+  // VERIFY: a required+excluded concern -> NEEDS-INPUT + incomplete:true (the acceptance's contradiction scan).
+  const contraConcerns = decidedConcerns.map((c) => c.concernId === 'authn' ? { concernId: 'authn', status: 'excluded', reason: 'no login', applicability: 'required' } : c);
+  const asmContra = reconcileAndAssemble({ frozen: p4frozen, applicability: p4appl, concerns: contraConcerns, blocks: [], sections: {} });
+  check('Phase4 VERIFY: a required+excluded concern returns NEEDS-INPUT (incomplete:true) and a valid lock',
+    asmContra.ok && asmContra.incomplete === true && asmContra.lock.incomplete === true);
+  check('Phase4 contradiction scan emits the required-excluded-contradiction gate token',
+    asmContra.openQuestions.some((q) => GATE_TOKENS['required-excluded-contradiction'].test(q.context) && q.blockingCompose === true));
+
+  // decide-only concerns (external-integrations "none" etc) excluded != contradiction; a signal-elevated one is.
+  const recDecideOnly = reconcileConcerns([{ concernId: 'external-integrations', status: 'excluded', reason: 'none', applicability: 'required' }], { ...p4appl, 'external-integrations': 'required' });
+  check('Phase4 reconcile: a decide-only concern (external-integrations) excluded is NOT a contradiction',
+    recDecideOnly.contradictions.length === 0);
+  const recElevated = reconcileConcerns([{ concernId: 'authn', status: 'excluded', reason: 'no login', applicability: 'required' }], { ...p4appl, authn: 'required' });
+  check('Phase4 reconcile: a signal-elevated concern (authn) excluded IS a contradiction',
+    recElevated.contradictions.some((c) => c.concernId === 'authn'));
+
+  // An undecided applicable concern -> decidedness block.
+  const undecConcerns = decidedConcerns.map((c) => c.concernId === 'observability' ? { concernId: 'observability', status: 'failed', applicability: 'required', blockingQuestion: { question: 'are metrics required?', context: 'concern-decidedness: undecided' } } : c);
+  const asmUndec = reconcileAndAssemble({ frozen: p4frozen, applicability: p4appl, concerns: undecConcerns, blocks: [], sections: {} });
+  check('Phase4 decidedness gate: an undecided applicable concern blocks with concern-decidedness',
+    asmUndec.incomplete === true && asmUndec.openQuestions.some((q) => GATE_TOKENS['concern-decidedness'].test(q.context)));
+
+  // forward-coverage: drop the feature delivering M2 -> M2 uncovered -> blocking.
+  const noM2 = deepFreeze({ ...JSON.parse(JSON.stringify(p4frozen)), featureOrder: p4frozen.featureOrder.filter((f) => f.mustHaveId !== 'M2') });
+  const asmNoCov = reconcileAndAssemble({ frozen: noM2, applicability: p4appl, concerns: decidedConcerns, blocks: [], sections: {} });
+  check('Phase4 forward-coverage gate: an uncovered must-have blocks with forward-coverage',
+    asmNoCov.incomplete === true && asmNoCov.openQuestions.some((q) => GATE_TOKENS['forward-coverage'].test(q.context)));
+
+  // musthave<->nongoal contradiction (and NO false-fire on the coherent fixture).
+  check('Phase4 musthave-nongoal: a must-have requiring a §5 non-goal phrase conflicts',
+    musthaveNongoalConflicts([{ id: 'M1', text: 'Provide time tracking for members' }], ['No time tracking']).length === 1);
+  check('Phase4 musthave-nongoal: no false-fire when no must-have requires the non-goal',
+    musthaveNongoalConflicts(p4frozen.mustHaves, p4frozen.nonGoals).length === 0);
+
+  // validateLock catches a schema breach the skeleton->lock mapping must prevent (a stray app.slug).
+  const dirtyLock = JSON.parse(JSON.stringify(asmOk.lock)); dirtyLock.app.slug = 'tasklane';
+  check('validateLock rejects a disallowed additionalProperty (app.slug)',
+    validateLock(dirtyLock).ok === false && validateLock(dirtyLock).errors.some((e) => /app\.slug/.test(e)));
+  const badStack = JSON.parse(JSON.stringify(asmOk.lock)); badStack.stack['core/services'] = { choice: 'Rust', why: 'x' };
+  check('validateLock rejects a stack key outside the enum',
+    validateLock(badStack).ok === false && validateLock(badStack).errors.some((e) => /not in allowed enum/.test(e)));
+
+  // agentConsults pass-through: lock-shaped entries survive; malformed ones drop (never invented, T1).
+  const consultFrozen = deepFreeze({ ...JSON.parse(JSON.stringify(p4frozen)), agentConsults: [
+    { question: 'Queue or cron?', decision: 'Use a cron poller', rationale: 'simpler for v1', reversalCost: 'low — swap the trigger' },
+    { decision: 'partial — no question', rationale: 'x', alternatives: ['y'] }
+  ] });
+  const asmConsult = reconcileAndAssemble({ frozen: consultFrozen, applicability: p4appl, concerns: decidedConcerns, blocks: [], sections: {} });
+  check('Phase4 agentConsults: lock-shaped consult passes through, malformed one dropped, lock still valid',
+    asmConsult.ok && isArr(asmConsult.lock.agentConsults) && asmConsult.lock.agentConsults.length === 1 && asmConsult.lock.agentConsults[0].reversalCost === 'low — swap the trigger');
+
   const passed = results.filter((r) => r.pass).length;
   return { results, passed, total: results.length, ok: passed === results.length };
 }
@@ -802,21 +1444,42 @@ async function main() {
   const undecided = concerns.filter((r) => !isDecided(r));
   log(`vision: concerns decided — ${concerns.length - undecided.length}/${concerns.length} decided${undecided.length ? `, ${undecided.length} undecided (concern-decidedness): ${undecided.map((r) => r.concernId).join(', ')}` : ''}.`);
 
-  // Phase 4 (reconcile: fold in excluded-by-default concerns + the four gates + decidedness verdict +
-  // assemble lock v2/tenets/plan.md) is appended by autonomous-build-ih5.4. ih5.3 returns the frozen skeleton
-  // + applicability + the per-concern fan-out results so the seam is exercisable end-to-end now. `incomplete`
-  // here is NOT the final verdict — Phase 4 computes it from these blocking questions + the coverage gates.
-  return {
-    status: 'ok',
-    skeleton: frozen,
-    signals: skelRaw && skelRaw.signals,
-    applicability,
-    applicableConcerns: applicable,
-    concerns,
-    blocks,
-    incomplete: false, // placeholder — Phase 4 (ih5.4) sets the real verdict from concerns[] + the gates.
-    note: 'Phases 1-3 (autonomous-build-ih5.3); reconcile + decidedness verdict + assemble land in ih5.4.'
-  };
+  // ---- Phase 4: reconcile + four gates + decidedness verdict + assemble (pure JS; agent only writes) ----
+  phase('Assemble');
+  const asm = reconcileAndAssemble({ frozen, applicability, concerns, blocks, sections: intake.sections });
+
+  // A schema-invalid assembled lock is a workflow bug (the workflow built it, not an agent) — fail LOUD,
+  // write nothing (T7). There is no agent to retry an object we assembled, so we surface the errors instead.
+  if (!asm.ok) {
+    log(`vision: FAILED — assembled lock is schema-invalid (workflow bug): ${asm.validationErrors.slice(0, 6).join('; ')}`);
+    return { status: 'failed', incomplete: asm.incomplete, lock: asm.lock, validationErrors: asm.validationErrors, openQuestions: asm.openQuestions, dryRun: A.dryRun };
+  }
+
+  const verdict = asm.incomplete ? 'needs-input' : 'ok';
+  const tokens = asm.openQuestions.map((q) => String(q.context || '').split(':')[0]).filter(Boolean);
+  const planMdPath = siblingPath(A.outPath, 'plan.md');
+  const tenetsPath = siblingPath(A.outPath, 'tenets.md');
+  const reportPaths = { planLock: A.outPath, planMd: planMdPath, tenets: tenetsPath };
+
+  // Dry-run: return the would-be lock + verdict without writing (the --no-file inspection path).
+  if (A.dryRun) {
+    log(`vision: ${asm.incomplete ? 'NEEDS-INPUT' : 'COMPLETE'} (dry-run, nothing written) — ${asm.lock.concerns.length} concern(s) decided, ${asm.lock.coverage.length}/${asm.lock.mustHaves.length} must-have(s) covered${asm.incomplete ? `, ${asm.openQuestions.length} blocking question(s): ${tokens.join(', ')}` : ''}.`);
+    return { status: verdict, incomplete: asm.incomplete, lock: asm.lock, openQuestions: asm.openQuestions, reportPaths, dryRun: true };
+  }
+
+  // Write the three files via the lone Phase-4 agent (the sandbox has no filesystem). The lock is incomplete:true
+  // when blocked, so /decompose pre-flight refuses it cleanly — the same gate the must-have path uses.
+  const writeRes = await agent(
+    assemblePrompt({ outPath: A.outPath, planMdPath, tenetsPath, lockJson: JSON.stringify(asm.lock, null, 2), planMd: asm.planMd, tenetsMd: asm.tenetsMd }),
+    { label: 'assemble', phase: 'Assemble', schema: ASSEMBLE_SCHEMA }
+  );
+  const written = (writeRes && isArr(writeRes.written)) ? writeRes.written : [];
+  if (!writeRes || writeRes.status !== 'ok') {
+    log(`vision: assemble agent did not confirm all writes — ${writeRes && writeRes.failedReason ? writeRes.failedReason : 'no ok status'} (wrote: ${written.join(', ') || 'none'}).`);
+  }
+  log(`vision: ${asm.incomplete ? 'NEEDS-INPUT' : 'COMPLETE'} — wrote ${written.length} file(s)${asm.incomplete ? `; incomplete:true, ${asm.openQuestions.length} blocking question(s): ${tokens.join(', ')}` : `; ${asm.lock.concerns.length} concerns decided, ${asm.lock.coverage.length}/${asm.lock.mustHaves.length} must-have(s) covered`}.`);
+
+  return { status: verdict, incomplete: asm.incomplete, lock: asm.lock, openQuestions: asm.openQuestions, reportPaths, written, dryRun: false };
 }
 
 // Entry point — guarded so `node`/`import` (for the selftest harness) never triggers agent calls.
@@ -836,8 +1499,12 @@ if (typeof agent === 'function') {
     validateIntake, buildNeedsInput, deriveApplicability, applicableConcerns,
     normalizeSkeleton, detectOffEnumPicks, runSelftest,
     concernBlock, isDecided, concernInputs, normalizeConcernResult,
-    intakePrompt, skeletonPrompt, concernPrompt, parseArgs,
+    standardExclusion, reconcileConcerns, buildCoverage, reverseTraceOrphans,
+    musthaveNongoalConflicts, parseEscalationBudget, mapStack, runGatesV4,
+    assembleLock, validateLock, renderTenets, renderPlanMd, reconcileAndAssemble, siblingPath,
+    intakePrompt, skeletonPrompt, concernPrompt, assemblePrompt, parseArgs,
     CONCERN_IDS, CONCERN_BARS, EVIDENCE_BAR, GATE_TOKENS, DEFAULT_STACK, SIGNAL_NAMES, LOAD_BEARING,
-    INTAKE_SCHEMA, SKELETON_SCHEMA, CONCERN_SCHEMA
+    STANDARD_EXCLUSIONS, DECIDE_ONLY_CONCERNS, STACK_ENUM, STACK_KEY_MAP, TENETS_INHERITED_MD,
+    INTAKE_SCHEMA, SKELETON_SCHEMA, CONCERN_SCHEMA, ASSEMBLE_SCHEMA
   };
 }

@@ -154,9 +154,9 @@ ConcernResult = {
 
 ---
 
-## Phase 4 — Reconcile + decidedness verdict + assemble (sequential, 1–2 agents + pure-JS gates)
+## Phase 4 — Reconcile + decidedness verdict + assemble (sequential, pure-JS + 1 write-agent)
 
-Collect the Phase-3 results, fold in the excluded-by-default concerns, run the four gates, compute the decidedness verdict, and assemble the three output files. The gates are **pure JS** where they can be (mechanical set checks), mirroring `decompose`/`vision-eval` — only the file-writing is an agent (the sandbox cannot write files).
+Collect the Phase-3 results, fold in the excluded-by-default concerns, run the four gates, compute the decidedness verdict, build the `plan.lock.json` object, and render `plan.md` + `tenets.md`. **Everything except the file write is pure JS** (reconcile, gates, lock assembly, schema validation, plan.md/tenets.md rendering) — deterministic, reproducible, and selftestable with no agents, the same discipline the gates already use and the property `vision-eval`'s L3 stability layer grades. The **lone Phase-4 agent is a dumb file-writer**: it receives the already-built, already-validated lock/plan.md/tenets.md content and writes it verbatim (the sandbox has no filesystem). Building the machine contract in code, not in an agent, is what keeps the lock identical across runs and what lets the `--selftest` exercise the whole Verify path (complete → COMPLETE+valid; required+excluded → NEEDS-INPUT+`incomplete:true`) without spending an agent.
 
 ### Gates (the controlled `openQuestions[].context` vocabulary)
 
@@ -167,23 +167,25 @@ Each gate that fires appends a blocking `openQuestion` whose `context` **starts 
 | **6.5 decidedness** | `concern-decidedness` | any applicable concern is undecided (a Phase-3 `blockingQuestion` or `status: 'failed'`). |
 | **6.6 forward-coverage** | `forward-coverage` | a §3 must-have maps to no `featureOrder[]` feature (and is not `deferred`). |
 | **6.7 reverse-trace** | `reverse-trace` | a `featureOrder[]` feature traces to no §3 must-have / declared infra need (scope creep). |
-| **8.6 musthave-nongoal** | `musthave-nongoal-contradiction` | a §3 must-have contradicts a §5 non-goal (internally inconsistent vision). |
-| (also) **no formula** | `no-matching-formula` | a must-have's feature has no installed formula (carried from Phase 2). |
+| **8.6 musthave-nongoal** | `musthave-nongoal-contradiction` | a §3 must-have contradicts a §5 non-goal (internally inconsistent vision). Conservative substring check (errs toward not-firing; a false block of a coherent plan is the worse failure for the stability harness — deeper semantic detection is future work). |
+| (also) **required+excluded** | `required-excluded-contradiction` | a **signal-elevated** applicable concern is decided `excluded` — the vision implied the product needs it (e.g. accounts ⇒ `authn`) but the plan excluded it. Does **not** fire for the *decide-only* concerns (`data-model`, `error-handling`, `external-integrations`), where `excluded` is a valid decision ("none", "stateless CLI"). This is the acceptance's contradiction scan. |
+| (also) **no formula** | `no-matching-formula` | a must-have's feature has no installed formula (carried from Phase 2; a formula-less `featureOrder[]` entry is also caught here at assembly and dropped from the lock). |
 | (also) **empty product** | `missing-product-sections` | load-bearing sections were empty (carried from Phase 1's `needs-input` on the headless path). |
 
 `incomplete` is **defined** as "any `openQuestion.blockingCompose === true`" — the same definition `schemas/plan.lock.schema.json` and `vision-eval`'s L1 enforce. The verdict is not a separate boolean; it falls out of the gate results.
 
 ### Steps
 
-1. **Reconcile (pure JS):** merge Phase-3 `ConcernResult[]` with the excluded-by-default concerns into one `concerns[]` (every one of the ten `CONCERN_IDS` present and decided, or carrying a blocking question). Build `coverage[]` from the must-haves + the concern `coverageLink`s + `featureOrder` mapping.
+1. **Reconcile (pure JS):** merge the Phase-3 `ConcernResult[]` with the excluded-by-default concerns into the lock's `concerns[]`. The lock status enum is `addressed | excluded` **only** — an undecided concern cannot be represented in the lock, so it surfaces as a blocking `openQuestion` (decidedness) instead, and a blocking plan may carry fewer than ten `concerns[]` entries (that is why `vision-eval`'s L1 only requires all-ten-decided on a *complete* plan). The required+excluded contradiction scan runs here (signal-elevated concerns only; `DECIDE_ONLY_CONCERNS` exempt). Build `coverage[]` from the must-haves + the concern `coverageLink`s + `featureOrder[].mustHaveId` mapping.
 2. **Run the four gates (pure JS set checks)** over the frozen skeleton + reconciled concerns; collect blocking `openQuestions[]` with their gate tokens.
 3. **Decidedness verdict:** `incomplete = openQuestions.some(q => q.blockingCompose)`. (Mechanical, not a judgement.)
-4. **Assemble (1 agent — file writes):** build the `plan.lock.json` object conforming to `schemas/plan.lock.schema.json` (schemaVersion 2): `app`, `mustHaves`, `successMetric`, `stack`, `dataModel`, `featureOrder`, `coverage`, `concerns`, `crossFeatureDependencies`, `escalationBudget`, `openQuestions`, `incomplete`, optional `agentConsults`. Then render `plan.md` (human-readable) and `tenets.md` (T1–T10 inherited verbatim from `docs/TENETS.md` + any app-specific additions the vision implies). Validate the lock against the schema before writing; a schema-invalid lock is a workflow bug, not an output (T7). Skip all writes if `Context.dryRun`.
-5. **Return** the verdict + paths to the runtime (and, on the skill-shell path, back to the shell for the human-facing summary).
+4. **Assemble + validate + render (pure JS):** build the `plan.lock.json` object conforming to `schemas/plan.lock.schema.json` (schemaVersion 2). This is the mechanical skeleton→lock **mapping**: drop the skeleton fields the lock has no slot for (`app.slug`, `mustHaves[].deferred`, `successMetric.statement`, `featureOrder[].mustHaveId`), decompose `successMetric` into `{id,text}` steps, and map the skeleton's stack layers onto the schema's `stack` key enum (unmappable layers drop to `plan.md` prose). Then render `plan.md` (human-readable) and `tenets.md` (T1–T10 inherited verbatim — inlined as `TENETS_INHERITED_MD`, SYNC with `templates/tenets.md` + `docs/TENETS.md` — plus one app tenet per §5 non-goal + the locked-stack tenet). Validate the assembled lock against the schema with `validateLock` (a strict **superset** of `vision-eval.js`'s L1 `validatePlanLock`: the same checks plus the `additionalProperties` / stack-key-enum constraints).
+5. **Write (1 agent):** the lone Phase-4 agent writes the three already-built strings to `planLock` / `planMd` / `tenets` paths verbatim. Skip the agent entirely if `Context.dryRun` (return the would-be lock + verdict, write nothing).
+6. **Return** the verdict + paths to the runtime (and, on the skill-shell path, back to the shell for the human-facing summary).
 
 **Output:** `{ status: 'ok' | 'needs-input' | 'failed', incomplete: <bool>, lock: <obj>, openQuestions: [...], reportPaths: { planLock, planMd, tenets }, dryRun }`.
 
-**Failure (T7):** schema validation failure on the assembled lock → retry the assemble agent once; on second failure return `{ status: 'failed', lock, validationErrors }` with the errors loud, write nothing.
+**Failure (T7):** the lock is built **in pure JS, not by an agent**, so a `validateLock` failure is a deterministic workflow bug — there is no agent to retry. Return `{ status: 'failed', lock, validationErrors }` with the errors loud and **write nothing**. (A write-agent that fails to write a valid lock is logged loud but does not corrupt the verdict.)
 
 ---
 
@@ -194,7 +196,7 @@ Every `agent()` call that must return data uses a JSON Schema so the runtime val
 - **`intake`** → `{ status: 'ok'|'needs-input'|'failed', context?: {...}, missing?: [<section>], failedReason?: <string> }`
 - **`skeleton`** → `{ skeleton: <FrozenSkeleton>, signals: { <signalName>: <bool> }, blocks?: [{ token, note }] }` — the agent emits observable `signals`; the workflow computes `applicability` from them in pure JS (`deriveApplicability`), so the agent never hand-assigns a concern's tier.
 - **`concern`** (per applicable concern) → the `ConcernResult` shape above: `{ concernId, status: 'addressed'|'excluded'|'failed', evidence?, reason?, applicability, coverageLink?, blockingQuestion? }`
-- **`assemble`** → `{ status: 'ok'|'failed', incomplete: <bool>, written: [<path>], validationErrors?: [<string>] }`
+- **`assemble`** (the write-agent) → `{ status: 'ok'|'failed', written: [<path>], failedReason?: <string> }` — it only reports which files it wrote; the lock/plan.md/tenets.md content is the workflow's (built + validated in pure JS), not the agent's, so it carries no `validationErrors` (validation already happened upstream).
 
 > **Honesty note (mirrors `vision-eval`'s "honest" rule).** The `concern` agent is schema-constrained on its *output shape* but the workflow does **not** hand it the answer — it must derive `addressed`/`excluded` and the evidence itself. The `EVIDENCE_BAR` is applied by the agent at derivation time and re-checkable downstream by `vision-eval`'s L4 judge: `/vision` is the producer, `vision-eval` is the independent grader, and they share only the inlined bar — never a verdict.
 
