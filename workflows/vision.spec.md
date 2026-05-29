@@ -44,7 +44,7 @@ The workflow accepts these arguments (parsed from the invocation; all optional):
 
 | Arg | Default | Meaning |
 | --- | --- | --- |
-| `--vision <path>` | `vision.md` in cwd | The human's product brief. Sections §1 problem, §2 users/roles, §3 must-haves, §4 nice-to-haves, §5 success metric, §6 constraints, §7 non-goals. |
+| `--vision <path>` | `vision.md` in cwd | The human's product brief. Sections §1 problem, §2 users/roles, §3 must-haves, §4 nice-to-haves, §5 non-goals, §6 constraints, §7 tech-preferences, §8 success metric, §9 escalation budget, §10 anything-else (the numbering `templates/vision.md` ships — success metric is §8, non-goals §5). |
 | `--skeleton <path>` | none | A frozen skeleton JSON produced by the skill shell (Steps 2–5). When present, Phases 1–2 validate it instead of re-deriving; when absent, the workflow builds the skeleton headlessly (the `vision-eval` path). |
 | `--out <path>` | `plan.lock.json` in cwd | Where the assembled lock is written. `plan.md` + `tenets.md` are written next to it. |
 | `--no-file` | false | Dry-run: run all four phases and return the would-be lock + verdict, but write nothing. Used to inspect a derivation before it lands. |
@@ -78,11 +78,11 @@ Verify the run is viable and produce the `Context` the rest of the workflow cons
 **Tools:** `Bash`, `Read`, `Glob`
 **Steps:**
 1. `--vision` path exists. If not, fail with "no vision.md at `<path>` — `/vision` needs a filled product brief."
-2. Parse the seven sections. **Load-bearing sections** (§1 problem, §3 must-haves, §5 success metric) must be filled — not empty, not template placeholders. If any is empty/placeholder → `{ status: 'needs-input', missing: [<section>], note }`. The skill shell turns `needs-input` into a human question (the product checkpoint); a headless `Workflow vision` run surfaces it as a block (`incomplete: true` with a `missing-product-sections` openQuestion) rather than inventing content (T1).
+2. Parse the vision's sections. **Load-bearing sections** (§1 problem, §3 must-haves, §8 success metric) must be filled — not empty, not template placeholders. If any is empty/placeholder → `{ status: 'needs-input', missing: [<section>], note }`. The skill shell turns `needs-input` into a human question (the product checkpoint); a headless `Workflow vision` run surfaces it as a block (`incomplete: true` with a `missing-product-sections` openQuestion) rather than inventing content (T1).
 3. If `--skeleton` was passed, read it and validate it carries the skill-shell outputs (`app`, `mustHaves[]`, `successMetric`, `stack`, `dataModel[]`, `featureOrder[]`, plus the parsed `nonGoals[]`). A malformed skeleton fails loud. If `--skeleton` is absent, set `headless: true` (Phase 2 will build the skeleton itself).
 4. Resolve `--out` and the sibling `plan.md` / `tenets.md` paths.
 
-**Output:** `Context = { visionPath, sections: { problem, users, mustHaves, niceToHaves, successMetric, constraints, nonGoals }, skeleton: <obj|null>, headless: <bool>, outPath, planMdPath, tenetsPath, dryRun }`
+**Output:** `Context = { visionPath, sections: { problem, users, mustHaves, niceToHaves, nonGoals, constraints, techPreferences, successMetric, escalationBudget, anythingElse }, skeleton: <obj|null>, headless: <bool>, outPath, planMdPath, tenetsPath, dryRun }` — keyed by section *name* (the intake agent maps by heading, not by number, so a renumbered vision still parses).
 
 **Failure:** missing vision, unparseable sections, or a malformed `--skeleton` → stop (T1/T7). `needs-input` is a clean structured exit, not a crash.
 
@@ -107,11 +107,12 @@ Produce (or normalize) the **frozen skeleton** the concern fan-out reasons again
      stack: { <layer>: { choice, why }, ... },
      dataModel: [{ entity, fields: [...], relationships: [...] }],
      featureOrder: [{ name, formulas: [...], vars: {...}, mustHaveId? }],
-     nonGoals: [<string>],                            // from §7 — Phase 4's musthave-nongoal gate reads this
+     nonGoals: [<string>],                            // from §5 — Phase 4's musthave-nongoal gate reads this
      agentConsults: [{ decision, rationale, alternatives }]  // any off-stack decisions already made by the shell
    }
    ```
-3. **Pre-compute applicability** for each of the ten `CONCERN_IDS` from the frozen skeleton + the vision sections, using the inlined derivation table: each resolves to `required`, `optional`, or `excluded-by-default`. **Applicable** = `required` or `optional`; `excluded-by-default` concerns are recorded directly as `status: 'excluded'` with the standard reason (no agent needed) **unless** the vision elevates them.
+3. **Pre-compute applicability** for each of the ten `CONCERN_IDS`. The split that keeps this testable + honest: the `skeleton` agent emits only the **observable `signals`** it can read off the frozen skeleton + vision sections (booleans — `impliesAccounts`, `multipleHumanRoles`, `multiplePrincipals`, `crossUserData`, `privacyConstraint`, `holdsPii`, `productionOperation`, `externalIntegrations`, `scaleTarget`, `publicSurface`); a **pure-JS `deriveApplicability(signals)`** then applies the inlined derivation table to resolve each concern to `required`, `optional`, or `excluded-by-default`. (The agent reports facts; the rule is code — so the derivation is reproducible and the `--selftest` exercises it with no agents.) **Applicable** = `required` or `optional`; `excluded-by-default` concerns are recorded directly as `status: 'excluded'` with the standard reason (no agent needed) **unless** a signal elevates them.
+   - **Oracle-grounded reconciliation (SYNC note):** `docs/PLAN_CONCERNS.md` + `skills/vision/SKILL.md` say a §6 *privacy **or budget*** constraint elevates `secrets`/`data-lifecycle`. The eval oracle (fixture `04-public-unauth-api`) establishes that a **budget** line alone is a cost ceiling, *not* a secret-management signal — elevating `secrets` on budget there would manufacture a false `required+excluded` contradiction. So `deriveApplicability` elevates `secrets` only on `authnRequired || externalIntegrations || privacyConstraint`, and `data-lifecycle` only on `privacyConstraint || holdsPii`. A paid-API budget surfaces instead as `externalIntegrations`. The doc/skill prose should drop "budget" from the `secrets` elevator — tracked as a follow-up flag for `/retro`.
 4. **Freeze.** The skeleton is immutable from here. Phase 3 agents receive a deep copy; none may mutate it. (The freeze is what makes the ten derivations independent + reproducible.)
 
 **Output:** `FrozenSkeleton` (the object above) + `applicability = { <concernId>: 'required' | 'optional' | 'excluded-by-default' }`.
@@ -166,7 +167,7 @@ Each gate that fires appends a blocking `openQuestion` whose `context` **starts 
 | **6.5 decidedness** | `concern-decidedness` | any applicable concern is undecided (a Phase-3 `blockingQuestion` or `status: 'failed'`). |
 | **6.6 forward-coverage** | `forward-coverage` | a §3 must-have maps to no `featureOrder[]` feature (and is not `deferred`). |
 | **6.7 reverse-trace** | `reverse-trace` | a `featureOrder[]` feature traces to no §3 must-have / declared infra need (scope creep). |
-| **8.6 musthave-nongoal** | `musthave-nongoal-contradiction` | a §3 must-have contradicts a §7 non-goal (internally inconsistent vision). |
+| **8.6 musthave-nongoal** | `musthave-nongoal-contradiction` | a §3 must-have contradicts a §5 non-goal (internally inconsistent vision). |
 | (also) **no formula** | `no-matching-formula` | a must-have's feature has no installed formula (carried from Phase 2). |
 | (also) **empty product** | `missing-product-sections` | load-bearing sections were empty (carried from Phase 1's `needs-input` on the headless path). |
 
@@ -191,7 +192,7 @@ Each gate that fires appends a blocking `openQuestion` whose `context` **starts 
 Every `agent()` call that must return data uses a JSON Schema so the runtime validates the shape (the convention `decompose.js` / `vision-eval.js` follow). The load-bearing ones:
 
 - **`intake`** → `{ status: 'ok'|'needs-input'|'failed', context?: {...}, missing?: [<section>], failedReason?: <string> }`
-- **`skeleton`** → `{ skeleton: <FrozenSkeleton>, applicability: { <concernId>: 'required'|'optional'|'excluded-by-default' }, blocks?: [{ token, note }] }`
+- **`skeleton`** → `{ skeleton: <FrozenSkeleton>, signals: { <signalName>: <bool> }, blocks?: [{ token, note }] }` — the agent emits observable `signals`; the workflow computes `applicability` from them in pure JS (`deriveApplicability`), so the agent never hand-assigns a concern's tier.
 - **`concern`** (per applicable concern) → the `ConcernResult` shape above: `{ concernId, status: 'addressed'|'excluded'|'failed', evidence?, reason?, applicability, coverageLink?, blockingQuestion? }`
 - **`assemble`** → `{ status: 'ok'|'failed', incomplete: <bool>, written: [<path>], validationErrors?: [<string>] }`
 
@@ -221,7 +222,7 @@ When the workflow finishes:
 
 ## Stopping conditions
 
-- `vision.md` missing or load-bearing sections (§1/§3/§5) unfilled → Phase 1 `needs-input` (shell asks the human; headless run blocks via `missing-product-sections`). Never invent product content (T1).
+- `vision.md` missing or load-bearing sections (§1/§3/§8) unfilled → Phase 1 `needs-input` (shell asks the human; headless run blocks via `missing-product-sections`). Never invent product content (T1).
 - A concern cannot be decided from the vision → Phase 3 `blockingQuestion` → Phase 4 `concern-decidedness` block.
 - A must-have maps to no feature → `forward-coverage` block. A feature with no source must-have → `reverse-trace` block.
 - A must-have's feature has no installed formula → `no-matching-formula` block.
