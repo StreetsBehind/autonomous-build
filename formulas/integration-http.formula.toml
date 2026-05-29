@@ -36,7 +36,7 @@ description = "Base URL of the API (e.g. https://api.stripe.com). The client pre
 required = true
 
 [vars.auth_strategy]
-description = "Credential transport: 'api-key' (Authorization: Bearer | X-API-Key header), 'oauth-client-credentials' (token endpoint exchange), 'hmac-signed' (request signature), or 'none' (public API)."
+description = "Credential transport: 'api-key' (Authorization: Bearer | X-API-Key header), 'basic' (HTTP Basic — username:password base64 in the Authorization header; e.g. Twilio account-SID:auth-token), 'oauth-client-credentials' (token endpoint exchange), 'hmac-signed' (request signature), or 'none' (public API)."
 required = true
 
 [vars.retry_policy]
@@ -73,7 +73,7 @@ The typed HTTP client. Constructor / init accepts credentials as a plain paramet
 **Acceptance:**
 - Client class / module exported from one of the file paths above
 - Constructor accepts credentials directly (e.g. `new {{integration_name}}Client({ credentials: { ... } })`) — does NOT read from process.env, secret managers, or config files
-- Applies {{auth_strategy}} on every outbound request (Authorization header, signed request, or none — whichever the strategy requires)
+- Applies {{auth_strategy}} on every outbound request (Bearer/X-API-Key header for api-key, an `Authorization: Basic <base64(user:pass)>` header for basic, a signed request for hmac-signed, or nothing for none — whichever the strategy requires)
 - Implements {{retry_policy}} on 5xx and network errors; does NOT retry on 4xx (those are application errors, not transient failures)
 - Applies a per-request timeout of {{timeout_seconds}}s to connect AND read phases; on timeout raises a typed timeout error
 - Surfaces typed errors per response class: 4xx → client error, 5xx (after retries) → server error, network/timeout → transport error
