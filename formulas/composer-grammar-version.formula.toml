@@ -48,7 +48,6 @@ version = 1
 
 [vars.version]
 description = "Integer grammar version (>=1). Phase 1 pours version=1; Phase 4+ pours version=2 etc. when a breaking change requires it. Pre-transformed at pour time as a string; the schema files embed it as the URI segment `composer/grammar/v{{version}}/`."
-required = true
 default = "1"
 
 [vars.bump_from]
