@@ -7,9 +7,13 @@
   "required": [
     "schemaVersion",
     "app",
+    "mustHaves",
+    "successMetric",
     "stack",
     "dataModel",
     "featureOrder",
+    "coverage",
+    "concerns",
     "crossFeatureDependencies",
     "escalationBudget",
     "openQuestions",
@@ -19,8 +23,8 @@
   "properties": {
     "schemaVersion": {
       "type": "integer",
-      "const": 1,
-      "description": "Schema version. Bump on breaking changes; /compose refuses unknown versions."
+      "const": 2,
+      "description": "Schema version. Bump on breaking changes; /decompose refuses unknown versions. v2 added mustHaves[], successMetric, coverage[], concerns[] for the plan-stage coverage gate."
     },
     "app": {
       "type": "object",
@@ -29,6 +33,39 @@
       "properties": {
         "name": { "type": "string", "minLength": 1 },
         "description": { "type": "string" }
+      }
+    },
+    "mustHaves": {
+      "type": "array",
+      "description": "The product must-haves /vision lifted from vision.md §3, each with a stable ID (M1, M2, ...). Every entry must appear in coverage[] mapped to >=1 feature, else /vision flips incomplete=true. The set the forward-coverage gate checks against.",
+      "items": {
+        "type": "object",
+        "required": ["id", "text"],
+        "additionalProperties": false,
+        "properties": {
+          "id":   { "type": "string", "minLength": 1, "description": "Stable must-have ID, e.g. M1." },
+          "text": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "successMetric": {
+      "type": "object",
+      "description": "The vision.md §8 success metric decomposed into observable steps (S1, S2, ...). The success-metric oracle (bfo.5) maps each step to >=1 covered feature.",
+      "required": ["steps"],
+      "additionalProperties": false,
+      "properties": {
+        "steps": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "text"],
+            "additionalProperties": false,
+            "properties": {
+              "id":   { "type": "string", "minLength": 1, "description": "Stable step ID, e.g. S1." },
+              "text": { "type": "string" }
+            }
+          }
+        }
       }
     },
     "stack": {
@@ -114,6 +151,79 @@
           },
           "notes": { "type": "string" }
         }
+      }
+    },
+    "coverage": {
+      "type": "array",
+      "description": "Forward-coverage map: each must-have (by mustHaveId) to the feature(s) that deliver it and HOW. /vision asserts every mustHaves[].id appears here with >=1 feature; an uncovered must-have becomes a blocking openQuestion (incomplete=true).",
+      "items": {
+        "type": "object",
+        "required": ["mustHaveId", "features", "how"],
+        "additionalProperties": false,
+        "properties": {
+          "mustHaveId": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Matches a mustHaves[].id (e.g. M1)."
+          },
+          "features": {
+            "type": "array",
+            "minItems": 1,
+            "description": "featureOrder[].name entries that deliver this must-have.",
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "how": {
+            "type": "string",
+            "minLength": 1,
+            "description": "HOW the feature(s) deliver the must-have — falsifiable evidence, not a bare link. Mirrors the decompose anti-vagueness invariant."
+          }
+        }
+      }
+    },
+    "concerns": {
+      "type": "array",
+      "description": "One decided entry per applicable cross-cutting concern (data-model, authn, authz, secrets, data-lifecycle, error-handling, observability, external-integrations, perf-envelope, abuse-surface). concernId is validated against docs/PLAN_CONCERNS.md by /vision, NOT enumerated here — vocabulary edits never force a schema bump. Every applicable concern resolves to addressed (with evidence) or excluded (with reason); silence is the failure mode this prevents.",
+      "items": {
+        "type": "object",
+        "required": ["concernId", "status"],
+        "additionalProperties": false,
+        "properties": {
+          "concernId": {
+            "type": "string",
+            "minLength": 1,
+            "description": "A stable concernId from docs/PLAN_CONCERNS.md. Free string here; the vocabulary lives in that doc, not the schema."
+          },
+          "status": {
+            "type": "string",
+            "enum": ["addressed", "excluded"]
+          },
+          "evidence": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Falsifiable evidence the concern is handled (a feature name, formula, tenet, gate, or stack pin). Required when status=addressed."
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "description": "One-line reason the concern does not apply. Required when status=excluded."
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "required": ["status"],
+              "properties": { "status": { "const": "addressed" } }
+            },
+            "then": { "required": ["evidence"] }
+          },
+          {
+            "if": {
+              "required": ["status"],
+              "properties": { "status": { "const": "excluded" } }
+            },
+            "then": { "required": ["reason"] }
+          }
+        ]
       }
     },
     "crossFeatureDependencies": {
