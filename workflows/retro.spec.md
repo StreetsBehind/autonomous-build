@@ -29,6 +29,7 @@ The workflow accepts these arguments (parsed from the `/retro` invocation; all o
 | `--meta-path <path>` | resolved per `docs/META_PATH_RESOLUTION.md` | Where to file improvement beads. When omitted, pre-flight resolves the autonomous-build repo from `$HOME` (env → installed-skill-link trace → candidate probe). The old hardcoded `~/Documents/Github/autonomous-build` did not exist on every host and silently produced file-only (zero-bead) runs. |
 | `--no-file` | false | Produce report only; skip filing beads (debug mode). |
 | `--self` | false | Meta-retro: analyze autonomous-build itself, treating its own beads + git log as the build window. |
+| `--inbox` | false | Triage-drain mode: vet the `triage` inbox (`bd list --label triage --all`) via the adversarial cross-check and **promote survivors in place** (re-parent under a per-drain epic, drop the `triage` label) instead of analyzing a build window. Counterpart to `/flag --upstream`. See "Inbox mode" below — it short-circuits Phases 1–5 of the build-window flow. |
 
 ---
 
@@ -99,6 +100,7 @@ Signal = {
 | `signal-tenet` | app-beads + interactions + meta-git | tenets cited in bead notes (working as designed), tenets that should have fired and didn't (e.g., T4 scope discipline: bead closed with files outside `filesTouched`), tenets the workflow needs but doesn't have yet. If `collect-interactions` returned `{ status: "empty" }`, derive signals from app-beads + meta-git alone — do not treat the empty interactions blob as a missing-data failure. |
 | `signal-jankurai` | jankurai + app-beads | kickoff refusals (the bead spec was too broad — formula AC is undercooked), audit findings the gate let through, witness regressions that should have failed the gate but didn't |
 | `signal-wins` | all sources | formulas that poured cleanly + closed first try, gate catches on real failures, escalations the human resolved quickly. Memory candidates. Emit `proposed: null`. |
+| `signal-semantic` | app-beads + jankurai + app-git + `plan.lock.json` + `docs/DEFAULT_STACK.md` | three structural detectors the smbuild retros needed but couldn't auto-detect: **formula-pick vs DEFAULT_STACK** (a generic fallback formula poured where a stack-native variant exists, or a stack choice diverging from the pinned stack — e.g. SQLite, a Python backend), **quality-scored-zero** (a jankurai quality score of 0 the gate let through), **cross-dep edges declared≠present** (a code cross-dependency with no declared bead edge, or a declared edge with no code dependency). Emits nothing for a detector whose inputs are absent. |
 
 **Output:** flat array of `Signal` objects, deduped on `(category, evidence.refs sorted)`.
 
@@ -191,6 +193,26 @@ For each entry in `toFile`:
 
 ---
 
+## Inbox mode (`--inbox`, triage drain)
+
+The counterpart to `/flag --upstream`. `/flag --upstream` files **raw** triage beads into autonomous-build (`workflow-improvement,triage,from-app:<app>`, top-level, no acceptance) — intentionally un-vetted, accumulating until something drains them. `/retro --inbox` is that drain: it vets the inbox with the **same adversarial 2-agent cross-check** as a normal retro (Phase 4), then **promotes survivors in place** instead of filing new beads.
+
+It is a distinct flow — different *source* (existing `triage` beads, not a build window) and different *action* (mutate survivors, not create) — so the script branches on `parsedArgs.isInbox` right after arg-parse and `return`s before the build-window Phases 1–5, reusing only the cross-check + report machinery.
+
+| Inbox phase | Does |
+| --- | --- |
+| **Inbox pre-flight** | Resolve `metaPath` per `docs/META_PATH_RESOLUTION.md`. The triage inbox lives ONLY in the meta repo, so an unresolved `metaPath` is a **fail-loud** stop (nothing to drain) — never a file-only fallback (T7). |
+| **Inbox collect** | `bd list --label triage --all --json`; keep `open`/`in_progress` beads (still awaiting vetting — `closed` ones are already resolved). Empty inbox → write a short "inbox empty" report and return cleanly. |
+| **Inbox cross-check** | Per triage bead, run the two independent verifiers: `verify-evidence` (may read the cited files / from-app repo to confirm the observation holds), `verify-fix` (judges whether a concrete, gate/grep-verifiable AC is derivable, and supplies it). Same reconciliation bins as Phase 4: both pass → promote; evidence ✓ + suggested AC → promote with that AC; otherwise → uncertain. |
+| **Inbox promote** | Idempotently create a per-drain epic `Triage drain (<date>)` (`workflow-improvement,triage-drain,retro-date:<date>`). For each survivor: `bd update <id> --parent <epic> --remove-label triage` (+ `--acceptance` when the cross-check sharpened one). `workflow-improvement` + `from-app:<app>` are kept untouched. bd errors are caught into a FAILED-TO-PROMOTE list (T7). |
+| **Inbox report** | Write `<meta-path>/retros/triage-drain-<date>.md` with **## Promoted** (survivors + their new epic + AC + verification), **## Uncertain** (non-survivors *left in the inbox*, with both verifier verdicts) and a loud **## FAILED TO PROMOTE** section if any. |
+
+**Promote, don't re-file.** Survivors are the *same* beads, re-parented and de-`triage`d — never new duplicates. Non-survivors are *left in the inbox* (still labelled `triage`) and reported as Uncertain for human triage — not closed, not deleted — so a later drain re-vets them.
+
+The workflow returns `{ status, mode: 'inbox', reportPath, epicId, promotedBeadIds, uncertainCount, failedToPromoteCount }`.
+
+---
+
 ## Run-completion behavior
 
 When the workflow finishes:
@@ -241,4 +263,4 @@ This `retro.spec.md` remains as the spec source-of-truth. When the workflow need
 
 ## Auto-trigger from /build-next
 
-`/build-next` calls `/retro` at the DONE exit (when both `bd ready` and `bd blocked` are empty). For mid-build manual review, the user invokes `/retro` directly. For a retro of the workflow itself, invoke `/retro --self` from inside autonomous-build.
+`/build-next` calls `/retro` at the DONE exit (when both `bd ready` and `bd blocked` are empty). For mid-build manual review, the user invokes `/retro` directly. For a retro of the workflow itself, invoke `/retro --self` from inside autonomous-build. `/retro --inbox` is invoked manually (or on a cadence) to drain the `triage` inbox — it is the counterpart to `/flag --upstream` and never auto-fires from `/build-next`.

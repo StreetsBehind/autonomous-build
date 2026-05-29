@@ -26,7 +26,7 @@ function parseArgs(s) {
   // metaPath default is null → the pre-flight agent resolves it via docs/META_PATH_RESOLUTION.md
   // (env → installed-skill-link trace → candidate probe). The old hardcoded path did not exist on
   // every host, so a no-arg run silently dropped to file-only and filed zero beads.
-  const out = { appPath: '.', since: null, until: null, metaPath: null, noFile: false, isSelf: false };
+  const out = { appPath: '.', since: null, until: null, metaPath: null, noFile: false, isSelf: false, isInbox: false };
   if (!s) return out;
   const tokens = (typeof s === 'string') ? s.trim().split(/\s+/).filter(Boolean) : (Array.isArray(s) ? s : []);
   for (let i = 0; i < tokens.length; i++) {
@@ -36,8 +36,207 @@ function parseArgs(s) {
     else if (tokens[i] === '--meta-path' && tokens[i + 1]) { out.metaPath = tokens[++i]; }
     else if (tokens[i] === '--no-file') { out.noFile = true; }
     else if (tokens[i] === '--self') { out.isSelf = true; }
+    else if (tokens[i] === '--inbox') { out.isInbox = true; }
   }
   return out;
+}
+
+// ===========================================================================
+// Inbox mode (--inbox) — triage drain. Counterpart to /flag --upstream.
+// Different SOURCE (existing `triage`-labelled beads in the meta repo, not a
+// build window) and different ACTION (promote survivors in place — re-parent +
+// drop the triage label — instead of filing new beads). Reuses the Phase 4
+// adversarial 2-agent cross-check, then returns before the build-window flow.
+// ===========================================================================
+if (parsedArgs.isInbox) {
+  phase('Inbox pre-flight');
+
+  const inboxPreSchema = {
+    type: 'object',
+    required: ['status'],
+    properties: {
+      status: { enum: ['ok', 'failed'] },
+      failedReason: { type: 'string' },
+      metaPath: { type: 'string' },
+      date: { type: 'string' }
+    }
+  };
+  const inboxPre = await agent(`
+You are inbox-preflight for /retro --inbox (the triage drain). The triage inbox lives ONLY in the autonomous-build (meta) repo.
+Invocation args: ${JSON.stringify(parsedArgs)}
+Run IN ORDER and return JSON matching the schema:
+1. Resolve metaPath per docs/META_PATH_RESOLUTION.md. If --meta-path was passed ("${parsedArgs.metaPath || ''}" — non-empty means explicit), use it verbatim. Otherwise resolve from \$HOME (do NOT hardcode):
+   \`\`\`bash
+   META="\$AUTONOMOUS_BUILD_HOME"
+   { [ -n "\$META" ] && [ -d "\$META/.beads" ]; } || META="\$(readlink -f ~/.claude/skills/flag 2>/dev/null | xargs -r dirname | xargs -r dirname)"
+   { [ -d "\$META/.beads" ] && [ -f "\$META/skills/build-next/SKILL.md" ]; } || for c in "\$HOME/.openclaw/workspace/autonomous-build" "\$HOME/Documents/Github/autonomous-build"; do [ -d "\$c/.beads" ] && [ -f "\$c/skills/build-next/SKILL.md" ] && META="\$c" && break; done
+   \`\`\`
+   A resolved metaPath must contain BOTH \`.beads/\` and \`skills/build-next/SKILL.md\`.
+2. If metaPath does NOT resolve → { "status": "failed", "failedReason": "could not resolve autonomous-build repo; the triage inbox lives only there — set AUTONOMOUS_BUILD_HOME or pass --meta-path" }. (Fail loud, never file-only: there is nothing to drain without the meta repo — T7.)
+3. date = "${parsedArgs.until || ''}" if non-empty, else today (YYYY-MM-DD via \`date +%F\`).
+Return { "status": "ok", "metaPath": "<absolute path>", "date": "<YYYY-MM-DD>" }.
+Use Bash, Read.
+`, { label: 'inbox-preflight', phase: 'Inbox pre-flight', schema: inboxPreSchema });
+
+  if (!inboxPre || inboxPre.status !== 'ok' || !inboxPre.metaPath) {
+    log(`Triage drain pre-flight failed: ${inboxPre?.failedReason || 'null'}`);
+    return { status: 'failed', mode: 'inbox', failedReason: inboxPre?.failedReason || 'inbox-preflight returned null', reportPath: null, promotedBeadIds: [] };
+  }
+  const metaPath = inboxPre.metaPath;
+  const drainDate = inboxPre.date;
+  log(`Inbox pre-flight OK — meta=${metaPath}, date=${drainDate}`);
+
+  // --- Collect the triage inbox ---
+  phase('Inbox collect');
+  const inboxCollectSchema = {
+    type: 'object',
+    required: ['triage'],
+    properties: {
+      triage: {
+        type: 'array',
+        items: {
+          type: 'object',
+          required: ['id', 'title'],
+          properties: {
+            id:          { type: 'string' },
+            title:       { type: 'string' },
+            description: { type: 'string' },
+            status:      { type: 'string' },
+            labels:      { type: 'array', items: { type: 'string' } },
+            fromApp:     { type: ['string', 'null'] },
+            category:    { type: ['string', 'null'] }
+          }
+        }
+      }
+    }
+  };
+  const inbox = await agent(`
+You are inbox-collect for /retro --inbox. List the triage inbox in the meta repo (${metaPath}).
+Run: \`bd --db "${metaPath}/.beads" list --label triage --all --json\` — the \`triage\` label IS the inbox; \`--all\` covers every status.
+Keep ONLY un-vetted beads still awaiting triage: status \`open\` or \`in_progress\` (skip \`closed\` — already resolved). For each kept bead capture { id, title, description, status, labels, fromApp (parse the \`from-app:<x>\` label → "<x>", else null), category (parse "Category: <c>" out of the description, else null) }.
+Return { "triage": [...] } (empty array if the inbox is empty). If bd errors, return { "triage": [] } and note it — do NOT throw (T7).
+Use Bash.
+`, { label: 'inbox-collect', phase: 'Inbox collect', schema: inboxCollectSchema, agentType: 'general-purpose' });
+
+  const triage = (inbox && Array.isArray(inbox.triage)) ? inbox.triage : [];
+  log(`Inbox: ${triage.length} un-vetted triage bead(s)`);
+
+  if (triage.length === 0) {
+    phase('Inbox report');
+    const emptySchema = { type: 'object', required: ['reportPath'], properties: { status: { type: 'string' }, reportPath: { type: ['string', 'null'] } } };
+    const emptyReport = await agent(`
+Write a short markdown report to "${metaPath}/retros/triage-drain-${drainDate}.md" via the Write tool (\`mkdir -p "${metaPath}/retros"\` first). Body:
+"# Triage drain (${drainDate})
+
+Inbox empty — no un-vetted \`triage\` beads to drain.
+"
+Return { "status": "ok", "reportPath": "<path>" }.
+`, { label: 'inbox-report-empty', phase: 'Inbox report', schema: emptySchema, agentType: 'general-purpose' });
+    log('Triage drain: inbox empty — nothing to promote.');
+    return { status: 'ok', mode: 'inbox', reportPath: emptyReport?.reportPath || null, epicId: null, promotedBeadIds: [], uncertainCount: 0, failedToPromoteCount: 0 };
+  }
+
+  // --- Adversarial cross-check: same 2-verifier pattern as Phase 4, per triage bead ---
+  phase('Inbox cross-check');
+  const evidenceSchemaI = { type: 'object', required: ['supports'],   properties: { supports:   { type: 'boolean' }, note:             { type: 'string' } } };
+  const fixSchemaI      = { type: 'object', required: ['verifiable'], properties: { verifiable: { type: 'boolean' }, suggestedRewrite: { type: 'string' } } };
+
+  const checkedInbox = await parallel(triage.map((b, idx) => () =>
+    Promise.all([
+      agent(`
+You are verify-evidence for the triage drain (bead ${b.id}). A triage bead is a RAW observation filed via /flag --upstream — your job is to check whether it actually holds up. You see ONLY the observation and its cited evidence (NOT any proposed fix). Use Bash/Read/Grep to inspect the cited files / ids in ${metaPath} (or the named from-app repo if reachable) and decide: does real evidence support the observation?
+Observation (title — description): ${JSON.stringify((b.title || '') + ' — ' + (b.description || ''))}
+from-app: ${JSON.stringify(b.fromApp)}
+Return { "supports": true|false, "note": "<what you checked and found>" }. Default supports=false if the evidence cannot be located or does not bear out the claim.`,
+        { label: `inbox-verify-evidence-${idx}`, phase: 'Inbox cross-check', schema: evidenceSchemaI, agentType: 'general-purpose' }),
+      agent(`
+You are verify-fix for the triage drain (bead ${b.id}). Triage beads are raw and usually carry NO acceptance. Given the observation, judge whether a CONCRETE, self-verifiable acceptance criterion is derivable — one a grep / file-exists / line-count / gate-pass check on a file in autonomous-build could PROVE. If so, supply it.
+Observation (title — description): ${JSON.stringify((b.title || '') + ' — ' + (b.description || ''))}
+Return { "verifiable": true|false, "suggestedRewrite": "<the concrete AC — REQUIRED whenever verifiable=true; \\"\\" only if genuinely not verifiable>" }.`,
+        { label: `inbox-verify-fix-${idx}`, phase: 'Inbox cross-check', schema: fixSchemaI, agentType: 'general-purpose' })
+    ]).then(([ev, fx]) => ({ bead: b, ev, fx }))
+  ));
+
+  // Reconcile (pure JS) — same bins as Phase 4: survivors get promoted, the rest stay in the inbox.
+  const promote = [];
+  const uncertain = [];
+  for (const c of checkedInbox) {
+    if (!c) { continue; }
+    const { bead, ev, fx } = c;
+    const evOk = ev && ev.supports === true;
+    const fxOk = fx && fx.verifiable === true;
+    if (evOk && fxOk) {
+      promote.push({ bead, acceptance: (fx && fx.suggestedRewrite) || null, verification: 'evidence ✓, fix ✓', verdicts: { ev, fx } });
+    } else if (evOk && fx && fx.suggestedRewrite) {
+      promote.push({ bead, acceptance: fx.suggestedRewrite, verification: 'fix ✓ after rewrite', verdicts: { ev, fx } });
+    } else {
+      uncertain.push({ bead, bin: (!evOk && fxOk) ? 'disagree' : 'report-only', verdicts: { ev, fx } });
+    }
+  }
+  log(`Inbox cross-check: ${promote.length} to promote, ${uncertain.length} stay in inbox (of ${triage.length})`);
+
+  // --- Promote survivors in place: re-parent under a per-drain epic, drop the triage label ---
+  phase('Inbox promote');
+  let epicId = null;
+  const promotedBeadIds = [];
+  const failedToPromote = [];
+  if (promote.length > 0) {
+    const promoteSchema = {
+      type: 'object',
+      required: ['promotedBeadIds'],
+      properties: {
+        epicId:          { type: ['string', 'null'] },
+        promotedBeadIds: { type: 'array', items: { type: 'string' } },
+        failedToPromote: { type: 'array', items: { type: 'object' } }
+      }
+    };
+    const promoteInput = promote.map(p => ({ id: p.bead.id, title: p.bead.title, acceptance: p.acceptance, verification: p.verification }));
+    const promoted = await agent(`
+You are inbox-promote for /retro --inbox. Promote vetted triage beads IN PLACE in the meta repo (${metaPath}). Run every bd command with \`--db "${metaPath}/.beads"\`.
+Survivors to promote: ${JSON.stringify(promoteInput)}
+
+Steps (Bash + bd):
+1. IDEMPOTENCY: look for an existing per-drain epic for this date — \`bd --db "${metaPath}/.beads" list --label triage-drain --label retro-date:${drainDate} --all\`. If one exists, reuse its ID; otherwise create it: \`bd --db "${metaPath}/.beads" create "Triage drain (${drainDate})" --type=epic --priority=2 --labels "workflow-improvement,triage-drain,retro-date:${drainDate}"\` and capture the new ID. (bd create takes \`--labels <comma-separated>\`, NOT --add-label.)
+2. For EACH survivor, one update call: \`bd --db "${metaPath}/.beads" update <id> --parent <epicId> --remove-label triage\` — re-parents it under the drain epic AND drops the \`triage\` label so it leaves the inbox. Do NOT touch its other labels (\`workflow-improvement\`, \`from-app:<app>\` stay). If the survivor's acceptance field above is non-null, ALSO pass \`--acceptance "<that acceptance>"\`.
+3. If any bd call errors, record { "id": <id>, "error": <message> } under failedToPromote and continue — do NOT crash (T7).
+Return { "epicId": "<id|null>", "promotedBeadIds": [<ids actually re-parented + de-triaged>], "failedToPromote": [...] }.
+`, { label: 'inbox-promote', phase: 'Inbox promote', schema: promoteSchema, agentType: 'general-purpose' });
+    epicId = promoted?.epicId || null;
+    promotedBeadIds.push(...((promoted && promoted.promotedBeadIds) || []));
+    failedToPromote.push(...((promoted && promoted.failedToPromote) || []));
+  }
+
+  // --- Report ---
+  phase('Inbox report');
+  const inboxReportSchema = { type: 'object', required: ['status', 'reportPath'], properties: { status: { enum: ['ok', 'failed'] }, reportPath: { type: ['string', 'null'] }, reportMarkdown: { type: 'string' } } };
+  const inboxReport = await agent(`
+You are inbox-report for /retro --inbox. Write the triage-drain report to "${metaPath}/retros/triage-drain-${drainDate}.md" via the Write tool (\`mkdir -p "${metaPath}/retros"\` first).
+Inputs:
+- date: ${drainDate}
+- epicId: ${JSON.stringify(epicId)}
+- promoted (now under the drain epic, \`triage\` label dropped): ${JSON.stringify(promote.map(p => ({ id: p.bead.id, title: p.bead.title, fromApp: p.bead.fromApp, verification: p.verification, acceptance: p.acceptance })))}
+- promotedBeadIds: ${JSON.stringify(promotedBeadIds)}
+- uncertain (LEFT in the inbox — still labelled \`triage\` — for human triage): ${JSON.stringify(uncertain.map(u => ({ id: u.bead.id, title: u.bead.title, fromApp: u.bead.fromApp, bin: u.bin, verdicts: u.verdicts })))}
+- failedToPromote: ${JSON.stringify(failedToPromote)}
+- counts: inbox=${triage.length}, promoted=${promotedBeadIds.length}, uncertain=${uncertain.length}
+
+Sections (fill every one): "# Triage drain (${drainDate})" header with a one-line summary (inbox size, promoted, uncertain); ## Promoted — one entry per promoted bead: id, title, from-app, the epic it now sits under, verification, and its acceptance; ## Uncertain (stay in inbox) — one entry per non-survivor with BOTH verifier verdicts (evidence + fix) so a human can see why it didn't survive; if failedToPromote is non-empty add a LOUD "## FAILED TO PROMOTE" section with ids + errors for manual repair.
+Return { "status": "ok", "reportPath": "<path>" }. If Write fails, retry once; on a second failure return { "status": "failed", "reportPath": null, "reportMarkdown": "<the body inlined>" }.
+`, { label: 'inbox-report', phase: 'Inbox report', schema: inboxReportSchema, agentType: 'general-purpose' });
+
+  if (!inboxReport || inboxReport.status !== 'ok' || !inboxReport.reportPath) {
+    log(`Triage-drain report write did NOT succeed. Inlined below:\n${inboxReport?.reportMarkdown || '<none>'}`);
+  }
+  log(`Triage drain: promoted ${promotedBeadIds.length} under ${epicId || '(no epic)'}; ${uncertain.length} left in inbox; report ${inboxReport?.reportPath || '(write failed)'}`);
+  return {
+    status: 'ok',
+    mode: 'inbox',
+    reportPath: inboxReport?.reportPath || null,
+    epicId,
+    promotedBeadIds,
+    uncertainCount: uncertain.length,
+    failedToPromoteCount: failedToPromote.length
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -215,6 +414,17 @@ Return { "signals": [...] }.`),
 You are signal-wins for /retro Phase 3. ${SIGNAL_SHAPE}
 ${BLOBS}
 Emit "win" signals (proposed: null) for: formulas that poured cleanly + closed first try; gate catches on real failures; escalations the human resolved quickly. These are memory candidates and prevent the workflow drifting toward over-engineering.
+Return { "signals": [...] }.`),
+
+  sig('signal-semantic', `
+You are signal-semantic for /retro Phase 3 — three structural detectors the smbuild retros needed but could NOT auto-detect. ${SIGNAL_SHAPE}
+${BLOBS}
+App path: ${Context.appPath}. Meta path: ${Context.metaPath}.
+Run these THREE detectors (Bash/Read/Grep against appPath; read ${Context.metaPath}/docs/DEFAULT_STACK.md for #1):
+1. formula-pick vs DEFAULT_STACK: read appPath/plan.lock.json (the formula pick per feature) and ${Context.metaPath}/docs/DEFAULT_STACK.md. Emit a HIGH "quality" signal for each feature that poured a GENERIC fallback formula (app-skeleton, crud-feature, background-job, integration-http) where a stack-native variant exists (app-skeleton-rust-cargo, app-skeleton-vite-react, crud-feature-rust, ...), OR any stack choice diverging from the pinned stack (e.g. SQLite instead of PostgreSQL, a Python backend service). proposed.targetFile = the formula or plan.lock entry; acceptance = a grep proving the native variant / pinned stack is used.
+2. quality-scored-zero: from the jankurai blob (+ appPath/target/jankurai/*.json and appPath/agent/baselines/*.repo-score.json if present), emit a HIGH "quality" signal for any bead/commit whose jankurai quality score is 0 (or repo-score collapsed to 0) — a quality failure the gate let through. proposed.acceptance = a check that the score is > 0 / the gate hard-fails on score 0.
+3. cross-dep edges declared != present: compare the bead DAG's declared dependencies (app-beads blob: blocked-by / parent edges) against actual code cross-dependencies (app-git file lists + grep imports/calls between the modules those beads produced). Emit a "quality" signal per MISMATCH — a code edge with NO declared bead dep (hidden coupling), or a declared dep with NO code edge (phantom edge). proposed.acceptance = the specific edge to add/remove, or a decompose-time check.
+Emit NOTHING for a detector whose inputs are absent (no plan.lock.json, no jankurai receipts, etc.) — return only real findings.
 Return { "signals": [...] }.`)
 ]);
 
