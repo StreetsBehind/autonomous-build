@@ -133,7 +133,7 @@ if (preflight.status === 'blocked-only') {
   return { refused: false, drained: false, postAction: 'escalate', blockedCount: preflight.blockedCount, merged: [], blocked: [], failed: [] };
 }
 
-log(`[BATCH START] workers=${parsedArgs.workers} max-merges=${parsedArgs.maxMerges || 'unbounded'} ready=${preflight.readyCount}`);
+log(`[BATCH START] workers=${parsedArgs.workers} max-merges=${parsedArgs.maxMerges || 'unbounded'} budget=${parsedArgs.budget != null ? '$' + parsedArgs.budget : 'unbounded'} ready=${preflight.readyCount}`);
 
 // ---------------------------------------------------------------------------
 // Phase 2 — Dispatch + drain (wave-loop)
@@ -156,6 +156,40 @@ const blockedSet = [];
 const failedSet = [];
 let drainOnly = false;
 let waveNum = 0;
+
+// ---------------------------------------------------------------------------
+// Budget accounting for --budget (USD cap) — the one financial safety stop for
+// an unattended run. Checked before each new wave's dispatch (never mid-worker,
+// per spec). The script has no precise per-call billing feed, so cost is an
+// ESTIMATE and logged as such:
+//   - Preferred: the runtime `budget` global exposes cumulative output-token
+//     spend (budget.spent()); convert to USD via a documented rate.
+//   - Fallback (no token feed): workers dispatched so far × a per-worker
+//     estimate. An approximate bound still beats no bound on a 2-day run.
+// Tune the two constants to the model/pricing in use.
+// ---------------------------------------------------------------------------
+const USD_PER_1M_OUTPUT_TOKENS = 15;    // approximate output-token price
+const USD_PER_WORKER_ESTIMATE  = 0.75;  // rough per-bead build cost (fallback)
+let workersDispatched = 0;
+
+function estimatedSpendUSD() {
+  if (typeof budget !== 'undefined' && budget && typeof budget.spent === 'function') {
+    return (budget.spent() / 1_000_000) * USD_PER_1M_OUTPUT_TOKENS;
+  }
+  return workersDispatched * USD_PER_WORKER_ESTIMATE;
+}
+
+// True once estimated cumulative cost has reached the cap. Unbounded if no
+// --budget was passed.
+function budgetReached() {
+  if (parsedArgs.budget == null) return false;
+  const spent = estimatedSpendUSD();
+  if (spent >= parsedArgs.budget) {
+    log(`[BUDGET] estimated cumulative cost ~$${spent.toFixed(2)} >= --budget $${parsedArgs.budget} — no new dispatches; finishing in-flight work and exiting`);
+    return true;
+  }
+  return false;
+}
 
 const candidateSchema = {
   type: 'object',
@@ -236,6 +270,14 @@ while (true) {
   // even before the merge step.
   if (drainOnly) {
     log(`[WAVE ${waveNum}] drain-only mode — skipping new dispatches`);
+    break;
+  }
+
+  // Financial safety stop: if the estimated cumulative cost has reached
+  // --budget, dispatch no new work. Each wave merges what it dispatched within
+  // the same iteration, so there is no cross-wave in-flight work to drain.
+  if (budgetReached()) {
+    drainOnly = true;
     break;
   }
 
@@ -337,6 +379,7 @@ Run these serialized (one bead at a time) — concurrent bd writes can race on t
   // output. The .bd-build-complete.json file is a defensive fallback for
   // runtimes where structured output is lossy; we read the file IF the
   // structured return is missing.
+  workersDispatched += prepped.length;  // for the fallback cost estimate
   const buildTasks = prepped.map(p => () => agent(`
 beadId: ${p.beadId}
 worktree: ${p.worktreePath}

@@ -25,7 +25,7 @@ The workflow accepts these arguments (parsed from the `/build-batch` invocation;
 | --- | --- | --- |
 | `--workers N` | `2` | Max concurrent worker dispatches. Cap at 4 unless the user explicitly raises it — beyond that, merge throughput dominates and you're not actually getting more done. |
 | `--max-merges M` | unbounded | Stop dispatching new work after M successful merges. Useful for "do a chunk and come back." |
-| `--budget $X` | unbounded | Cumulative session cost cap (USD). Check before each new dispatch, not mid-worker. |
+| `--budget $X` | unbounded | Cumulative session cost cap (USD). Checked before each new wave's dispatch, never mid-worker. Cost is an **estimate**: the runtime `budget` global's output-token spend converted via `USD_PER_1M_OUTPUT_TOKENS` when available, else `workersDispatched × USD_PER_WORKER_ESTIMATE`. Both constants live at the top of `build-batch.js` and should be tuned to current pricing. |
 
 If the user invokes `/build-batch` with no flags, use defaults.
 
