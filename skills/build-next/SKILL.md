@@ -16,7 +16,7 @@ This skill must:
 
 ## Modes
 
-**App mode** (default): the repo is an app scaffolded by `/compose`. Jankurai is initialized (or about to be), and the full Step 5–8 sequence runs. This is what 99% of /build-next ticks do.
+**App mode** (default): the repo is an app scaffolded by `/decompose`. Jankurai is initialized (or about to be), and the full Step 5–8 sequence runs. This is what 99% of /build-next ticks do.
 
 **Meta mode**: the repo is `autonomous-build` itself, and the work is editing skills, formulas, hooks, or docs. Detect this at the top of the tick:
 
@@ -131,7 +131,7 @@ bd worktree create "task-$id"
 
 **Meta mode:** skip this entire step. There's no `AGENTS.md` to bound the intent against, and the skills/formulas being edited aren't Jankurai-tracked. Proceed to Step 7.
 
-**App mode:** The repo has `AGENTS.md` from `/compose`. Read it. Then turn the issue's `acceptance` into a bounded plan:
+**App mode:** The repo has `AGENTS.md` from `/decompose`. Read it. Then turn the issue's `acceptance` into a bounded plan:
 
 ```powershell
 mkdir -Force target/jankurai | Out-Null

@@ -1,6 +1,6 @@
 # plan.lock.json
 
-Machine-readable mirror of `plan.md`. Emitted by `/vision` alongside the human narrative; consumed by `/compose` as the authoritative source for stack, data model, features, formula picks, cross-feature dependencies, and the escalation budget.
+Machine-readable mirror of `plan.md`. Emitted by `/vision` alongside the human narrative; consumed by `/decompose` as the authoritative source for stack, data model, features, formula picks, cross-feature dependencies, and the escalation budget.
 
 `plan.md` remains the human-readable contract. `plan.lock.json` exists because `/compose` used to regex-parse markdown for feature names — a fragile parse where a typo in an em-dash placement silently dropped a feature, caught only by the end-of-pour coverage check. The lock removes the parse fragility without removing the narrative.
 
@@ -133,10 +133,10 @@ Object keyed by layer name. Allowed keys: `language`, `backend`, `frontend`, `da
 Array of entities. `fields` and `relationships` are free-form strings — schema-as-prose, not schema-as-DDL. The first migration formula will translate.
 
 ### `featureOrder` (required)
-Ordered array. Each entry names one or more formulas to pour and the variable bindings. `vars` values may be strings, numbers, booleans, or arrays of those (everything the bd CLI `--var k=v` syntax accepts). Order is significant — `/compose` pours in this order, and cross-feature deps assume earlier entries pour first.
+Ordered array. Each entry names one or more formulas to pour and the variable bindings. `vars` values may be strings, numbers, booleans, or arrays of those (everything the bd CLI `--var k=v` syntax accepts). Order is significant — `/decompose` pours in this order, and cross-feature deps assume earlier entries pour first.
 
 ### `crossFeatureDependencies` (required, may be empty)
-Each entry becomes a `bd dep add <blocked> <blocker>` call after the pour. `blocked` and `blocker` are either feature names (matching `featureOrder[].name` — `/compose` resolves to the pour root) or specific bead IDs if known in advance.
+Each entry becomes a `bd dep add <blocked> <blocker>` call after the pour. `blocked` and `blocker` are either feature names (matching `featureOrder[].name` — `/decompose` resolves to the pour root) or specific bead IDs if known in advance.
 
 ### `escalationBudget` (required)
 - `maxSessionCostUsd` — `/build-next` cumulative session cost ceiling.
@@ -144,7 +144,7 @@ Each entry becomes a `bd dep add <blocked> <blocker>` call after the pour. `bloc
 - `additionalBlockTriggers` — free-form strings appended to `docs/ESCALATION_RULES.md`'s defaults for this app.
 
 ### `openQuestions` (required, may be empty)
-**Product/scope questions** `/vision` could not resolve. Each has `question`, `blockingCompose` (bool), and optional `context`. If any item has `blockingCompose: true`, `incomplete` MUST be `true` and `/compose` will refuse with the question list.
+**Product/scope questions** `/vision` could not resolve. Each has `question`, `blockingCompose` (bool), and optional `context`. If any item has `blockingCompose: true`, `incomplete` MUST be `true` and `/decompose` will refuse with the question list.
 
 Tech ambiguity does **not** belong here — it routes to `agentConsults`. See `skills/vision/SKILL.md` step 7 for the consult protocol and `docs/DEFAULT_STACK.md` for the pinned stack.
 
@@ -158,11 +158,11 @@ Boolean. True iff any `openQuestions[].blockingCompose === true`. Written explic
 
 After producing `plan.md`, `/vision` writes the structured equivalent to `plan.lock.json` in the same directory and validates against `schemas/plan.lock.schema.json` before saving. If validation fails, `/vision` stops — do not write a partial lock.
 
-If `openQuestions` contains any `blockingCompose: true` entry, write the lock anyway with `incomplete: true`. This gives `/compose` a structured reason to refuse rather than silently parsing an unfinished plan.md.
+If `openQuestions` contains any `blockingCompose: true` entry, write the lock anyway with `incomplete: true`. This gives `/decompose` a structured reason to refuse rather than silently parsing an unfinished plan.md.
 
-## How `/compose` reads it
+## How `/decompose` reads it
 
-`/compose` Step 4 reads `plan.lock.json` before touching `plan.md`:
+`/decompose` Step 4 reads `plan.lock.json` before touching `plan.md`:
 
 1. If present and valid:
    - If `incomplete: true` → refuse with the open-question list.
@@ -170,13 +170,13 @@ If `openQuestions` contains any `blockingCompose: true` entry, write the lock an
 2. If absent → fall back to the legacy `plan.md` regex parse with a deprecation warning: `plan.lock.json missing — falling back to plan.md parse; rerun /vision to generate the lock`.
 3. If present but schema-invalid → refuse with the validator error. Do NOT fall back; a malformed lock indicates a `/vision` bug that should be fixed at the source.
 
-The coverage check in compose Step 5 still runs (cheap insurance), but with the lock as source of truth it should never fire — it's now backstop for the fallback path.
+The coverage check in decompose Step 5 still runs (cheap insurance), but with the lock as source of truth it should never fire — it's now backstop for the fallback path.
 
 ## Versioning
 
 Schema is versioned via the top-level `schemaVersion` integer. Bumping rules:
 
 - **Non-breaking additions** (new optional field, new allowed enum value) — no version bump.
-- **Breaking changes** (renamed/removed field, changed type, new required field) — bump `schemaVersion`. `/compose` refuses unknown versions; bump in lockstep with the `/compose` reader.
+- **Breaking changes** (renamed/removed field, changed type, new required field) — bump `schemaVersion`. `/decompose` refuses unknown versions; bump in lockstep with the `/decompose` reader.
 
 The schema file itself is the source of truth; this doc is a guide.

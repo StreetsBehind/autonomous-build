@@ -1,6 +1,6 @@
 # Default Stack (Jankurai)
 
-The pipeline's canonical tech stack. `/vision` defaults every app to this stack without asking the user. `/compose`, `/build-next`, and the formulas all assume it.
+The pipeline's canonical tech stack. `/vision` defaults every app to this stack without asking the user. `/decompose`, `/build-next`, and the formulas all assume it.
 
 > Jankurai itself is stack-agnostic (per `github.com/neverhuman/jankurai`). This file pins the specific stack profile this workflow uses — it is *not* prescribed by Jankurai's CLI, it is the choice this repo has made for every app it builds.
 

@@ -47,7 +47,7 @@ Get-ChildItem .\skills -Directory | ForEach-Object { Try-Link (Join-Path "$env:U
 Try-Link "$env:USERPROFILE\.beads\formulas" ((Resolve-Path .\formulas).Path)
 ```
 
-After installing, **restart Claude Code** so the new skills get discovered. They show up as `/vision`, `/compose`, `/build-next`, `/escalate`.
+After installing, **restart Claude Code** so the new skills get discovered. They show up as `/vision`, `/decompose`, `/build-next`, `/escalate`.
 
 Verify:
 
@@ -83,7 +83,7 @@ jankurai version   # should print CLI + standard + schema versions
 
 If `bd formula list` is empty inside a `bd init`'d project, the formula symlink isn't being picked up — check `~/.beads/formulas/` exists and points where you expect.
 
-If `jankurai version` fails, the rest of the pipeline will refuse to run (`/compose` pre-flight check #5). Reinstall before continuing.
+If `jankurai version` fails, the rest of the pipeline will refuse to run (`/decompose` pre-flight check #5). Reinstall before continuing.
 
 ## Troubleshooting bd install
 

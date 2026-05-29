@@ -87,7 +87,7 @@ Fields:
 - `cases` — integer count of test cases this bead should add to the file
 - `coverage` — semicolon-separated list of behaviors covered
 
-**Important:** bd 0.55.3 does not propagate unknown step fields into the spawned issue. `[steps.testPlan]` lives in the formula but bd cook silently drops it. The `/compose` skill is responsible for parsing the formula TOML after pour and writing the testPlan as bd issue metadata (`testPlanFile`, `testPlanCases`, `testPlanCoverage`). See `autonomous-build-5au` for that work.
+**Important:** bd 0.55.3 does not propagate unknown step fields into the spawned issue. `[steps.testPlan]` lives in the formula but bd cook silently drops it. The `/decompose` skill is responsible for parsing the formula TOML after pour and writing the testPlan as bd issue metadata (`testPlanFile`, `testPlanCases`, `testPlanCoverage`). See `autonomous-build-5au` for that work.
 
 ### File ownership declarations (`files`)
 
@@ -135,7 +135,7 @@ Validated end-to-end against bd 0.55.3 on 2026-05-28:
 ## Authoring guidance
 
 - **Acceptance is the contract.** If the builder can't self-verify it (e.g. "looks good"), the step blocks. Write acceptance as runnable checks: "endpoint returns 201 on POST with valid body, 400 on missing fields, and an integration test covers both".
-- **Keep steps small enough to finish in one tick.** A step that needs 5+ files is usually 2+ steps. (See the sizing audit in `/compose`, autonomous-build-66t, for the enforced thresholds.)
+- **Keep steps small enough to finish in one tick.** A step that needs 5+ files is usually 2+ steps. (See the sizing audit in `/decompose`, autonomous-build-66t, for the enforced thresholds.)
 - **Use `needs` liberally.** Cheap to add, drives parallelism later.
 - **Don't bake stack choices into formulas.** A `crud-feature` formula should work for FastAPI+Postgres and Express+SQLite alike. Use variables for the parts that change.
 

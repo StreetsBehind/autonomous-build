@@ -122,7 +122,7 @@ Turn a `vision.md` into a `plan.md` the rest of the pipeline can consume.
 - **`plan.lock.json`** — the machine-readable mirror that `/decompose` consumes (schema v2). Same content in structured form, validated against [`autonomous-build/schemas/plan.lock.schema.json`](../../schemas/plan.lock.schema.json) before writing. In addition to the stack/data-model/feature fields, write the v2 coverage fields: `mustHaves[]` ({id, text} from step 1), `successMetric.steps[]` ({id, text} from step 1), `coverage[]` ({mustHaveId, features, how} from step 6.5), `concerns[]` (one decided entry per concern from step 8.5), and `nfrs[]` ({id, category, statement, target, verify} from step 8.7, when §6 has measurable constraints). See [`docs/PLAN_LOCK.md`](../../docs/PLAN_LOCK.md) for the field reference.
 - **`tenets.md`** — the build-time judgment-call reference, derived from [`autonomous-build/templates/tenets.md`](../../templates/tenets.md) per step 9. Read by `/build-next` when an agent faces a question the bead spec / formula / gate don't answer.
 
-Write all three. Before writing the lock, cross-check each `featureOrder[].vars` entry against its formula's declared vars (from `bd formula show`): every bound key must be a declared variable name, and every value of an enum-typed variable must be enum-valid. A key that isn't declared, or an off-enum value, is a hard stop — fix the binding (step 6) or escalate the formula gap; do not write a lock that pours will reject or that improvises a rename. If schema validation fails on the lock, stop — do not write a partial lock or a tenets file derived from a partial lock. If `plan.md` §"Open questions for human" has any items the user must answer before composing, write the lock anyway with `incomplete: true` and `openQuestions[].blockingCompose: true` for those items, and still write `tenets.md` (the blocking questions become tenets that say "do not proceed until the human answers"); `/compose` will refuse cleanly with the structured reason.
+Write all three. Before writing the lock, cross-check each `featureOrder[].vars` entry against its formula's declared vars (from `bd formula show`): every bound key must be a declared variable name, and every value of an enum-typed variable must be enum-valid. A key that isn't declared, or an off-enum value, is a hard stop — fix the binding (step 6) or escalate the formula gap; do not write a lock that pours will reject or that improvises a rename. If schema validation fails on the lock, stop — do not write a partial lock or a tenets file derived from a partial lock. If `plan.md` §"Open questions for human" has any items the user must answer before /decompose runs, write the lock anyway with `incomplete: true` and `openQuestions[].blockingCompose: true` for those items, and still write `tenets.md` (the blocking questions become tenets that say "do not proceed until the human answers"); `/decompose` will refuse cleanly with the structured reason.
 
 ### Closing summary
 
@@ -133,7 +133,7 @@ After writing the three files, print a closing summary to the user. It must incl
 
 ### `plan.md` structure
 
-Use this exact structure so `/compose`'s fallback parser (for repos that pre-date plan.lock.json) still works:
+Use this exact structure so `/decompose`'s fallback parser (for repos that pre-date plan.lock.json) still works:
 
 ```markdown
 # Plan: <app name>
@@ -201,7 +201,7 @@ Use this exact structure so `/compose`'s fallback parser (for repos that pre-dat
 
 ## Open questions for human
 > Product/scope only. Tech ambiguity does NOT belong here — see "Decided by agent consult" above.
-> If this section is non-empty, /compose will NOT run. Resolve here first.
+> If this section is non-empty, /decompose will NOT run. Resolve here first.
 - ...
 ```
 
@@ -215,7 +215,7 @@ Only **product/scope** ambiguities stop the plan. Tech ambiguity is never a stop
 
 ## Do not
 
-- Do not run `bd init` or create any issues — that is `/compose`'s job.
+- Do not run `bd init` or create any issues — that is `/decompose`'s job.
 - Do not start implementing — even a `package.json` is too early.
 - **Do not ask the user any technical question.** Stack, framework, database, auth, hosting, tests, lint — all come from `docs/DEFAULT_STACK.md`. Off-stack needs go through the 3-agent consult, not the human.
 - Do not put tech choices in `plan.md` §"Open questions for human" — that section is product/scope only.

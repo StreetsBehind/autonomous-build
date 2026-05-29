@@ -22,7 +22,7 @@ This file is workflow-level. Every app the loop builds inherits it via the per-a
 When two signals disagree, the higher item wins. Always.
 
 1. **The quality gate** (`hooks/post-build-gate.{sh,ps1}`) — if it says no, it's no.
-2. **`plan.lock.json`** — the structured contract; what `/compose` and `/build-next` actually consume.
+2. **`plan.lock.json`** — the structured contract; what `/decompose` and `/build-next` actually consume.
 3. **`plan.md`** — human narrative. Where it disagrees with the lock, the lock wins; flag the divergence with `/flag`.
 4. **The bead spec** — title, description, acceptance criteria, testPlan, filesTouched. The unit of work.
 5. **Formula output** — whatever `bd mol pour` produced. Errors at this layer are formula bugs; fix the formula, not the output.
@@ -95,7 +95,7 @@ Each tenet has the same shape: a one-sentence rule, why it exists, and how to ap
 ### T10. plan.lock.json is the contract, plan.md is the narrative
 
 - **Rule**: Where the lock and the narrative disagree, the lock wins. Do not edit a bead spec to match `plan.md` when `plan.lock.json` says something different. Re-run `/vision` to regenerate both.
-- **Why**: The lock is what `/compose` pours from and `/build-next` reads. The narrative is for the human and is hand-editable. A drift between the two is a `/vision` bug or a manual edit that bypassed the schema — both need to be fixed at the source.
+- **Why**: The lock is what `/decompose` pours from and `/build-next` reads. The narrative is for the human and is hand-editable. A drift between the two is a `/vision` bug or a manual edit that bypassed the schema — both need to be fixed at the source.
 - **How to apply**: At build time, read the lock first. If the lock is missing or the narrative contradicts it, flag and escalate; do not pick a side.
 
 ---

@@ -38,7 +38,7 @@ Valid `status` values:
 | Status | Meaning | Bead state on exit |
 |---|---|---|
 | `ready-to-merge` | Gate passed, commit landed on `bead/<id>` branch | `in_progress` (orchestrator closes after merge) |
-| `blocked` | Hit an escalation rule, gate failed twice, scope creep, etc. | `blocked` with `--notes` (YOU set this before exiting) |
+| `blocked` | Hit an escalation rule, gate failed the retry budget, scope creep, etc. | `blocked` with `--notes` (YOU set this before exiting) |
 | `failed` | Unexpected error you couldn't handle | `in_progress` (orchestrator decides) |
 
 Emit exactly one marker. Do not emit progress markers — the orchestrator polls but does not parse intermediate output.
@@ -74,7 +74,7 @@ Read `docs/ESCALATION_RULES.md` (in the worktree). Apply each hard-stop rule aga
 - New paid third-party API → blocked
 - Public-facing copy/branding → blocked
 - Acceptance criteria you cannot self-verify → blocked
-- Same task previously failed gate twice (check `bd show $id --json | notes`) → blocked
+- Same task previously exhausted its gate retry budget (check `bd show $id --json | notes`) → blocked
 - Cumulative session cost over budget → blocked
 - A **new** auth/authz model, secrets, or migration decision → blocked, **unless plan.lock front-loaded it**: if `plan.lock.json` `concerns[]` has the relevant concern (authn/authz/secrets/data-lifecycle) `addressed` with evidence, the decision already exists — **implement the decided model and proceed.** A `touches-auth` label alone is not a block when the auth concern is decided (lbq.3). Block only when the concern is absent/`excluded`, or the bead needs a decision beyond what the plan decided.
 
@@ -106,7 +106,7 @@ bd update $beadId --status=blocked --notes "jankurai kickoff: intent too broad t
 
 Then emit `BUILD_COMPLETE blocked` and exit.
 
-If `AGENTS.md` is absent (e.g., the app didn't run /compose's Jankurai init), skip this step — the gate is still self-detecting.
+If `AGENTS.md` is absent (e.g., the app didn't run /decompose's Jankurai init), skip this step — the gate is still self-detecting.
 
 ### Step 5: implement
 
@@ -136,7 +136,7 @@ if (-not (Test-Path $gate)) { $gate = Join-Path (Resolve-Path "../autonomous-bui
 pwsh -NoProfile -File $gate
 ```
 
-Use the symlink/copy the app uses if /compose set one up. Behavior — the retry budget is **not** a flat "once" (that strands hard, load-bearing beads, lbq.19):
+Use the symlink/copy the app uses if /decompose set one up. Behavior — the retry budget is **not** a flat "once" (that strands hard, load-bearing beads, lbq.19):
 
 ```
 budget = plan.lock.escalationBudget.maxFailuresPerTask   # default 2 if no lock

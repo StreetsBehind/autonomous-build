@@ -56,7 +56,7 @@ const metaGuardSchema = {
 };
 
 const guard = await agent(`
-You are the meta-guard agent for /build-batch. Spec: workflows/build-batch.spec.md §"Phase 0 — Meta-mode guard".
+You are the meta-guard agent for /build-batch. (Self-contained — all steps are inline below; you run in the app repo cwd, where the workflow spec is not present, so do NOT try to read workflows/build-batch.spec.md.)
 
 Check whether \`skills/build-next/SKILL.md\` exists relative to cwd. The marker is build-next's own source file — present by definition in the autonomous-build workflow repo, absent in any app the loop builds. (Do NOT use AGENTS.md — every app has one too.)
 
@@ -98,7 +98,7 @@ const preflightSchema = {
 };
 
 const preflight = await agent(`
-You are the pre-flight agent for /build-batch. Spec: workflows/build-batch.spec.md §"Phase 1 — Pre-flight".
+You are the pre-flight agent for /build-batch. (Self-contained — all steps are inline below; you run in the app repo cwd, where the workflow spec is not present, so do NOT try to read workflows/build-batch.spec.md.)
 
 Run these checks IN ORDER and return JSON matching the schema:
 
@@ -353,7 +353,7 @@ while (true) {
   const exclude = [...mergedSet, ...blockedSet, ...failedSet];
 
   const candResult = await agent(`
-You are the candidate-picker for /build-batch wave ${waveNum}. Spec: workflows/build-batch.spec.md §"Phase 2.1 — Poll loop body" (Step A — Fill free slots) and §"Phase 2.3 — Test-FilesTouched-Intersect helper".
+You are the candidate-picker for /build-batch wave ${waveNum}. (Self-contained — all steps are inline below; you run in the app repo cwd, where the workflow spec is not present, so do NOT try to read workflows/build-batch.spec.md.)
 
 Steps:
 1. Run \`bd ready --json\`. Filter out epics (issue_type == "epic") and any bead whose id is in the exclude list: ${JSON.stringify(exclude)}.
@@ -423,7 +423,7 @@ Return JSON: { "blocked": [<beadId>, ...] }
   }
 
   const prep = await agent(`
-You are the prep agent for /build-batch wave ${waveNum}. Spec: workflows/build-batch.spec.md §"Phase 2.2 — Dispatch-Bead helper" (claim + worktree creation portion only — worker dispatch is handled by the orchestrator).
+You are the prep agent for /build-batch wave ${waveNum}. (Self-contained — all steps are inline below; you run in the app repo cwd, where the workflow spec is not present, so do NOT try to read workflows/build-batch.spec.md.)
 
 For each bead in ${JSON.stringify(prepCandidates.map(c => ({ id: c.id })))}:
 1. \`bd update <id> --claim\`. If exit≠0, the bead was raced — push into "failed" with reason "claim failed (raced)" and skip the rest for this bead.
@@ -565,7 +565,7 @@ The beads-builder for ${p.beadId} returned no structured output. Read \`${p.work
       log(`[WORKER] ${p.beadId} completed (sha ${marker.commitSha || '?'}) → merge`);
 
       const mergeResult = await agent(`
-You are the merge agent for /build-batch, bead=${p.beadId}. Spec: workflows/build-batch.spec.md §"Phase 2.5 — Serialized merge step".
+You are the merge agent for /build-batch, bead=${p.beadId}. (Self-contained — all steps are inline below; you run in the app repo cwd, where the workflow spec is not present, so do NOT try to read workflows/build-batch.spec.md.)
 
 This call is the ONLY merger running right now — the orchestrator awaits it before processing the next ready-to-merge bead. Do NOT spawn parallel git operations.
 
@@ -653,7 +653,7 @@ log(`  Duration: ${durationStr}`);
 // beads were marked blocked above so they notify too); /retro if clean drain.
 let postAction = 'none';
 const summaryActions = await agent(`
-You are the summary agent for /build-batch Phase 3. Spec: workflows/build-batch.spec.md §"Phase 3 — Summary + post-actions".
+You are the summary agent for /build-batch Phase 3. (Self-contained — all steps are inline below; you run in the app repo cwd, where the workflow spec is not present, so do NOT try to read workflows/build-batch.spec.md.)
 
 Inputs:
   merged:  ${JSON.stringify(mergedSet)}
