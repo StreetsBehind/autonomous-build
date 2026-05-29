@@ -4,6 +4,8 @@ Workflow infrastructure for going from a `vision.md` file to a shipped app, with
 
 ## The pipeline
 
+**Walk-away entry point:** `/orchestrate [--auto-bless]` drives the whole pipeline end-to-end from a filled `vision.md` — sequencing `/vision → /decompose → /build-batch → /escalate|/retro`, clearing the seams it can (with `--auto-bless`, a high-confidence BLESSED chains straight into the build) and stopping only at genuine human gates (incomplete vision, NEEDS-FIX plan). Invoke the stages individually for hands-on control, or `/orchestrate` to hand off and walk away.
+
 ```
 vision.md   ──/vision──▶   plan.md + plan.lock.json + tenets.md
 plan.md + plan.lock.json  ──/decompose──▶  blessed beads DAG (epics + tasks + deps)
