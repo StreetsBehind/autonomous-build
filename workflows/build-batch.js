@@ -502,10 +502,16 @@ Steps (all from the repo root: \`git rev-parse --show-toplevel\`):
    - \`git pull --ff-only origin main\`. If exit≠0:
      - \`bd update ${p.beadId} --status=blocked --notes "git pull --ff-only origin main failed before merge — local main is behind remote and cannot fast-forward"\`.
      - Return { "ok": false, "reason": "pull-failed" }.
-3. \`git merge --no-ff ${p.branch} -m "Merge ${p.beadId}"\`. If exit≠0:
-   - \`git merge --abort\`.
-   - \`bd update ${p.beadId} --status=blocked --notes "merge conflict against main" --append-notes "<merge output>"\`.
-   - Return { "ok": false, "reason": "merge-conflict" }.
+3. \`git merge --no-ff ${p.branch} -m "Merge ${p.beadId}"\`. If exit≠0 (conflict):
+   - \`git merge --abort\` to restore main.
+   - AUTO-REBASE RETRY (shared config/barrel/lockfiles conflict mechanically and usually rebase cleanly; a conflict-block should not be the first response when the human is furthest away):
+     a. \`git checkout ${p.branch}\`
+     b. \`git rebase main\`.
+        - If the rebase reports conflicts: \`git rebase --abort\`, \`git checkout main\`, then \`bd update ${p.beadId} --status=blocked --notes "merge conflict against main; auto-rebase also conflicted — needs manual resolution" --append-notes "<conflict output>"\`. Return { "ok": false, "reason": "merge-conflict" }.
+        - If the rebase succeeds: \`git checkout main\`, then RE-ATTEMPT \`git merge --no-ff ${p.branch} -m "Merge ${p.beadId}"\`.
+          - If this second merge still fails: \`git merge --abort\`, \`bd update ${p.beadId} --status=blocked --notes "merge conflict against main; persisted after auto-rebase" --append-notes "<merge output>"\`. Return { "ok": false, "reason": "merge-conflict" }.
+          - If it succeeds: fall through to Step 4 (the gate below re-runs on the rebased+merged result — this is the "re-run gate after rebase").
+   (After a successful rebase the branch's commit shas change; that is expected and fine — nothing downstream reuses the worker's original commitSha.)
 4. Run the quality gate (resolve cross-platform: prefer \`<repo-root>/hooks/post-build-gate.{sh,ps1}\`, else the sibling \`../autonomous-build/hooks/\`; \`post-build-gate.sh\` on Linux/macOS, \`pwsh -NoProfile -File post-build-gate.ps1\` on Windows). If exit≠0:
    - \`git reset --hard HEAD~1\` (undo the merge — main returns to its pre-merge head).
    - \`bd update ${p.beadId} --status=blocked --notes "post-merge gate failed on main" --append-notes "<gate output>"\`.

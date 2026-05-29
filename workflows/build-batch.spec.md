@@ -330,12 +330,26 @@ Merge-And-Close(beadId):
 
     mergeOutput = git merge --no-ff $branch -m "Merge $beadId"
     if exitCode != 0:
-      # Conflict. Abort the merge, block the bead.
+      # Conflict. Don't block on the first conflict — shared config/barrel/lock
+      # files conflict mechanically and usually rebase cleanly, and conflict-
+      # blocks rise exactly when the human is furthest away. Auto-rebase + retry
+      # before blocking. (A clean replay preserves T3 atomicity — same logical
+      # change, same single commit, just re-parented onto updated main.)
       git merge --abort
-      bd update beadId --status=blocked --notes "merge conflict against main" --append-notes "$mergeOutput"
-      blockedSet += beadId
-      mergeInFlight = null
-      return
+      git checkout $branch
+      rebaseOut = git rebase main
+      if exitCode != 0:
+        # Real content conflict — needs a human.
+        git rebase --abort; git checkout main
+        bd update beadId --status=blocked --notes "merge conflict against main; auto-rebase also conflicted — needs manual resolution" --append-notes "$rebaseOut"
+        blockedSet += beadId; mergeInFlight = null; return
+      git checkout main
+      mergeOutput = git merge --no-ff $branch -m "Merge $beadId"
+      if exitCode != 0:
+        git merge --abort
+        bd update beadId --status=blocked --notes "merge conflict against main; persisted after auto-rebase" --append-notes "$mergeOutput"
+        blockedSet += beadId; mergeInFlight = null; return
+      # Rebase+merge clean — fall through to the post-merge gate (re-runs below).
 
     # Post-merge gate on main. THIS is the defense-in-depth check.
     print "[GATE] post-merge gate on main (bead $beadId)"
@@ -438,7 +452,7 @@ This is a per-worker timeout, not a batch-wide one. The batch's only wall-time b
 - Do not run `/build-batch` in meta mode. Period. (T9.)
 - Do not skip the post-merge gate "because the worker gate already passed." That's the whole point — defense-in-depth catches the cases where two workers' merges interact. (T2.)
 - Do not run concurrent merges. The merge queue exists for exactly this reason.
-- Do not amend or rebase a worker's commit. If a commit is wrong, the bead is blocked. (T3.)
+- Do not amend a worker's commit or rebase it to *change its content*. If a commit is wrong, the bead is blocked. (T3.) The one allowed rebase is the mechanical merge-conflict retry in Phase 2.5 — a clean replay onto updated `main` that changes only the parent, not the logical change; if that rebase itself conflicts, the bead is still blocked for a human.
 - Do not `bd close` a bead before the post-merge gate passes. The bead's "done" state IS "merged to main and main is green."
 - Do not auto-remove the worktree of a `failed` bead — the human needs that state to debug.
 - Do not invoke `/build-batch` recursively. One orchestrator at a time.
