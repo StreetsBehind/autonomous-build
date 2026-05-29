@@ -107,6 +107,21 @@ After all `pour-feature` agents complete, the orchestrator script also applies `
 
 ---
 
+## Phase 3.5 — Concern + NFR enforcement pours (lock only; bfo.10 / lbq.16)
+
+**Agent:** `concern-enforcement` **Tools:** `Read`, `Bash`
+
+Two sources of non-feature work otherwise evaporate into advisory `tenets.md` prose — never a bead, never scored, never gated:
+
+1. **Addressed concerns** (`concerns[]`) whose evidence is *not* a `featureOrder[]` entry (it cites a tenet/gate/stack-pin or a bare target). The product-feature pours don't cover them.
+2. **First-class NFRs** (`nfrs[]`) — measurable requirements (performance, security, privacy, compliance, data-residency, availability) with no home in the 10-concern vocabulary, e.g. "data stays in my region". This is the `lbq.16` field.
+
+For each (skipping any already delivered by a product feature — no double-pour), select an **enforcement formula** matching the concern class / NFR category and pour a dedicated bead whose **AC comes from the target** and **testPlan from `verify`**, reparented under the app epic. **T6/T1:** never hand-create via `bd create` and never remap to a near-miss formula — if no installed formula fits, record it under `missingFormula` / `nfrMissingFormula` with a `recommendedFormula` description. `excluded` concerns are skipped.
+
+**Gate:** any `missingFormula` or `nfrMissingFormula` (or enforcement-pour error) means an NFR has a target that will never be tested — this forces **NEEDS-FIX** (`concernEnforcementClean` in the verdict), surfaced in the report's "Concern + NFR enforcement" section. Skipped entirely when `planSource != lock`.
+
+---
+
 ## Phase 4 — Atomize oversized beads (parallel fan-out, iterative)
 
 Walk every bead created in Phase 3. For each bead whose sizing score is < 95, spawn an atomize agent. This phase may loop (up to 3 iterations) because an atomization can in principle produce a child that itself needs splitting.

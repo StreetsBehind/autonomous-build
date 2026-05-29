@@ -297,18 +297,22 @@ Report the VERIFIED-PRESENT count, never the attempted count, as the headline. R
 }
 
 // ---------------------------------------------------------------------------
-// Phase 3.5 — Concern enforcement pours (bfo.10)
-// An "addressed" concern whose evidence is NOT an existing featureOrder entry
-// (it cites a tenet/gate/stack-pin or a bare NFR target like "p99 < 200ms") has
-// no product-feature bead. Today it evaporates into tenets.md prose — never
-// scored, never gated (the lbq.16 finding). Pour a dedicated enforcement bead
-// (concrete AC + testPlan) so the NFR becomes testable, scored, gated work.
-// T6 (formula precedence): pour from a concern-enforcement formula, NEVER
-// hand-create via bd create; if no formula fits, surface "Missing formula" and
-// force NEEDS-FIX. No double-pour: a concern whose evidence cites a product
-// feature is already covered by that feature's Phase 3 pour and is skipped.
+// Phase 3.5 — Concern + NFR enforcement pours (bfo.10 / lbq.16)
+// Two sources of non-feature work that otherwise evaporate into advisory
+// tenets.md prose — never a bead, never scored, never gated:
+//   (a) An "addressed" concern whose evidence is NOT an existing featureOrder
+//       entry (cites a tenet/gate/stack-pin or a bare target). [bfo.10]
+//   (b) A first-class lock `nfrs[]` entry — a measurable NFR (perf, security,
+//       privacy, compliance, data-residency, availability) that has no home in
+//       the 10-concern vocabulary ("data stays in my region"). [lbq.16]
+// For each, pour a dedicated enforcement bead (concrete AC from the target +
+// testPlan from the verify) so it becomes testable, scored, gated work.
+// T6 (formula precedence): pour from an enforcement formula, NEVER hand-create
+// via bd create; if no formula fits, surface "Missing formula" and force
+// NEEDS-FIX. No double-pour: a concern/NFR already delivered by a product
+// feature's Phase 3 pour is skipped.
 // ---------------------------------------------------------------------------
-let concernEnforcement = { poured: [], missingFormula: [], skippedCoveredByFeature: [], errors: [] };
+let concernEnforcement = { poured: [], missingFormula: [], skippedCoveredByFeature: [], errors: [], nfrPoured: [], nfrMissingFormula: [] };
 if (Context.planSource === 'lock') {
   phase('Concern enforcement');
   const ceSchema = {
@@ -318,7 +322,9 @@ if (Context.planSource === 'lock') {
       poured:                  { type: 'array', items: { type: 'object' } },
       missingFormula:          { type: 'array', items: { type: 'object' } },
       skippedCoveredByFeature: { type: 'array', items: { type: 'object' } },
-      errors:                  { type: 'array', items: { type: 'object' } }
+      errors:                  { type: 'array', items: { type: 'object' } },
+      nfrPoured:               { type: 'array', items: { type: 'object' } },
+      nfrMissingFormula:       { type: 'array', items: { type: 'object' } }
     }
   };
   const ce = await agent(`
@@ -344,16 +350,27 @@ FOR EACH \`concerns[]\` entry with \`status == "addressed"\`:
    - Record under "poured" ({concernId, formula, pourRoot, acSummary}).
 4. On any \`bd\` error, record under "errors" ({concernId, msg}) instead of throwing (T7).
 
+THEN, FOR EACH \`nfrs[]\` entry in the lock (the first-class measurable NFRs — may be absent/empty, in which case skip this block):
+5. If an existing \`featureOrder[]\` feature already delivers this NFR (its statement clearly maps to a feature that has a Phase-3 bead), record under "skippedCoveredByFeature" ({concernId: nfr.id, feature}) and do NOT pour — no double-pour.
+6. Otherwise select an enforcement formula matching \`nfr.category\` (e.g. a load/latency-test formula for "performance", a data-residency/retention formula for "data-residency"/"compliance", an input-validation/rate-limit formula for "security", a privacy/PII formula for "privacy"). Read its \`[vars.*]\` contract with \`bd formula show <name>\`.
+   - If NO installed formula fits → record under "nfrMissingFormula" ({nfrId: nfr.id, category, statement, target, recommendedFormula: "<one-line description of the formula that should exist>"}) and move on. DO NOT hand-create via \`bd create\`, DO NOT remap to a near-miss formula (T6 + T1).
+7. Pour the chosen formula, binding ONLY its declared vars (validate exactly as Phase 3). Bind \`nfr.target\` into the AC and \`nfr.verify\` into the testPlan so the poured bead is concrete and falsifiable. Reparent under ${ParsedPlan.appEpicId}. Set the description to cite \`nfr.id\` + \`nfr.statement\`. Record under "nfrPoured" ({nfrId: nfr.id, category, formula, pourRoot, acSummary}). On \`bd\` error → "errors" ({concernId: nfr.id, msg}).
+
 Return JSON:
 {
   "poured": [{ "concernId": "...", "formula": "...", "pourRoot": "...", "acSummary": "..." }, ...],
   "missingFormula": [{ "concernId": "...", "evidence": "...", "recommendedFormula": "..." }, ...],
   "skippedCoveredByFeature": [{ "concernId": "...", "feature": "..." }, ...],
-  "errors": [{ "concernId": "...", "msg": "..." }, ...]
+  "errors": [{ "concernId": "...", "msg": "..." }, ...],
+  "nfrPoured": [{ "nfrId": "...", "category": "...", "formula": "...", "pourRoot": "...", "acSummary": "..." }, ...],
+  "nfrMissingFormula": [{ "nfrId": "...", "category": "...", "statement": "...", "target": "...", "recommendedFormula": "..." }, ...]
 }
 `, { label: 'concern-enforcement', phase: 'Concern enforcement', schema: ceSchema, agentType: 'general-purpose' });
   concernEnforcement = ce || concernEnforcement;
-  log(`Concern enforcement: ${concernEnforcement.poured.length} poured, ${concernEnforcement.missingFormula.length} missing-formula, ${concernEnforcement.skippedCoveredByFeature.length} covered-by-feature, ${concernEnforcement.errors.length} errors`);
+  // normalize the optional NFR arrays so downstream gate logic never NPEs
+  concernEnforcement.nfrPoured = concernEnforcement.nfrPoured || [];
+  concernEnforcement.nfrMissingFormula = concernEnforcement.nfrMissingFormula || [];
+  log(`Concern+NFR enforcement: ${concernEnforcement.poured.length} concern-poured, ${concernEnforcement.nfrPoured.length} nfr-poured, ${concernEnforcement.missingFormula.length + concernEnforcement.nfrMissingFormula.length} missing-formula, ${concernEnforcement.skippedCoveredByFeature.length} covered-by-feature, ${concernEnforcement.errors.length} errors`);
 }
 
 // ---------------------------------------------------------------------------
@@ -825,6 +842,13 @@ phase('Synthesis');
 // open non-epic beads (qualityOk), else a zero-scored run would bless silently.
 const allBeadsAt95 = qualityResults.every(r => r.scores.every(s => s.score >= 95));
 const qualityOk = !qualityVacuous && !qualityUndercovered;
+// An "addressed" concern that needs a dedicated enforcement bead but has no
+// formula to pour from (bfo.10 / lbq.16) is an unenforced NFR — NEEDS-FIX, not
+// a silent pass (T7). Enforcement-pour errors block too.
+const concernEnforcementClean =
+  (concernEnforcement.missingFormula || []).length === 0 &&
+  (concernEnforcement.nfrMissingFormula || []).length === 0 &&
+  (concernEnforcement.errors || []).length === 0;
 const blessed =
   pourFailed.length === 0 &&
   AtomizeSummary.persistentlyOversized.length === 0 &&
@@ -832,6 +856,7 @@ const blessed =
   allBeadsAt95 &&
   qualityOk &&
   fidelityBin === 'pass' &&
+  concernEnforcementClean &&
   (DepAuditResult?.cycles || []).length === 0 &&
   !DepAuditResult?.emptyReady;
 
@@ -844,6 +869,7 @@ const synthesisPayload = {
   dryRun: Context.dryRun,
   verdict,
   pours: { ok: pourOk, failed: pourFailed },
+  concernEnforcement,
   atomize: AtomizeSummary,
   quality: qualityResults,
   fidelity: FidelityResult,
@@ -933,6 +959,14 @@ Steps:
 ## Pours (Phase 3)
 - Successful: <N>
 - Failed: <list with feature + error>
+
+## Concern + NFR enforcement (Phase 3.5)
+<render from concernEnforcement; omit the whole section if planSource != lock>
+- Concern enforcement beads poured: <concernEnforcement.poured: concernId → formula → pourRoot>
+- NFR enforcement beads poured: <concernEnforcement.nfrPoured: nfrId (category) → formula → pourRoot>
+- Covered by an existing feature (no separate bead): <skippedCoveredByFeature>
+- **MISSING FORMULA (forces NEEDS-FIX):** <missingFormula + nfrMissingFormula — each names the concern/NFR with no enforcement formula and the recommendedFormula that should exist. An unenforced NFR is a target that will never be tested or gated.>
+- Errors: <errors>
 
 ## Dep audit (Phase 7)
 - Cycles: <none | list>

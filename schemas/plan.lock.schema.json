@@ -226,6 +226,22 @@
         ]
       }
     },
+    "nfrs": {
+      "type": "array",
+      "description": "Non-functional requirements with MEASURABLE targets, lifted from vision.md §6 constraints (performance, security, privacy, compliance, data-residency, availability, ...). Unlike concerns[] (decide-and-cite prose evidence), each NFR is FIRST-CLASS: /decompose pours a dedicated enforcement bead whose acceptance criterion is derived from `target` and whose test is seeded from `verify`, and gates that every NFR maps to >=1 enforcement bead (NEEDS-FIX otherwise). This is what keeps 'data stays in my region' from evaporating into an advisory tenet sentence. Optional + may be omitted so adding it does not force a schemaVersion bump; /vision populates it from §6.",
+      "items": {
+        "type": "object",
+        "required": ["id", "category", "statement", "target", "verify"],
+        "additionalProperties": false,
+        "properties": {
+          "id":        { "type": "string", "minLength": 1, "description": "Stable NFR ID, e.g. N1." },
+          "category":  { "type": "string", "enum": ["performance", "security", "privacy", "compliance", "data-residency", "availability", "accessibility", "other"] },
+          "statement": { "type": "string", "minLength": 1, "description": "The requirement in product terms, e.g. 'All user data stored in EU regions only.'" },
+          "target":    { "type": "string", "minLength": 1, "description": "The MEASURABLE/testable bar, e.g. 'p99 < 200ms at 100 concurrent' or 'no row written outside eu-* regions'. Not a vibe." },
+          "verify":    { "type": "string", "minLength": 1, "description": "How the enforcement bead's test checks the target — the test-plan seed." }
+        }
+      }
+    },
     "crossFeatureDependencies": {
       "type": "array",
       "description": "Each entry produces a `bd dep add <blocked> <blocker>` call after the pour.",
