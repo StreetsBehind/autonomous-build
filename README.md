@@ -49,7 +49,7 @@ plan.md + plan.lock.json  ──/decompose──▶  blessed beads DAG (epics + 
 | `templates/vision.md` | The form you fill out per app |
 | `templates/tenets.md` | Template `/vision` populates per-app — inherits the workflow tenets and derives app-specific ones from vision + plan.lock |
 | `docs/TENETS.md` | The workflow-level tenets — principles the loop falls back on for build-time judgment calls |
-| `hooks/post-build-gate.{sh,ps1}` | Quality gate run before every `bd close`: lint/typecheck, mandatory tests, e2e/integration, SCA (dep-vuln audit), opt-in coverage floor, Jankurai audit/witness — across Node/Python/**Rust**. `.sh` on Linux/macOS, `.ps1` (via `pwsh`) on Windows — kept in sync. Knobs: `GATE_SCA`, `GATE_COVERAGE_MIN` |
+| `hooks/post-build-gate.{sh,ps1}` | Quality gate run before every `bd close`: lint/typecheck, mandatory tests, e2e/integration, SCA (dep-vuln audit), opt-in coverage floor, Jankurai advisory audit + regression-only ratchet — across Node/Python/**Rust**. `.sh` on Linux/macOS, `.ps1` (via `pwsh`) on Windows — kept in sync. Knobs: `GATE_SCA`, `GATE_COVERAGE_MIN`, `GATE_REQUIRE_BASELINE`, `GATE_RESTAMP` |
 | `retros/` | Markdown retros produced by `/retro` after each app finishes |
 | `.beads/` | This repo's *own* beads DB — tracks workflow improvements (retro-filed) |
 | `docs/` | Architecture, install, escalation rules |
@@ -75,9 +75,9 @@ Every app this workflow builds is held to the **[Jankurai](https://github.com/ne
 | --- | --- | --- |
 | `/decompose` (per-app init) | `jankurai adopt` → `jankurai init --level agents --yes` → first advisory `jankurai audit` | Scaffolds `AGENTS.md`, ownership map, proof lanes; establishes a starting score |
 | `/build-next` (per-task) | `jankurai kickoff --intent "<acceptance>"` before coding | Bounds the change — names read-first files, ownership boundaries, forbidden paths, proof lane |
-| `hooks/post-build-gate.{sh,ps1}` (per-task close) | `jankurai audit --changed-fast` (advisory) + `jankurai witness` against baseline if present (hard fail on regression) | Inner-loop scan; merge witness ratchets only after a baseline has been accepted |
+| `hooks/post-build-gate.{sh,ps1}` (per-task close) | `jankurai audit --changed-fast --baseline <blessed>` (advisory) → **regression-only ratchet parsed from the receipt** (`decision.ratchet`): block on `score_delta < -2`, any new hard finding, or any new cap | Inner-loop scan; ratchets on every commit once the baseline is blessed — never on the absolute 85 floor (deferred, see below) |
 
-Adoption is staged: start at **observe** + **agents** (read-only inventory and AGENTS.md), then accept a baseline at `agent/baselines/main.repo-score.json` in a dedicated commit once the first few tasks close cleanly, then enable **ratchet** mode in CI.
+Adoption is staged: `/decompose` starts at **observe** + **agents** (read-only inventory and AGENTS.md) and captures a scaffold score; the human accepts the starting baseline at `agent/baselines/main.repo-score.json` in the same action that blesses the DAG (auto-accepted with a loud note on the `--auto-bless` walk-away path). From the first build bead the gate runs a **regression-only ratchet** against that baseline — blocking any commit that drops the score past tolerance or adds a new hard finding or cap, and re-stamping the baseline upward on green commits. An **absolute score floor** (flat 85 or HL-derived) is deliberately **deferred** until the ratchet has run on a real app.
 
 Receipts land under `target/jankurai/` (gitignored) per task. Baselines under `agent/baselines/` (tracked, trusted).
 
