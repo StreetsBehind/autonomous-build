@@ -1,7 +1,14 @@
 ﻿# post-build-gate.ps1
 #
+# Gate checks (in execution order):
+# 1. lint            — stack linter (eslint / cargo clippy / etc.); style + obvious errors
+# 2. typecheck       — type checker (tsc / cargo check); reject untyped or ill-typed code
+# 3. test            — the project's test suite; all tests must be green
+# 4. pre-commit safety — secret / large-file / merge-marker scan before anything commits
+# 5. Jankurai        — `jankurai audit` (advisory in meta mode, blocking in app mode)
+#
 # Quality gate run by /build-next before `bd close`. Detects the stack and
-# runs lint + typecheck + test. Exits 0 only if everything passes.
+# runs the checks above in order. Exits 0 only if everything passes.
 #
 # Designed to be conservative: if the gate cannot find a runner for a check,
 # it prints "SKIP: <check> (no runner detected)" and continues — but the
