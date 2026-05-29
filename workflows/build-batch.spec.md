@@ -98,7 +98,7 @@ The heart of the workflow. One orchestrator script holds in-memory pipeline stat
 
 ### In-memory pipeline state
 
-The orchestrator holds this as script variables (do not persist to a build epic — the run is bounded by a single workflow invocation, and recovery from a crash mid-batch is a deliberate non-goal for v1):
+The orchestrator holds this as script variables AND checkpoints the processed sets to disk after each wave for crash recovery (lbq.7 — see "Crash recovery" below; over a 2-day window an OOM/restart is likely):
 
 ```
 activePipelines = {}      # beadId → { taskId, worktreePath, branch, dispatchTime, filesTouched }
@@ -444,6 +444,15 @@ This is a per-worker timeout, not a batch-wide one. The batch's only wall-time b
 
 ---
 
+## Crash recovery (lbq.7)
+
+Over a 2-day unattended window an OOM/restart is likely, and a crashed run otherwise strands `in_progress` beads (claimed, worktree on disk) that are invisible to `bd ready` — and loses the in-memory merged/blocked/failed sets. Two mechanisms make a re-invocation resume instead of re-doing or stranding work:
+
+- **Checkpoint** (`.bd-batch-state.json` at the repo root, gitignored): after every wave the orchestrator writes `{ merged, blocked, failed, waveNum }` via a Bash agent (the workflow runtime has no fs). Local runtime state, never committed.
+- **Startup recovery + stale-claim reaper**: before the first dispatch, the orchestrator (a) reads the checkpoint and seeds `mergedSet/blockedSet/failedSet` so processed beads aren't redone, and (b) reaps stale claims — at startup nothing has been dispatched yet, so **every `in_progress` bead is necessarily an orphan from a crashed run**. Each is reset to `open` (un-claimed), its worktree `bd worktree remove --force`'d, and its stale `bead/<id>` branch deleted, so it re-dispatches cleanly. Rebuilding from scratch is the safe choice: an unmerged worker commit never passed the post-merge gate on `main`. The count of orphans whose unmerged work was discarded is logged (T7).
+
+---
+
 ## Stopping conditions (do not guess)
 
 - **Meta mode detected** (Phase 0): refuse outright. Tell user to use `/loop /build-next`.
@@ -465,7 +474,7 @@ This is a per-worker timeout, not a batch-wide one. The batch's only wall-time b
 - Do not auto-remove the worktree of a `failed` bead — the human needs that state to debug.
 - Do not invoke `/build-batch` recursively. One orchestrator at a time.
 - Do not promise dependency-aware scheduling beyond what `bd ready` + the `filesTouched` conflict filter (Phase 2.1 Step A) give you. When two ready siblings declare overlapping `filesTouched`, the filter defers the second until the first completes; if a bead has no `filesTouched` declared, the orchestrator warns and falls back to the post-merge gate as the sole conflict catcher.
-- Do not persist pipeline state to bd or disk between iterations. The run is bounded by a single workflow invocation; recovery from a crash mid-batch is a deliberate non-goal for v1. (If recovery becomes a requirement, it's a separate bead.)
+- Do persist the processed sets to the on-disk checkpoint after each wave (lbq.7) — but keep the rest of the pipeline state (active pipelines, merge queue) in-memory; the checkpoint exists only to resume merged/blocked/failed and reap stale claims after a crash, not to make every internal step durable.
 - Do not poll `TaskOutput` on workers that haven't exited. The marker-file path is the cheap default; stdout scraping is the fallback only.
 
 ---
