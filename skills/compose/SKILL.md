@@ -7,6 +7,18 @@ description: Take a plan.md and materialize it into a beads issue DAG (epics, ta
 
 Convert `plan.md` into a live beads DAG inside the current app repo. After this skill runs, `bd ready` returns the first true leaf tasks and `/loop /build-next` can take over.
 
+## Responsibilities
+
+**Owns:**
+- Translating a resolved plan (`plan.lock.json` / `plan.md`) into a beads issue DAG — epics, tasks, and the dependency edges between them.
+- Choosing and pouring the right `bd formula` per plan item, and wiring parent/child + blocker relationships so `bd ready` surfaces true leaf tasks.
+- Pre-flight gating: refusing to compose against an incomplete plan, an uninitialized/dirty beads DB, missing formulas, or a missing Jankurai install.
+
+**Delegates:**
+- Producing or repairing the plan itself → `/vision` (compose refuses rather than papering over an incomplete plan).
+- Implementing the tasks it creates, running the quality gate, and closing beads → `/build-next` (and `/build-batch`).
+- Defining what each formula pours → `formulas/*.toml`; compose only invokes them.
+
 ## Pre-flight checks (run these before doing anything)
 
 1. **`plan.md` exists in CWD.** If not, stop and ask the user to run `/vision`.
