@@ -39,7 +39,7 @@ The orchestrator is resumable: it figures out where the pipeline is from the rep
 | ready=0, blocked=0, beads were built | **Stage 4b — /retro**, then DONE |
 | no `vision.md` at all | STOP: "no vision.md — nothing to build. Fill the vision template first." |
 
-Detect with cheap checks: `Test-Path vision.md / plan.lock.json`, `bd ready --json` (filter epics), `bd blocked --json`.
+Detect with cheap checks: `Test-Path vision.md / plan.lock.json`, `bd ready --json` (filter epics), `bd list --status=blocked --json` (the human-needed set — not `bd blocked`, which lists only dependency-blocked beads and misses the `--status=blocked` ones the loop sets; autonomous-build-gh4).
 
 ## Stage 1 — /vision
 

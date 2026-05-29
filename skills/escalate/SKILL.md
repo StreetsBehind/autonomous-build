@@ -11,8 +11,9 @@ The loop's exit point when it can't proceed on its own.
 
 1. **List blockers.**
    ```powershell
-   bd blocked --json
+   bd list --status=blocked --json
    ```
+   Use the **status field** (`--status=blocked`), not `bd blocked`. `bd blocked` lists only *dependency*-blocked beads; the loop escalates by setting `--status=blocked` (build-next Step 8, build-batch's failed/blocked marking), and those have no open dependency — so `bd blocked` would summarize *zero* and this skill would page the human with an empty list (autonomous-build-gh4).
 
 2. **Group by reason category.** Read each issue's notes (the first line is the short reason; subsequent appended notes have the diagnostic detail). Bucket into:
    - **Decisions needed** — auth model, schema changes, paid APIs, branding, secrets

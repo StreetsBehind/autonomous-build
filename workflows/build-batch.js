@@ -105,7 +105,7 @@ Run these checks IN ORDER and return JSON matching the schema:
 1. \`bd ready --json\` must succeed. On a JSONL lock error, run \`bd doctor --fix\` once and retry. If still failing, return { "status": "failed", "failedReason": "bd unhealthy: <underlying error>" }.
 2. Parse the result, filter out epics (issue_type == "epic"). Set readyCount = filtered length.
 3. If readyCount == 0:
-   - \`bd blocked --json\`. If non-empty → return { "status": "blocked-only", "readyCount": 0, "blockedCount": N } — caller will invoke /escalate.
+   - \`bd list --status=blocked --json\` (the status field, NOT \`bd blocked\` — that lists only dependency-blocked beads and misses the \`--status=blocked\` ones the loop sets; autonomous-build-gh4). If non-empty → return { "status": "blocked-only", "readyCount": 0, "blockedCount": N } — caller will invoke /escalate.
    - Else → return { "status": "done-no-work", "readyCount": 0, "blockedCount": 0 }.
 4. \`git status --porcelain\` on main must be empty. If dirty, return { "status": "failed", "failedReason": "main has uncommitted state — workers branch from main and would inherit it. Commit, stash, or revert first." }.
 5. Read \`plan.lock.json\` from cwd if present (it may be absent for a pre-/vision-concerns app). Compute front-loaded decision flags from its \`concerns[]\` array (lbq.3) — these let labeled beads clear unattended because the decision was made at /vision time:
@@ -660,11 +660,11 @@ Inputs:
   blocked: ${JSON.stringify(blockedSet)}
   failed:  ${JSON.stringify(failedSet)}
 
-Note: failed beads have already been marked \`blocked\` (with a "worker failed unexpectedly … worktree left at <path>" note) by the orchestrator, so they appear in \`bd blocked\` and their worktrees are preserved. Failed is the most severe outcome and must NOT be silent — it escalates like any other block.
+Note: failed beads have already been marked \`blocked\` (with a "worker failed unexpectedly … worktree left at <path>" note) by the orchestrator, so they appear in \`bd list --status=blocked\` and their worktrees are preserved. Failed is the most severe outcome and must NOT be silent — it escalates like any other block.
 
 Decide and execute the post-action:
 1. If blocked.length > 0 OR failed.length > 0:
-   - These need a human (blocked = decision; failed = unexpected error to debug). Both are now in \`bd blocked\`. Also print worktree paths via Bash (\`git worktree list\`) so the human can find any failed-bead worktrees. Record postAction="escalate"; do NOT spawn /escalate as a slash command from within the workflow — the orchestrator turn handles the push notification from \`bd blocked\`.
+   - These need a human (blocked = decision; failed = unexpected error to debug). Both are now in \`bd list --status=blocked\`. Also print worktree paths via Bash (\`git worktree list\`) so the human can find any failed-bead worktrees. Record postAction="escalate"; do NOT spawn /escalate as a slash command from within the workflow — the orchestrator turn handles the push notification from \`bd list --status=blocked\`.
 2. Else:
    - Run \`bd ready --json\` and filter epics. If the remaining list is empty AND merged.length > 0 (we actually did work and nothing else is ready), record postAction="retro-suggested".
    - Otherwise record postAction="none".

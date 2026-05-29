@@ -79,7 +79,7 @@ Verify the run is viable. Produces a `Context` object the rest of the workflow c
    $ready = bd ready --json | ConvertFrom-Json | Where-Object { $_.issue_type -ne 'epic' }
    ```
    If `$ready` is empty:
-   - Check `bd blocked --json`. If any → invoke `/escalate` and exit cleanly.
+   - Check `bd list --status=blocked --json` (the status field, NOT `bd blocked` — that lists only dependency-blocked beads and misses the `--status=blocked` ones the loop sets; autonomous-build-gh4). If any → invoke `/escalate` and exit cleanly.
    - Else → print "DONE: no ready or blocked work" and exit cleanly.
 3. **`main` is clean.** `git status --porcelain` on main must be empty. Workers branch worktrees from main; uncommitted state on main propagates into worktrees and confuses the post-merge gate. Fail loud if dirty.
 4. **Resolve flags.** Parse `--workers`, `--max-merges`, `--budget` from the invocation; apply defaults. Sanity-check `workers >= 1` and warn (but proceed) if `workers > 4`.
@@ -305,7 +305,7 @@ Process-WorkerCompletion(beadId, marker):
       print "[WORKER] $beadId failed: $marker.notes"
       failedSet += beadId
       # Failed is the most severe outcome — it must NOT be silent. Mark the bead
-      # blocked with a diagnostic note so it surfaces in `bd blocked` and the
+      # blocked with a diagnostic note so it surfaces in `bd list --status=blocked` and the
       # Phase-3 /escalate notification reaches the human. Do NOT remove the
       # worktree — the human needs that state to diagnose.
       bd update beadId --status=blocked --notes "worker failed unexpectedly: $marker.notes — worktree left at $pipeline.worktreePath for inspection"
@@ -419,7 +419,7 @@ After the poll loop exits.
 
 2. Conditional post-actions:
    - **Failed beads are marked `blocked`** (with a `"worker failed unexpectedly … worktree left at <path>"` note) at the moment they fail — failed is the *most severe* outcome and must never be the silent one. Marking them blocked routes them through the same notification path and preserves the worktree for inspection.
-   - If `len(blockedSet) > 0` OR `len(failedSet) > 0` → invoke `/escalate` (it builds the push notification from `bd blocked`, which now includes the failed beads). Also print worktree paths so the human can find failed-bead worktrees.
+   - If `len(blockedSet) > 0` OR `len(failedSet) > 0` → invoke `/escalate` (it builds the push notification from `bd list --status=blocked`, which now includes the failed beads). Also print worktree paths so the human can find failed-bead worktrees.
    - If `len(blockedSet) == 0` and `len(failedSet) == 0` and `bd ready` is now empty → invoke `/retro` (matches /build-next's DONE path).
 
 **Output:** `BatchSummary = { merged: [...], blocked: [...], failed: [...], durationSec, postActions: [...] }`

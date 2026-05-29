@@ -316,7 +316,7 @@ const T7 = `If this source errors (file missing, bd transient failure, parse err
 const collected = await parallel([
   collect('collect-app-beads', `
 You are collect-app-beads for /retro Phase 2. ${W}
-From appPath, gather (Bash + bd): closed beads in window (\`bd query\`/\`bd list\`), flagged (\`bd list --label workflow-issue\`), blocked (\`bd blocked\`), in_progress (\`bd list --status=in_progress\`).
+From appPath, gather (Bash + bd): closed beads in window (\`bd query\`/\`bd list\`), flagged (\`bd list --label workflow-issue\`), blocked (\`bd list --status=blocked\` — the status field, not \`bd blocked\`, which lists only dependency-blocked beads and misses the ones the loop marked; autonomous-build-gh4), in_progress (\`bd list --status=in_progress\`).
 For each closed bead capture {id, title, type, priority, labels, claimedAt, closedAt, created_to_closed_sec, retries, parentEpic}. If claimed_at is absent (bd <=0.55.x), use created_at as the start and set created_to_closed_sec = closedAt − createdAt (name it exactly that so downstream knows it's created-to-closed).
 Return { "closed": [...], "flagged": [...], "blocked": [...], "inProgress": [...] }. ${T7}`),
 

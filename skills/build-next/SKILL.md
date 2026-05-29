@@ -59,7 +59,7 @@ $next = bd ready --json | ConvertFrom-Json | Where-Object { $_.issue_type -ne 'e
 `bd ready` includes epics, but epics are containers with no implementable work. Filter them out client-side (bd has no `--type` filter on `ready`).
 
 If `$next` is empty:
-- Check `bd blocked --json`. If any → invoke `/escalate` and exit.
+- Check `bd list --status=blocked --json`. If any → invoke `/escalate` and exit. (Use the **status field**, not `bd blocked` — `bd blocked` lists only *dependency*-blocked beads and misses the `--status=blocked` ones the loop itself sets on every escalation, so a drain-to-blocked would read as zero and skip the page; autonomous-build-gh4.)
 - If both empty → print "DONE: no ready or blocked work" and exit.
 
 Capture the returned issue ID as `$id = $next.id`.
