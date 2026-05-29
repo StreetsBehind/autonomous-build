@@ -476,7 +476,7 @@ You are a beads-builder worker. Your full contract is the beads-builder agent de
 - TESTS: if \`metadata.testPlanFile\` is set on the bead, EXTEND that file — do not create a new singleton test file for this bead. A detected stack with no runnable test suite is a hard fail at the gate, not a pass.
 - Stay inside the kickoff's ownership boundaries (if Jankurai is configured); do not edit forbidden paths or files outside the bead's scope (that's a "scope creep" block).
 - Implement the bead per its acceptance criteria. Honor the kickoff if Jankurai is configured; if not, proceed.
-- Run the quality gate (resolve cross-platform: prefer \`<repo-root>/hooks/post-build-gate.{sh,ps1}\`, else the sibling \`../autonomous-build/hooks/\`; run \`post-build-gate.sh\` on Linux/macOS, \`pwsh -NoProfile -File post-build-gate.ps1\` on Windows). On red, retry once; on second red, block.
+- Run the quality gate (resolve cross-platform: prefer \`<repo-root>/hooks/post-build-gate.{sh,ps1}\`, else the sibling \`../autonomous-build/hooks/\`; run \`post-build-gate.sh\` on Linux/macOS, \`pwsh -NoProfile -File post-build-gate.ps1\` on Windows). On red, retry with a *different* fix up to the bead's budget = plan.lock.escalationBudget.maxFailuresPerTask (default 2), +2 if this bead has dependents or is P0/P1 (load-bearing beads earn more attempts — stranding them wastes the downstream subtree, lbq.19); block on the final failure.
 - Commit with explicit \`git add\` (no \`-A\`). Commit message: "<bead title> (bd: <beadId>)".
 - Do NOT merge to main, do NOT close the bead — the orchestrator owns those steps.
 - Write \`<worktree>/.bd-build-complete.json\` AND return the same payload as structured output.

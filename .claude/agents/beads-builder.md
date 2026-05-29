@@ -136,14 +136,19 @@ if (-not (Test-Path $gate)) { $gate = Join-Path (Resolve-Path "../autonomous-bui
 pwsh -NoProfile -File $gate
 ```
 
-Use the symlink/copy the app uses if /compose set one up. Behavior:
+Use the symlink/copy the app uses if /compose set one up. Behavior — the retry budget is **not** a flat "once" (that strands hard, load-bearing beads, lbq.19):
 
-- **First failure:** read the failure summary (and `target/jankurai/audit-fast.md`, `target/jankurai/merge-witness.md` if present), adjust the implementation, re-run. **Once.**
-- **Second failure:**
+```
+budget = plan.lock.escalationBudget.maxFailuresPerTask   # default 2 if no lock
+if the bead has dependents (other beads blocked-by it) OR is P0/P1: budget += 2
+```
+
+- **Each failure (attempts < budget):** read the failure summary (and `target/jankurai/audit-fast.md`, `target/jankurai/merge-witness.md` if present), adjust the implementation with a *different* approach informed by the failure, re-run.
+- **Final failure (attempts == budget):**
   ```powershell
   bd update $beadId --status=blocked --notes "<failure summary>" --append-notes "<full failure output>"
   ```
-  Emit `BUILD_COMPLETE blocked` and exit. Do not "try one more thing."
+  Emit `BUILD_COMPLETE blocked` and exit. Do not resubmit an unchanged build to spend budget.
 
 ### Step 7: commit on the bead branch
 

@@ -197,9 +197,19 @@ pwsh -NoProfile -File $gate
 
 Exits 0 on green, nonzero with summary on red. The gate now includes a Jankurai pass: `jankurai audit --changed-fast` (advisory — prints findings, does not fail the gate by itself) and `jankurai witness` against `agent/baselines/main.repo-score.json` if that baseline exists (hard fail on regression).
 
-On red:
-- First failure: read the failure (including `target/jankurai/audit-fast.md` and `target/jankurai/merge-witness.md` if present), adjust, re-run. Once.
-- Second failure: `bd update $id --status=blocked --notes "<failure summary>" --append-notes "<full failure output>"`, leave the worktree for the human to inspect, exit.
+On red — the retry budget is **not** a hardcoded "once" (that biases surviving output toward easy beads and strands hard, load-bearing ones, lbq.19). Compute the gate-attempt budget for this bead:
+
+```
+budget = plan.lock.escalationBudget.maxFailuresPerTask   # default 2 if no lock
+# Load-bearing bonus: stranding a bead that blocks others wastes the whole
+# downstream subtree, so it earns more attempts before a permanent block.
+if bead has dependents (other beads blocked-by it) OR priority is P0/P1: budget += 2
+```
+
+- Each failure: read the failure (including `target/jankurai/audit-fast.md` and `target/jankurai/merge-witness.md` if present), adjust, re-run — up to `budget` total attempts.
+- On the final failure (attempts == budget): `bd update $id --status=blocked --notes "<failure summary>" --append-notes "<full failure output>"`, leave the worktree for the human to inspect, exit.
+
+Each re-run must be a *different* approach informed by the failure, not the same diff resubmitted — a budget spent re-running an unchanged build is wasted.
 
 ### Step 9: commit
 
@@ -269,7 +279,7 @@ The DONE-path `/retro` invocation is automatic. The user can also run `/retro` m
 ## Stopping conditions (escalate, do not guess)
 
 - Any rule in `docs/ESCALATION_RULES.md` fires.
-- Quality gate fails twice on the same issue.
+- Quality gate fails the bead's full retry budget (`plan.lock.escalationBudget.maxFailuresPerTask`, raised for load-bearing beads — see Step 8) on the same issue.
 - A required tool isn't installed (don't auto-install — that's a human decision).
 - Tests pass but acceptance can't be self-verified (e.g. "the UI looks right" — block with a screenshot request).
 - A task's scope expands during implementation (block with "scope creep: <what>").

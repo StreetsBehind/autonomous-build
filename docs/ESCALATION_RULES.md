@@ -12,7 +12,7 @@ The loop's prime directive: **escalate over guess**. When in doubt, `bd update <
 | Deciding secrets handling **de novo** (where keys live, how they're rotated) **that plan.lock did not already decide** | Security incident risk. |
 | Public-facing copy or branding decisions | Subjective; better to ask than to redo. |
 | Any task whose acceptance criteria the builder cannot self-verify | If the gate can't tell you it's done, you don't know it's done. |
-| Same task fails the quality gate twice | Symptom of a wrong approach or missing context. |
+| Same task fails the quality gate its full **retry budget** | Symptom of a wrong approach or missing context. The budget is `plan.lock.escalationBudget.maxFailuresPerTask` (default 2), **raised by +2 for load-bearing beads** (those with dependents, or P0/P1) — a flat "once" biases surviving output toward easy beads and strands hard, downstream-blocking ones (lbq.19). Each retry must try a *different* approach, not resubmit the same diff. |
 | Cumulative session API cost exceeds the budget in `plan.md` | Stop the burn. |
 
 ### Front-loaded decisions are not escalations (auth / secrets / migration)
