@@ -289,7 +289,10 @@ if has_cmd jankurai; then
     echo "ADVISORY: jankurai audit reported findings (exit $?) — see target/jankurai/audit-fast.md"
   fi
 
-  # Witness ratchet: only enforce if a reviewed baseline exists.
+  # Witness ratchet: enforce if a baseline exists. /decompose populates this at
+  # scaffold time (lbq.14) so the ratchet is LIVE during the unattended build —
+  # a missing baseline now means a pre-lbq.14 app or a skipped decompose, not
+  # "waiting for a human to accept one".
   baseline="agent/baselines/main.repo-score.json"
   if [ -f "$baseline" ]; then
     witness_cmd="jankurai witness . --changed-from origin/main \
@@ -298,7 +301,7 @@ if has_cmd jankurai; then
 --md target/jankurai/merge-witness.md"
     run_step "jankurai witness" "$witness_cmd"
   else
-    echo "SKIP: jankurai witness (no baseline at $baseline — ratchet disabled until baseline accepted)"
+    echo "SKIP: jankurai witness (no baseline at $baseline — pre-lbq.14 app or decompose skipped; ratchet not live)"
   fi
 else
   echo "SKIP: jankurai (not installed — see docs for install)"

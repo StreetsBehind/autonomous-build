@@ -45,7 +45,7 @@ The pipeline applies the **[Jankurai](https://github.com/neverhuman/jankurai)** 
 - `/decompose` scaffolds Jankurai in every new app (`jankurai adopt` + `jankurai init --level agents --yes`) — do not silently remove this; it produces the `AGENTS.md` that downstream `/build-next` / `/build-batch` ticks read. (`/decompose` is the dynamic workflow that subsumed the old `/compose` skill.)
 - `/build-next` runs `jankurai kickoff --intent "<acceptance>"` before coding — this is the bounded-plan step. Kickoff refusal is a real signal, not a nuisance.
 - `hooks/post-build-gate.{sh,ps1}` (POSIX + Windows ports, kept in sync) runs `jankurai audit --changed-fast` (advisory) and `jankurai witness` (hard fail if `agent/baselines/main.repo-score.json` exists). Do not gut this without a replacement audit step, and keep the two ports behaviourally identical.
-- Receipts under `target/jankurai/` are gitignored; baselines under `agent/baselines/` are tracked and accepted in dedicated commits.
+- Receipts under `target/jankurai/` are gitignored; baselines under `agent/baselines/` are tracked and accepted in dedicated commits. `/decompose` seeds the initial `agent/baselines/main.repo-score.json` from the scaffold audit so the witness ratchet is live from the first build bead (lbq.14) — do not ship it `{}`/absent.
 
 Workflow-improvement tasks that touch the Jankurai integration should be labelled `quality-standard` so retros can find them.
 

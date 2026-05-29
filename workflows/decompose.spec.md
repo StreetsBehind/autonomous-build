@@ -71,7 +71,8 @@ Extract the structured feature list and cross-feature deps from the plan. Bootst
    - `bd hooks install`
    - `jankurai adopt . --profile auto --mode observe --out target/jankurai/adoption-plan.json --md target/jankurai/adoption-plan.md`
    - `jankurai init . --level agents --yes` (creates `AGENTS.md` at repo root)
-   - `jankurai audit . --mode advisory --json target/jankurai/repo-score.json --md target/jankurai/repo-score.md` (baseline; ratchet not enabled yet)
+   - `jankurai audit . --mode advisory --json target/jankurai/repo-score.json --md target/jankurai/repo-score.md`
+   - **Populate the witness baseline so the ratchet is LIVE for the build (lbq.14):** `mkdir -p agent/baselines && cp target/jankurai/repo-score.json agent/baselines/main.repo-score.json` (or `jankurai`'s dedicated baseline-accept command if present), then commit it on its own (`chore: accept initial jankurai witness baseline`). This is the scaffold's score — the floor the build must not regress below. The per-task gate enforces `jankurai witness` only when this file exists; shipping it `{}`/absent left the enforcer advisory during exactly the unattended window. A non-parseable/`{}` score is a FAIL, not an acceptable baseline.
 4. Create the app-level epic: `bd create "<appName>" --type=epic --priority=1 --description "See plan.md"`. Capture `appEpicId`.
 5. If `Context.dryRun`, skip steps 3 + 4 (do not mutate bd or filesystem); set `appEpicId='<dry-run>'`.
 
