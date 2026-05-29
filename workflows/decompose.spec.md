@@ -15,6 +15,8 @@ This file is a **workflow spec**, not a skill. The canonical script lives at `wo
 
 When this spec changes meaningfully, the JS in `workflows/decompose.js` must change to match in the same commit (T3: atomic bead, atomic commit). Spec-only edits with no JS counterpart are a workflow bug.
 
+**Agent prompts must be self-contained.** Every agent spawned by `decompose.js` runs with the *app repo* as cwd, where this spec does not exist (only the `.js` ships to `~/.claude/workflows/`; `.spec.md` is repo-only). So agent prompts must embed all instructions (and the report schema) inline — they must NOT tell an agent to read `workflows/decompose.spec.md`, a bare relative path that resolves to the app cwd and is never found. This spec is the source-of-truth for *maintainers*; the running agents only ever see their inlined prompt.
+
 **Why a workflow instead of a three-skill chain:** independent agents per feature parallelize the pour step (compose was sequential); intermediate per-feature/per-bead state stays in script variables instead of bloating Claude's context; the adversarial fidelity cross-check (two agents must agree before the DAG is blessed) gives evidence-grounded coverage verification that no single-pass skill could provide; the verdict (`BLESSED` vs `NEEDS-FIX`) is mechanical, not a judgment call buried in chat.
 
 ---

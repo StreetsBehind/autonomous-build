@@ -67,7 +67,7 @@ const preflightSchema = {
 };
 
 const preflight = await agent(`
-You are the pre-flight agent for the /decompose dynamic workflow. Spec: workflows/decompose.spec.md §"Phase 1 — Pre-flight".
+You are the pre-flight agent for the /decompose dynamic workflow. (Self-contained: all instructions are inline below — you run in the app repo cwd, where the workflow spec is not present.)
 
 Run these checks IN ORDER and return JSON matching the schema:
 
@@ -142,7 +142,7 @@ const parseSchema = {
 };
 
 const parseResult = await agent(`
-You are the parse-plan agent for /decompose. Spec: workflows/decompose.spec.md §"Phase 2 — Parse plan".
+You are the parse-plan agent for /decompose. (Self-contained: all instructions are inline below; you run in the app repo cwd, where the workflow spec is not present.)
 
 Context (from pre-flight):
 ${JSON.stringify(Context, null, 2)}
@@ -213,7 +213,7 @@ const pourSchema = {
 };
 
 const pourTasks = ParsedPlan.features.map((feature) => () => agent(`
-You are the pour-feature agent for /decompose, feature="${feature.name}". Spec: workflows/decompose.spec.md §"Phase 3 — Pour beads per feature".
+You are the pour-feature agent for /decompose, feature="${feature.name}". (Self-contained: all instructions are inline below; you run in the app repo cwd, where the workflow spec is not present.)
 
 Context: ${JSON.stringify(Context, null, 2)}
 appEpicId: ${ParsedPlan.appEpicId}
@@ -322,7 +322,7 @@ let persistentlyOversized = [];
 for (let iter = 1; iter <= atomizeIterationCap; iter++) {
   // Identify oversized beads via a scout agent (cheap, single agent reads all open beads).
   const scout = await agent(`
-You are the atomize-scout agent for /decompose Phase 4, iteration ${iter}/${atomizeIterationCap}. Spec: workflows/decompose.spec.md §"Phase 4 — Atomize oversized beads".
+You are the atomize-scout agent for /decompose Phase 4, iteration ${iter}/${atomizeIterationCap}. (Self-contained: all instructions are inline below; you run in the app repo cwd, where the workflow spec is not present.)
 
 Run \`bd list --status=open --json\` and filter out epics (issue_type == "epic"). For each remaining bead, compute the SIZING score:
 
@@ -348,7 +348,7 @@ ${Context.dryRun ? `Dry-run pours: ${JSON.stringify(pourResults, null, 2)}` : ''
   log(`Atomize iter ${iter}: ${oversized.length} oversized beads, fanning out`);
 
   const atomizeTasks = oversized.map((b) => () => agent(`
-You are the atomize agent for /decompose Phase 4, bead=${b.id}. Spec: workflows/decompose.spec.md §"Phase 4 — Atomize oversized beads".
+You are the atomize agent for /decompose Phase 4, bead=${b.id}. (Self-contained: all instructions are inline below; you run in the app repo cwd, where the workflow spec is not present.)
 
 Bead to atomize: ${JSON.stringify(b)}
 Context: ${JSON.stringify(Context, null, 2)}
@@ -476,7 +476,7 @@ const qualityScoreSchema = {
 };
 
 const qualityTasks = epics.map((e) => () => agent(`
-You are the quality-score agent for /decompose Phase 5, epic=${e.id}. Spec: workflows/decompose.spec.md §"Phase 5 — Quality scoring".
+You are the quality-score agent for /decompose Phase 5, epic=${e.id}. (Self-contained: all instructions are inline below; you run in the app repo cwd, where the workflow spec is not present.)
 
 For every open child of epic ${e.id} (\`bd list --parent ${e.id} --status=open --json\`), apply the FULL /quality-pass rubric. Start each bead at 100, floor at 0, apply ALL applicable penalties:
 
@@ -568,7 +568,7 @@ const traceabilitySchema = {
 const fidelityResults = await parallel([
   // Verifier A: plan → dag
   () => agent(`
-You are verifier A (plan → dag coverage) for /decompose Phase 6. Spec: workflows/decompose.spec.md §"Phase 6 — Adversarial fidelity cross-check".
+You are verifier A (plan → dag coverage) for /decompose Phase 6. (Self-contained: all instructions are inline below; you run in the app repo cwd, where the workflow spec is not present.)
 
 INPUTS:
 - Plan: read ${Context.planPath} (and ${Context.lockPath || 'plan.lock.json'} if planSource=lock).
@@ -594,7 +594,7 @@ Return JSON:
 
   // Verifier B: dag → plan
   () => agent(`
-You are verifier B (dag → plan traceability) for /decompose Phase 6. Spec: workflows/decompose.spec.md §"Phase 6 — Adversarial fidelity cross-check".
+You are verifier B (dag → plan traceability) for /decompose Phase 6. (Self-contained: all instructions are inline below; you run in the app repo cwd, where the workflow spec is not present.)
 
 INPUTS:
 - Plan: read ${Context.planPath} (and ${Context.lockPath || 'plan.lock.json'} if planSource=lock).
@@ -658,7 +658,7 @@ const depAuditSchema = {
 };
 
 const DepAuditResult = await agent(`
-You are the dep-audit agent for /decompose Phase 7. Spec: workflows/decompose.spec.md §"Phase 7 — Dep audit".
+You are the dep-audit agent for /decompose Phase 7. (Self-contained: all instructions are inline below; you run in the app repo cwd, where the workflow spec is not present.)
 
 Steps:
 1. \`bd dep cycles\` — capture any reported cycles. Empty list is good.
@@ -718,13 +718,80 @@ const synthesisPayload = {
 };
 
 const reportResult = await agent(`
-You are the write-report agent for /decompose Phase 8. Spec: workflows/decompose.spec.md §"Phase 8 — Synthesis & verdict". The report schema is fully defined there — follow it exactly.
+You are the write-report agent for /decompose Phase 8. (Self-contained: the report schema is inlined below — you run in the app repo cwd, where the workflow spec is not present, so do NOT try to read workflows/decompose.spec.md.)
 
 INPUT (aggregated from prior phases):
 ${JSON.stringify(synthesisPayload, null, 2)}
 
 Steps:
-1. Generate the report markdown per the schema in workflows/decompose.spec.md §"Report schema". Include EVERY section listed there.
+1. Generate the report markdown using EXACTLY this section structure (fill every section from the INPUT above):
+
+\`\`\`markdown
+# Decompose: <app-name> (<date>)
+
+**Verdict:** <BLESSED | NEEDS-FIX>
+**Plan source:** <plan.lock.json | plan.md (deprecation: rerun /vision)>
+**Beads created:** <N> (<X> epics, <Y> tasks)
+**App epic:** <id>
+**Phases run:** preflight, parse-plan, pour (<N> features), atomize (<iterations> iters, <M> atomized), quality (<K> epics scored), fidelity (A+B+reconcile), dep-audit, synthesis
+
+## Verdict reasoning
+<one paragraph: why blessed, or what blocks it>
+
+## Coverage (Phase 6.A — plan-to-dag)
+- <feature name> → <beadId(s)> ✓
+- <feature name> → **GAP** (no bead)
+- Cross-feature deps applied: <count>
+- Cross-feature deps missing: <list>
+
+## Traceability (Phase 6.B — dag-to-plan)
+- Beads with plan citation: <count>
+- Drifted beads (no plan source): <list with beadIds and titles>
+
+## Fidelity verdict (Phase 6 reconcile)
+- Bin: <pass | coverage-gap | traceability-drift | both-fail | disagree>
+- <if disagree: FIDELITY DISAGREEMENT block with both verifier outputs verbatim>
+
+## Per-epic quality (Phase 5)
+### <epicId> — <title>
+- <beadId> — <title> — <score>/100 ✓
+- <beadId> — <title> — <score>/100 ⚠
+  - Penalties: <list with rule + evidence>
+  - Remediations: <numbered list>
+  - Projected after remediation: <score>/100
+
+## Atomization (Phase 4)
+- Iterations: <n>/3
+- Atomized: <source → children list>
+- Unsplittable (surfaced for human): <list with bead, attempted seams, reason>
+- Persistently oversized after 3 iterations: <list>
+
+## Pours (Phase 3)
+- Successful: <N>
+- Failed: <list with feature + error>
+
+## Dep audit (Phase 7)
+- Cycles: <none | list>
+- Ready set on launch: <count> non-epic beads
+- Implicit conflicts (filesTouched overlap, no dep): <list>
+
+## Next steps
+<if BLESSED:>
+The DAG is ready. To start the build:
+
+    /build-batch --workers <suggested-N>
+
+Suggested workers: <min(4, ready_count)>. Higher values yield diminishing returns once the merge queue dominates.
+
+<if NEEDS-FIX:>
+The DAG is not ready. Resolve in this order:
+1. <highest-leverage fix from above — usually plan amendment or pour fix>
+2. <next fix>
+...
+
+After fixes, re-run \`/decompose --no-file\` to preview the state, then \`/decompose\` to re-pour.
+\`\`\`
+
 2. Prefix the title with "(DRY RUN) " if synthesisPayload.dryRun is true; skip the "Next steps" section in that case.
 3. Write the markdown to \`decomposeReport.md\` in cwd via the Write tool.
 4. Return JSON: { "status": "ok", "reportPath": "decomposeReport.md", "verdict": "${verdict}" }.
