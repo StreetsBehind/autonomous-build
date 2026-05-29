@@ -31,7 +31,11 @@ const parsedArgs = parseArgs(rawArgs);
 log(`decompose args: ${JSON.stringify(parsedArgs)}`);
 
 function parseArgs(s) {
-  const out = { plan: 'plan.md', dryRun: false, autoBless: false };
+  // phase: which build phase to decompose (epic 0ms). Default 1 — the only phase of a
+  // single-phase plan, so the bare `/decompose` behaves exactly as before. --phase N>1
+  // re-enters a repo that already holds prior (built, closed) phases and pours ONLY the
+  // slice tagged for phase N under a dedicated phase epic (JIT per-phase decomposition).
+  const out = { plan: 'plan.md', dryRun: false, autoBless: false, phase: 1 };
   if (!s) return out;
   const tokens = (typeof s === 'string') ? s.trim().split(/\s+/).filter(Boolean) : (Array.isArray(s) ? s : []);
   for (let i = 0; i < tokens.length; i++) {
@@ -41,6 +45,7 @@ function parseArgs(s) {
     // signal auto-chain into /build-batch instead of stopping at the human gate.
     // Default (flag absent) keeps the human-review gate. (lbq.1)
     else if (tokens[i] === '--auto-bless') { out.autoBless = true; }
+    else if (tokens[i] === '--phase' && tokens[i + 1]) { const n = parseInt(tokens[++i], 10); if (Number.isInteger(n) && n >= 1) out.phase = n; }
   }
   return out;
 }
@@ -80,7 +85,11 @@ Run these checks IN ORDER and return JSON matching the schema:
 2. Resolve plan.lock.json next to ${parsedArgs.plan}. If absent → set planSource="md". If present → set planSource="lock".
 3. If planSource="lock", read plan.lock.json and verify schemaVersion == 2. If schemaVersion == 1, fail with { "status": "failed", "failedReason": "plan.lock.json is schemaVersion 1; this workflow needs schemaVersion 2 — rerun /vision to regenerate a v2 lock" }. For any other version, fail with the version found. (v2 added mustHaves[]/successMetric/coverage[]/concerns[].)
 4. If planSource="lock" AND lock.incomplete == true, fail with the blocking openQuestions list joined into failedReason.
-5. Run \`bd info\`. If it errors → isFreshRepo=true. If it succeeds → run \`bd list --status=open --json\`. If the result is a non-empty array, fail with "repo already has open beads — /decompose is for fresh app repos; for re-pour delete .beads/ first then rerun".
+5. This run decomposes **phase ${parsedArgs.phase}** (epic 0ms; default 1 = the only phase of a single-phase plan). Run \`bd info\`.
+   - If it ERRORS (no beads DB yet): set isFreshRepo=true. This is valid ONLY at phase 1. At phase > 1, fail with "no beads DB — phase ${parsedArgs.phase} re-entry needs phase 1 to have run first" (you cannot decompose a later phase onto a repo with no prior phases).
+   - If it SUCCEEDS: set isFreshRepo=false, then run \`bd list --status=open --json\`.
+     - At **phase 1**: a fresh app repo must have NO open beads — if the array is non-empty, fail with "repo already has open beads — /decompose phase 1 is for fresh app repos; for re-pour delete .beads/ first then rerun".
+     - At **phase > 1**: prior built phases (now closed) and the umbrella app epic are EXPECTED — do NOT refuse on their presence (that is the whole point of re-entry). Refuse ONLY if THIS phase was already decomposed: look for an OPEN epic whose title starts with "Phase ${parsedArgs.phase}" (the phase epic this run would create). If such an epic already exists with open beads, fail with "phase ${parsedArgs.phase} already has open beads — it is already decomposed (resume the build, do not re-decompose)". Otherwise proceed.
 6. Enumerate formulas referenced in plan: from lock.featureOrder[].formulas if lock, else regex-parse plan.md §"Feature order" for backtick-quoted formula names. Then verify each named formula exists via \`bd formula list\`. IMPORTANT: \`bd formula list\` requires an openable beads database to run, but a fresh app repo has none yet (check 5 above relies on \`bd info\` erroring). So do NOT run \`bd formula list\` bare from cwd — instead create a throwaway empty database used ONLY for the listing, scoped to that one command so it never touches the app repo or its fresh state: \`TMPDB=$(mktemp -d); ( cd "$TMPDB" && bd init >/dev/null 2>&1 ); BEADS_DIR="$TMPDB/.beads" bd formula list; rm -rf "$TMPDB"\`. The user-level search path \`~/.beads/formulas/\` (and the project \`.beads/formulas/\`) is scanned regardless of BEADS_DIR, so formulas installed there resolve. Verify each named formula appears in the output. If any are missing, fail with the list of missing formula names.
 7. Run \`jankurai version\`. If exit≠0, fail with "jankurai not installed — see README install section".
 
@@ -108,8 +117,8 @@ if (!preflight || preflight.status !== 'ok') {
     reportPath: null
   };
 }
-const Context = { ...preflight.context, dryRun: parsedArgs.dryRun };
-log(`Pre-flight OK — app=${Context.appName}, planSource=${Context.planSource}, isFreshRepo=${Context.isFreshRepo}, formulas=${Context.formulas.length}, dryRun=${Context.dryRun}`);
+const Context = { ...preflight.context, dryRun: parsedArgs.dryRun, phase: parsedArgs.phase };
+log(`Pre-flight OK — app=${Context.appName}, planSource=${Context.planSource}, phase=${Context.phase}, isFreshRepo=${Context.isFreshRepo}, formulas=${Context.formulas.length}, dryRun=${Context.dryRun}`);
 
 // ---------------------------------------------------------------------------
 // Phase 2 — Parse plan + initialize repo (sequential, 1 agent)
@@ -156,7 +165,8 @@ Steps:
 1. Parse the plan:
    - If Context.planSource == "lock": read \`${Context.lockPath || 'plan.lock.json'}\`. Extract \`featureOrder[]\` (name, formulas, vars) and \`crossFeatureDependencies\` (blocked, blocker).
    - If Context.planSource == "md": regex-parse plan.md §"Feature order" (lines like "1. Habits CRUD — formulas: \`[crud-feature]\`, vars: \`{entity=Habit}\`") and §"Cross-feature dependencies".
-2. If Context.isFreshRepo AND NOT Context.dryRun:
+   - **Scope to phase ${Context.phase} (epic 0ms):** keep ONLY featureOrder[] entries whose \`phase\` equals ${Context.phase} (an entry with no \`phase\` field defaults to phase 1). This is the slice this run pours; a single-phase plan (no phase tags) at the default phase 1 keeps every feature, exactly as before. Keep a crossFeatureDependency only when BOTH endpoints are in this slice — an edge onto a prior, already-built phase is already satisfied, so drop it from pour-time wiring (do not fail on it). The returned \`features\`/\`crossDeps\` MUST contain only this phase's slice.
+2. If Context.phase == 1 AND Context.isFreshRepo AND NOT Context.dryRun:
    a. \`bd init\`
    b. \`bd setup claude --project\`
    c. \`bd hooks install\`
@@ -165,7 +175,10 @@ Steps:
    f. \`jankurai init . --level agents --yes\`
    g. \`jankurai audit . --mode advisory --json target/jankurai/repo-score.json --md target/jankurai/repo-score.md\`
    h. **Do NOT accept a baseline here (superseded by igu.2).** Step (g) only *measures* the scaffold score (advisory, into the gitignored \`target/jankurai/\`). lbq.14 used to auto-stamp that score as \`agent/baselines/main.repo-score.json\` and commit it *before* the verdict — freezing a never-blessed floor in exactly the unattended window, on runs that might be NEEDS-FIX. Baseline acceptance now rides the BLESSED verdict: the dedicated Baseline phase (Phase 8, after synthesis) accepts it only on a BLESSED run, after a human-review gate (attended) or with a loud trusted-by-policy note (\`--auto-bless\` walk-away). Leave \`target/jankurai/repo-score.json\` on disk for that phase; do not write or commit anything under \`agent/\` in this step.
-3. Create the app-level epic (skip if Context.dryRun): \`bd create "${Context.appName}" --type=epic --priority=1 --description "See plan.md"\`. Capture the returned ID.
+   (At phase > 1 this whole step is skipped — the repo was bootstrapped + Jankurai-scaffolded by phase 1; do NOT re-init or re-scaffold.)
+3. Create the epic this run's beads hang under (skip if Context.dryRun):
+   - At **phase 1**: create the app-level epic \`bd create "${Context.appName}" --type=epic --priority=1 --description "See plan.md"\`. Capture the returned ID as appEpicId.
+   - At **phase > 1**: the app-level umbrella epic already exists from phase 1 — find it (\`bd list --type=epic --json\`, the epic titled "${Context.appName}"). Create a PHASE epic under it: \`bd create "Phase ${Context.phase}: <short slice goal>" --type=epic --priority=1 --parent <appUmbrellaEpicId> --description "Phase ${Context.phase} slice — see plan.lock.json phases[]"\`. Set appEpicId to the PHASE epic's ID so this run's Phase-3 pours land under it, isolated from prior phases' (closed) beads.
 4. If Context.dryRun, set appEpicId to "<dry-run>".
 
 Return:
@@ -722,8 +735,9 @@ INPUTS:
 - DAG snapshot: \`bd list --status=open --json\` to see current open beads.
 - Cross-deps declared in plan: ${JSON.stringify(ParsedPlan.crossDeps)}
 - Phase 3 feature-name → pour-root-ID map (AUTHORITATIVE — resolve feature names to bead IDs with THIS, never by title; molecule-epic titles are formula names like "crud-feature"/"integration-http", not feature names): ${JSON.stringify(featureToPourRoot)}
+- This run is **phase ${Context.phase}** (epic 0ms). Verify coverage ONLY for THIS phase's slice — the features poured this run: ${JSON.stringify(ParsedPlan.features.map((f) => f.name))}. A featureOrder[] entry tagged for a LATER phase (\`phase\` > ${Context.phase}) is not poured yet by design (JIT per-phase decomposition) — do NOT flag it as a gap. (An untagged feature defaults to phase 1.)
 
-YOUR QUESTION: does every feature in plan.featureOrder have at least one open bead implementing it? Does every cross-feature dep in the plan map to a real \`bd dep\` edge?
+YOUR QUESTION: does every feature in THIS phase's slice (listed above) have at least one open bead implementing it? Does every cross-feature dep within this slice map to a real \`bd dep\` edge?
 
 For each plan feature, find the bead(s) that implement it: the pour-root in the map above IS that feature's molecule epic, so the feature is covered by that root and its children. A feature absent from the map never poured — mark it a gap. (Only fall back to title/description matching for a feature with no map entry.)
 
@@ -787,14 +801,18 @@ INPUTS:
 
 YOUR QUESTION: is every vision must-have realized by the DAG, or DELIBERATELY deferred? A must-have that silently dropped during /vision distillation — present in the product intent but absent from featureOrder, so no bead — is exactly what this catches.
 
+This run is **phase ${Context.phase}** (epic 0ms). Each mustHaves[] entry carries a \`phase\` (default 1).
+
 For EACH entry in mustHaves[]:
-1. Covering feature(s): use \`coverage[]\` if it maps this must-have to featureOrder entries; otherwise map semantically (must-have text → featureOrder[].name).
-2. Implementing bead(s): match the covering feature name(s) to open bead titles/descriptions.
-3. Classify status:
-   - "covered": ≥1 open bead implements a covering feature.
-   - "deferred": the lock EXPLICITLY marks this must-have deferred / out-of-v1 (a status or defer field, or a non-goal note naming it). A deliberate defer is acceptable.
-   - "gap": neither covered nor deliberately deferred — a dropped must-have.
-Be conservative: if you cannot confidently map a must-have to a bead AND it is not explicitly deferred, call it "gap".
+1. Determine its phase = the entry's \`phase\` field (an entry with no \`phase\` defaults to 1).
+2. Covering feature(s): use \`coverage[]\` if it maps this must-have to featureOrder entries; otherwise map semantically (must-have text → featureOrder[].name).
+3. Implementing bead(s): match the covering feature name(s) to open bead titles/descriptions.
+4. Classify status:
+   - If the must-have's phase > ${Context.phase} (a FUTURE phase): "deferred" — its beads do not exist yet BY DESIGN (JIT per-phase decomposition). A future-phase must-have is a deliberate deferral, NOT a gap.
+   - If the must-have's phase < ${Context.phase} (a PRIOR, already-built phase): "covered" — it was realized in an earlier phase's build; out of scope for this slice (do not flag).
+   - If the must-have's phase == ${Context.phase} (THIS phase): "covered" iff ≥1 open bead implements a covering feature; else "gap".
+   - Also "deferred" if the lock EXPLICITLY marks this must-have deferred / out-of-v1 (a defer field or a non-goal note naming it).
+Be conservative: a THIS-phase must-have you cannot confidently map to a bead AND that is not explicitly deferred is a "gap".
 
 Set traceable = "gap" if ANY must-have is a gap; else "complete". You are INDEPENDENT — do not see A's or B's reasoning.
 
@@ -965,17 +983,20 @@ const baselineSchema = {
   }
 };
 
+// Baseline is a phase-1 (fresh-repo) operation (epic 0ms): phase 1 scaffolds the repo and accepts the
+// starting floor; later phases ride that same baseline (the gate's high-water re-stamp moves it up during
+// builds), so re-accepting at phase > 1 would re-stamp a mid-build floor — skip it.
 let baselineResult = {
   status: 'ok',
   accepted: false,
   baselineScore: null,
   trustedByPolicy: false,
   policyWritten: false,
-  note: null,
+  note: (blessed && Context.phase > 1) ? `phase ${Context.phase} — baseline already accepted at phase 1; not re-accepted` : null,
   failedReason: blessed ? (Context.dryRun ? 'dry run — no baseline written' : null) : 'verdict NEEDS-FIX — no baseline accepted'
 };
 
-if (blessed && !Context.dryRun) {
+if (blessed && !Context.dryRun && Context.phase === 1) {
   baselineResult = await agent(`
 You are the baseline-acceptance agent for /decompose Phase 8. You run ONLY on a BLESSED verdict. (Self-contained: all instructions are inline; you run in the app repo cwd, where the workflow spec is not present — do NOT try to read workflows/decompose.spec.md.)
 
