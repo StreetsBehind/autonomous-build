@@ -73,7 +73,7 @@ timeout = "30m"
 
 ### Test Plan declarations (testPlan)
 
-Steps that produce code with verifiable tests SHOULD declare where those tests live and what they cover. This tells `/build-next` where to extend (vs. inventing a new test file per bead) and feeds the `/quality-pass` audit.
+Steps that produce code with verifiable tests SHOULD declare where those tests live and what they cover. This tells `/build-next` where to extend (vs. inventing a new test file per bead) and feeds `/decompose`'s quality audit.
 
 ```toml
 [steps.testPlan]

@@ -2,7 +2,7 @@
 #
 # For: scheduled cleanups, queue-driven webhooks, batched recomputes — anything
 # that isn't request-driven. ONE job per pour. Multi-stage pipelines (ETL,
-# fan-out-fan-in) belong in a different formula or in /split.
+# fan-out-fan-in) belong in a different formula, or split into separate beads during /decompose.
 #
 # Scope:
 # - Handler function + trigger wiring + optional idempotency guard + handler test.

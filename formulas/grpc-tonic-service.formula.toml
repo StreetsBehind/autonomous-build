@@ -239,7 +239,7 @@ Integration test that:
 - `cargo nextest run -p smbuild-api --test {{service_snake}}_service` passes
 - Every RPC in `{{rpc_methods}}` has at least 2 test cases (1 happy, 1 error)
 - Container reuse: marked compatible with the `testcontainers-reuse` nextest feature so a single Postgres container serves the whole nextest run
-- Test takes <30s on the workspace's standard CI runner (slow tests are marked with the `slow` nextest filter; this one should not be slow unless `{{rpc_methods}}` is very large — if it is, the bead should `/split` per T-15)
+- Test takes <30s on the workspace's standard CI runner (slow tests are marked with the `slow` nextest filter; this one should not be slow unless `{{rpc_methods}}` is very large — if it is, the bead should be split into separate beads during /decompose per T-15)
 """
 
 [steps.testPlan]

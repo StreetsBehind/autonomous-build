@@ -2,7 +2,7 @@
 
 Machine-readable mirror of `plan.md`. Emitted by `/vision` alongside the human narrative; consumed by `/decompose` as the authoritative source for stack, data model, features, formula picks, cross-feature dependencies, and the escalation budget.
 
-`plan.md` remains the human-readable contract. `plan.lock.json` exists because `/compose` used to regex-parse markdown for feature names — a fragile parse where a typo in an em-dash placement silently dropped a feature, caught only by the end-of-pour coverage check. The lock removes the parse fragility without removing the narrative.
+`plan.md` remains the human-readable contract. `plan.lock.json` exists because the markdown feature-name parse it replaced is fragile — a typo in an em-dash placement silently dropped a feature, caught only by the end-of-pour coverage check. (That regex parse survives only as `/decompose`'s legacy fallback for pre-lock plans.) The lock removes the parse fragility without removing the narrative.
 
 ## Schema
 

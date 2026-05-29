@@ -2,7 +2,7 @@
 #
 # For one-off DDL: add a column, add an index, drop a deprecated table, rename a
 # constraint. Anything bigger (extracting a new table from a column, multi-table
-# refactor) belongs in /split or a dedicated multi-step formula.
+# refactor) belongs in a dedicated multi-step formula, or split into separate beads during /decompose.
 #
 # OUT OF SCOPE for v1: data backfills. Those need batched-write strategies,
 # progress reporting, and resumability — separate `migration-with-backfill`

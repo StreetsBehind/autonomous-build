@@ -106,7 +106,7 @@ Where tenets pull opposite directions, this section is the tiebreaker. Lower-num
 
 ### Atomic bead (T3) vs. don't leave the tree broken
 - **Tension**: Splitting a bead mid-build would leave the working tree in a broken state with no easy commit boundary.
-- **Resolution**: The bead was sized wrong. Atomicity still wins — split the bead via `/split`, finish the originally-scoped half cleanly, and let the second half become its own bead with a `blocked-by` dependency on the first.
+- **Resolution**: The bead was sized wrong. Atomicity still wins — split the bead, finish the originally-scoped half cleanly, and let the second half become its own bead with a `blocked-by` dependency on the first.
 
 ### Scope discipline (T4) vs. obvious bug in adjacent code
 - **Tension**: You're editing `foo.ts` and spot an obvious bug in `bar.ts` next to it.

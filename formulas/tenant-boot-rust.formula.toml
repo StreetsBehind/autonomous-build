@@ -392,7 +392,7 @@ If anyone in Phase 3 or Phase 4 adds a parameter, removes async, changes the ret
 **Acceptance:**
 - The doc-test block is present in `crates/smbuild-api/src/tenant/boot.rs` immediately above the `pub async fn boot_tenant` declaration with a comment header reading `// PHASE 4 STABILITY LOCK — DO NOT EDIT WITHOUT TENETS.md §6 AMENDMENT`
 - `cargo test -p smbuild-api --doc tenant::boot` passes against the current (Phase 1) signature
-- A negative-control bead test (run by /quality-pass, not committed code): briefly edit `boot_tenant` to add an extra `&str` arg, re-run the doc-test, confirm it fails to compile — then revert. The doc-test PROVES the lock works.
+- A negative-control bead test (run during /decompose's quality audit, not committed code): briefly edit `boot_tenant` to add an extra `&str` arg, re-run the doc-test, confirm it fails to compile — then revert. The doc-test PROVES the lock works.
 """
 
 [steps.testPlan]
