@@ -8,7 +8,7 @@ export const meta = {
     { title: 'Pour',                 detail: 'One agent per feature pours its formula(s) and writes step metadata' },
     { title: 'Atomize',              detail: 'Split oversized beads along clean seams; iterate up to 3 times' },
     { title: 'Quality scoring',      detail: 'Per-epic agent scores every child against the buildability rubric' },
-    { title: 'Fidelity cross-check', detail: 'Two independent verifiers (plan→dag, dag→plan) + reconciler' },
+    { title: 'Fidelity cross-check', detail: 'Three independent verifiers (plan→dag, dag→plan, must-have→dag) + reconciler' },
     { title: 'Dep audit',            detail: 'Cycles, ready-set sanity, implicit conflicts, cross-deps applied' },
     { title: 'Synthesis',            detail: 'Aggregate, compute verdict, write decomposeReport.md' }
   ]
@@ -297,6 +297,66 @@ Report the VERIFIED-PRESENT count, never the attempted count, as the headline. R
 }
 
 // ---------------------------------------------------------------------------
+// Phase 3.5 — Concern enforcement pours (bfo.10)
+// An "addressed" concern whose evidence is NOT an existing featureOrder entry
+// (it cites a tenet/gate/stack-pin or a bare NFR target like "p99 < 200ms") has
+// no product-feature bead. Today it evaporates into tenets.md prose — never
+// scored, never gated (the lbq.16 finding). Pour a dedicated enforcement bead
+// (concrete AC + testPlan) so the NFR becomes testable, scored, gated work.
+// T6 (formula precedence): pour from a concern-enforcement formula, NEVER
+// hand-create via bd create; if no formula fits, surface "Missing formula" and
+// force NEEDS-FIX. No double-pour: a concern whose evidence cites a product
+// feature is already covered by that feature's Phase 3 pour and is skipped.
+// ---------------------------------------------------------------------------
+let concernEnforcement = { poured: [], missingFormula: [], skippedCoveredByFeature: [], errors: [] };
+if (Context.planSource === 'lock') {
+  phase('Concern enforcement');
+  const ceSchema = {
+    type: 'object',
+    required: ['poured', 'missingFormula', 'skippedCoveredByFeature', 'errors'],
+    properties: {
+      poured:                  { type: 'array', items: { type: 'object' } },
+      missingFormula:          { type: 'array', items: { type: 'object' } },
+      skippedCoveredByFeature: { type: 'array', items: { type: 'object' } },
+      errors:                  { type: 'array', items: { type: 'object' } }
+    }
+  };
+  const ce = await agent(`
+You are the concern-enforcement agent for /decompose Phase 3.5 (bfo.10). (Self-contained: all instructions are inline below; you run in the app repo cwd, where the workflow spec is not present.)
+
+PURPOSE: make every "addressed" concern that is NOT delivered by a product feature into testable, gated work — pour a dedicated enforcement bead with a concrete AC and a test plan. An NFR like "data stays in my region" or "p99 < 200ms" otherwise evaporates into prose, never scored, never gated.
+
+INPUTS:
+- Read the lock at ${Context.lockPath || 'plan.lock.json'}. Use its \`concerns[]\` and \`featureOrder[].name\` lists.
+- App epic id: ${ParsedPlan.appEpicId}. Reparent every poured root under it.
+- dryRun: ${Context.dryRun}.
+
+FOR EACH \`concerns[]\` entry with \`status == "addressed"\`:
+1. Classify the evidence:
+   - If it cites (names or clearly maps to) a \`featureOrder[].name\` → that product feature's Phase 3 pour ALREADY produces the implementing bead. Record under "skippedCoveredByFeature" ({concernId, feature}) and DO NOT pour — no double-pour.
+   - Otherwise (evidence cites a tenet like "T7", the quality gate, a DEFAULT_STACK pin, a formula name, or a bare NFR target such as "p99 < 200ms") → this concern needs a DEDICATED enforcement bead. Proceed to step 2.
+   (\`status == "excluded"\` concerns are skipped entirely — nothing to enforce.)
+2. Select a concern-enforcement formula. Run \`bd formula list\` (against a throwaway DB if the repo's is fresh: \`TMPDB=$(mktemp -d); ( cd "$TMPDB" && bd init >/dev/null 2>&1 ); BEADS_DIR="$TMPDB/.beads" bd formula list; rm -rf "$TMPDB"\`). Pick the formula whose purpose is enforcing this class of concern (e.g. a load/latency-test formula for \`perf-envelope\`, a data-residency/retention formula for \`data-lifecycle\`, a rate-limit/input-validation formula for \`abuse-surface\`). Read its \`[vars.*]\` contract with \`bd formula show <name>\`.
+   - If NO installed formula fits this concern → record under "missingFormula" ({concernId, evidence, recommendedFormula: "<one-line description of the formula that should exist, e.g. concern-enforcement-perf: pours a load test asserting a p99 latency target>"}) and move on. DO NOT hand-create the bead with \`bd create\` and DO NOT remap to a near-miss formula (T6 + T1).
+3. Pour the chosen formula, binding ONLY its declared vars (validate against the \`[vars.*]\` contract exactly as Phase 3 does — no invented keys, no off-enum values). Bind the concern's target/evidence into the formula's vars so the poured bead carries a concrete, falsifiable AC and a testPlan.
+   - If dryRun: \`bd mol pour <formula> --dry-run --var ...\` — capture the planned bead, do not mutate.
+   - Else: \`bd mol pour <formula> --var ... 2>&1\`, parse \`Root issue: (\\S+)\` → pourRoot, then \`bd dep add <pourRoot> ${ParsedPlan.appEpicId} --type parent-child\`. Set the bead's description to cite the concernId (so it is discoverable as the enforcement of that concern; the Phase 6 concern-traceability check treats NFR/tenet evidence as accepted-as-is, so this does not regress fidelity).
+   - Record under "poured" ({concernId, formula, pourRoot, acSummary}).
+4. On any \`bd\` error, record under "errors" ({concernId, msg}) instead of throwing (T7).
+
+Return JSON:
+{
+  "poured": [{ "concernId": "...", "formula": "...", "pourRoot": "...", "acSummary": "..." }, ...],
+  "missingFormula": [{ "concernId": "...", "evidence": "...", "recommendedFormula": "..." }, ...],
+  "skippedCoveredByFeature": [{ "concernId": "...", "feature": "..." }, ...],
+  "errors": [{ "concernId": "...", "msg": "..." }, ...]
+}
+`, { label: 'concern-enforcement', phase: 'Concern enforcement', schema: ceSchema, agentType: 'general-purpose' });
+  concernEnforcement = ce || concernEnforcement;
+  log(`Concern enforcement: ${concernEnforcement.poured.length} poured, ${concernEnforcement.missingFormula.length} missing-formula, ${concernEnforcement.skippedCoveredByFeature.length} covered-by-feature, ${concernEnforcement.errors.length} errors`);
+}
+
+// ---------------------------------------------------------------------------
 // Phase 4 — Atomize oversized beads (iterative parallel)
 // ---------------------------------------------------------------------------
 phase('Atomize');
@@ -573,6 +633,16 @@ const traceabilitySchema = {
   }
 };
 
+const mustHaveSchema = {
+  type: 'object',
+  required: ['traceable', 'matrix'],
+  properties: {
+    traceable: { enum: ['complete', 'gap', 'n/a'] },
+    matrix:    { type: 'array' },   // [{ mustHave, status, features, beads }]
+    note:      { type: 'string' }
+  }
+};
+
 const fidelityResults = await parallel([
   // Verifier A: plan → dag
   () => agent(`
@@ -631,11 +701,45 @@ Return JSON:
   "drifted": ["<beadId>", ...],
   "note": "<one sentence summary>"
 }
-`, { label: 'verify-dag-to-plan', phase: 'Fidelity cross-check', schema: traceabilitySchema, agentType: 'general-purpose' })
+`, { label: 'verify-dag-to-plan', phase: 'Fidelity cross-check', schema: traceabilitySchema, agentType: 'general-purpose' }),
+
+  // Verifier C: vision must-have → dag (catches a must-have dropped during /vision
+  // distillation — invisible to A/B, which only check plan↔DAG, never the lock's
+  // mustHaves[]). A 12-must-have vision can otherwise ship as a faithful 9-feature
+  // app with a green report.
+  () => agent(`
+You are verifier C (vision must-have → dag traceability) for /decompose Phase 6. (Self-contained: all instructions are inline below; you run in the app repo cwd, where the workflow spec is not present.)
+
+INPUTS:
+- planSource is "${Context.planSource}". If it is NOT "lock", you have no structured must-haves to trace — return { "traceable": "n/a", "matrix": [], "note": "md-only plan; no mustHaves[] to trace" } and stop.
+- If planSource=lock: read ${Context.lockPath || 'plan.lock.json'}. Use its \`mustHaves[]\` array (the product must-haves /vision distilled) and, if present, \`coverage[]\` (vision's must-have→feature map).
+- DAG snapshot: \`bd list --status=open --json\` (non-epic beads).
+
+YOUR QUESTION: is every vision must-have realized by the DAG, or DELIBERATELY deferred? A must-have that silently dropped during /vision distillation — present in the product intent but absent from featureOrder, so no bead — is exactly what this catches.
+
+For EACH entry in mustHaves[]:
+1. Covering feature(s): use \`coverage[]\` if it maps this must-have to featureOrder entries; otherwise map semantically (must-have text → featureOrder[].name).
+2. Implementing bead(s): match the covering feature name(s) to open bead titles/descriptions.
+3. Classify status:
+   - "covered": ≥1 open bead implements a covering feature.
+   - "deferred": the lock EXPLICITLY marks this must-have deferred / out-of-v1 (a status or defer field, or a non-goal note naming it). A deliberate defer is acceptable.
+   - "gap": neither covered nor deliberately deferred — a dropped must-have.
+Be conservative: if you cannot confidently map a must-have to a bead AND it is not explicitly deferred, call it "gap".
+
+Set traceable = "gap" if ANY must-have is a gap; else "complete". You are INDEPENDENT — do not see A's or B's reasoning.
+
+Return JSON:
+{
+  "traceable": "complete" | "gap" | "n/a",
+  "matrix": [{ "mustHave": "...", "status": "covered" | "deferred" | "gap", "features": ["..."], "beads": ["..."] }, ...],
+  "note": "<one sentence summary>"
+}
+`, { label: 'verify-musthave-to-dag', phase: 'Fidelity cross-check', schema: mustHaveSchema, agentType: 'general-purpose' })
 ]);
 
 const verifierA = fidelityResults[0];
 const verifierB = fidelityResults[1];
+const verifierC = fidelityResults[2];
 
 // Reconcile bin — pure synthesis, can be inline JS rather than another agent.
 // A feature-cited "addressed" concern with no implementing bead is a fidelity
@@ -643,6 +747,10 @@ const verifierB = fidelityResults[1];
 // independently so the offending concern is named even when coverage/traceability
 // also fail (the concern section in the report keys off concernGap, not the bin).
 const concernGap = !!(verifierA && verifierA.concernTrace && verifierA.concernTrace.traceable === 'gap');
+// A dropped must-have (in the vision, absent from the DAG, not deliberately
+// deferred) forces NEEDS-FIX exactly like a coverage gap. "n/a" (md-only plan)
+// and "complete" are both fine.
+const mustHaveGap = !!(verifierC && verifierC.traceable === 'gap');
 let fidelityBin;
 if (!verifierA || !verifierB) {
   fidelityBin = 'disagree';
@@ -650,7 +758,7 @@ if (!verifierA || !verifierB) {
   const covOk = verifierA.coverage === 'complete';
   const traceOk = verifierB.traceability === 'clean';
   if (covOk && traceOk) {
-    fidelityBin = concernGap ? 'concern-gap' : 'pass';
+    fidelityBin = concernGap ? 'concern-gap' : (mustHaveGap ? 'musthave-gap' : 'pass');
   } else if (!covOk && traceOk) {
     fidelityBin = 'coverage-gap';
   } else if (covOk && !traceOk) {
@@ -662,8 +770,8 @@ if (!verifierA || !verifierB) {
     fidelityBin = 'both-fail';
   }
 }
-const FidelityResult = { bin: fidelityBin, A: verifierA, B: verifierB, concernGap, blockingForBlessed: fidelityBin !== 'pass' || concernGap };
-log(`Fidelity verdict: ${fidelityBin}${concernGap && fidelityBin !== 'concern-gap' ? ' (+ concern-gap)' : ''}`);
+const FidelityResult = { bin: fidelityBin, A: verifierA, B: verifierB, C: verifierC, concernGap, mustHaveGap, blockingForBlessed: fidelityBin !== 'pass' || concernGap || mustHaveGap };
+log(`Fidelity verdict: ${fidelityBin}${concernGap && fidelityBin !== 'concern-gap' ? ' (+ concern-gap)' : ''}${mustHaveGap && fidelityBin !== 'musthave-gap' ? ' (+ musthave-gap)' : ''}`);
 
 // ---------------------------------------------------------------------------
 // Phase 7 — Dep audit (sequential, 1 agent)
@@ -773,7 +881,7 @@ Steps:
 **Plan source:** <plan.lock.json | plan.md (deprecation: rerun /vision)>
 **Beads created:** <N> (<X> epics, <Y> tasks)
 **App epic:** <id>
-**Phases run:** preflight, parse-plan, pour (<N> features), atomize (<iterations> iters, <M> atomized), quality (<K> epics scored), fidelity (A+B+reconcile), dep-audit, synthesis
+**Phases run:** preflight, parse-plan, pour (<N> features), atomize (<iterations> iters, <M> atomized), quality (<K> epics scored), fidelity (A+B+C+reconcile), dep-audit, synthesis
 
 ## Verdict reasoning
 <one paragraph: why blessed, or what blocks it>
@@ -794,9 +902,18 @@ Steps:
 - <concernId> — addressed by tenet/gate/stack-pin/formula → accepted as-is
 - <omit this section entirely if planSource is not lock or concerns[] is empty>
 
+## Must-have traceability (Phase 6.C — vision → DAG)
+<render fidelity.C.matrix as a table — one row per vision must-have:>
+| Must-have | Status | Covering feature(s) | Bead(s) |
+| --- | --- | --- | --- |
+| <mustHave> | covered ✓ / deferred ⏸ / **GAP** | <features> | <beadIds> |
+- <if any row is GAP: this must-have was in the vision but dropped during distillation — it has no bead and was not deliberately deferred. This forces NEEDS-FIX even when plan↔DAG coverage and traceability are otherwise clean.>
+- <omit this section entirely if planSource is not lock (fidelity.C.traceable == "n/a") — an md-only plan has no structured mustHaves[] to trace>
+
 ## Fidelity verdict (Phase 6 reconcile)
-- Bin: <pass | coverage-gap | traceability-drift | concern-gap | both-fail | disagree>
+- Bin: <pass | coverage-gap | traceability-drift | concern-gap | musthave-gap | both-fail | disagree>
 - <if concernGap is true: name each feature-cited "addressed" concern that has no implementing bead — this forces NEEDS-FIX even when coverage and traceability are otherwise clean>
+- <if mustHaveGap is true: name each vision must-have with status "gap" — this forces NEEDS-FIX>
 - <if disagree: FIDELITY DISAGREEMENT block with both verifier outputs verbatim>
 
 ## Per-epic quality (Phase 5)

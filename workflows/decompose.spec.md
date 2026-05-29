@@ -191,9 +191,9 @@ One agent per epic in the DAG (app-level epic + each pour-root epic from Phase 3
 
 ---
 
-## Phase 6 — Adversarial fidelity cross-check (parallel: 2 verifiers + 1 reconcile)
+## Phase 6 — Adversarial fidelity cross-check (parallel: 3 verifiers + 1 reconcile)
 
-The load-bearing phase that makes `/decompose` worth more than the sum of compose+quality-pass+split. Two independent agents verify the DAG against the plan from opposite directions; both must agree before the DAG is BLESSED on fidelity.
+The load-bearing phase that makes `/decompose` worth more than the sum of compose+quality-pass+split. Three independent agents verify the DAG from different directions — plan→DAG coverage, DAG→plan traceability, and vision-must-have→DAG — and all must agree before the DAG is BLESSED on fidelity. A/B only check plan↔DAG; a must-have dropped during `/vision` distillation (in the lock's `mustHaves[]` but absent from `featureOrder`) is invisible to them — verifier C closes that hole.
 
 ### Spawn pattern
 
@@ -209,7 +209,13 @@ The load-bearing phase that makes `/decompose` worth more than the sum of compos
 **Question:** does every bead in the DAG (excluding the app-level epic) trace back to a plan feature? Flag beads with no plan citation as scope-drift candidates.
 **Output:** `{ traceability: 'clean' | 'drift', beads: [{id, title, citedFeature: <name | null>}], drifted: [<ids of beads with no plan citation>], note: <one sentence> }`
 
-Both A and B run in **parallel** on the same inputs (2 agents total). They must reach conclusions **independently** — neither sees the other's output. The runtime fan-out provides this isolation by construction.
+**Agent C:** `verify-musthave-to-dag` (vision must-have → DAG traceability)
+**Tools:** `Read`, `Bash`
+**Inputs:** plan.lock.json (`mustHaves[]` and, if present, `coverage[]`), full open-bead snapshot
+**Question:** is every vision must-have realized by ≥1 open bead, or DELIBERATELY deferred? For each `mustHaves[]` entry: find covering feature(s) (via `coverage[]` if present, else semantic map to `featureOrder[].name`), then the implementing bead(s). Classify `covered` / `deferred` (lock explicitly marks it out-of-v1) / `gap` (neither). A `gap` is a must-have that silently dropped during distillation. If `planSource != 'lock'` there are no structured must-haves — return `traceable: 'n/a'`.
+**Output:** `{ traceable: 'complete' | 'gap' | 'n/a', matrix: [{mustHave, status: 'covered'|'deferred'|'gap', features: [<names>], beads: [<ids>]}], note: <one sentence> }`
+
+A, B, and C run in **parallel** on the same inputs (3 agents total). They must reach conclusions **independently** — none sees the others' output. The runtime fan-out provides this isolation by construction.
 
 ### Reconciliation
 
@@ -223,6 +229,7 @@ Both A and B run in **parallel** on the same inputs (2 agents total). They must 
 | `pass` | A.coverage == 'complete' AND B.traceability == 'clean' AND A.concernTrace.traceable == 'complete' | fidelity passes; no remediation needed |
 | `coverage-gap` | A reports `incomplete` (one or more features have no bead) | fidelity fails; surface gaps; recommend `/vision` rerun OR manual pour of missing formulas |
 | `concern-gap` | A.coverage == 'complete' AND B.traceability == 'clean' BUT A.concernTrace.traceable == 'gap' (a feature-cited `addressed` concern has no implementing bead) | fidelity fails; name the offending concern(s); recommend `/vision` rerun to correct the evidence OR pour the missing feature. The `concernGap` flag is also surfaced independently in the report, so the offending concern is named even when `coverage-gap`/`traceability-drift` is the headline bin |
+| `musthave-gap` | A.coverage == 'complete' AND B.traceability == 'clean' AND no concern-gap BUT C.traceable == 'gap' (a vision must-have has no implementing bead and was not deliberately deferred) | fidelity fails; name the dropped must-have(s); recommend `/vision` rerun to restore the feature OR an explicit deferral in the lock. The `mustHaveGap` flag is surfaced independently in the report (must-have traceability matrix), so the dropped must-have is named even when another bin is the headline |
 | `traceability-drift` | B reports `drift` (one or more beads have no plan citation) | fidelity fails; surface drifted beads; recommend either close as scope creep OR amend `plan.md` to declare the feature |
 | `both-fail` | A and B both fail with non-overlapping concerns | fidelity fails; surface both verdicts; the DAG has both gaps and drift |
 | `disagree` | A and B fail with conflicting evidence (e.g. A says feature X is covered by bead Y; B says bead Y traces to feature Z, not X) | fidelity fails; surface BOTH verifier outputs verbatim under a "FIDELITY DISAGREEMENT" section in the report; **the human resolves**, the workflow does not auto-pick (T1) |
