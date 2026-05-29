@@ -1203,8 +1203,8 @@ The DAG is ready. To start the build:
 
 Suggested workers: <min(4, ready_count)>. Higher values yield diminishing returns once the merge queue dominates.
 <if baseline.trustedByPolicy: ⚠ This run auto-accepted the Jankurai baseline WITHOUT human review (--auto-bless). The score-<N> floor now arms the regression ratchet for the whole build — glance at agent/baselines/main.repo-score.json if you want to re-bless the starting line.>
-<if confidence == 'high'>: This is a HIGH-confidence BLESSED (no advisory warnings). Re-running /decompose with `--auto-bless` (or driving via the orchestrator) would chain straight into the build without stopping here — use it for a true walk-away run.
-<if confidence == 'review-recommended'>: BLESSED, but advisory warnings are present (implicit conflicts / missing cross-deps below) — `--auto-bless` deliberately will NOT auto-chain this; glance at the warnings first.
+<if confidence == 'high'>: This is a HIGH-confidence BLESSED (no advisory warnings). Re-running /decompose with \`--auto-bless\` (or driving via the orchestrator) would chain straight into the build without stopping here — use it for a true walk-away run.
+<if confidence == 'review-recommended'>: BLESSED, but advisory warnings are present (implicit conflicts / missing cross-deps below) — \`--auto-bless\` deliberately will NOT auto-chain this; glance at the warnings first.
 
 <if NEEDS-FIX:>
 The DAG is not ready. Resolve in this order:
