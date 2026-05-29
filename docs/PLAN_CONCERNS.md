@@ -51,7 +51,7 @@ Applicability is **derived from `vision.md`, never invented.** This keeps the co
 | `data-model` | required | always (excluded only for a genuinely stateless app — rare). |
 | `authn` | excluded-by-default | any §3 must-have implies user accounts / per-user data, or §2 lists multiple human roles. |
 | `authz` | excluded-by-default | `authn` is required **and** there is >1 principal or any cross-user/cross-tenant data. |
-| `secrets` | excluded-by-default | `authn` or `external-integrations` is required, **or** §6 has a privacy/budget constraint. (Usually required once there's a DB + auth.) |
+| `secrets` | excluded-by-default | `authn` or `external-integrations` is required, **or** §6 has a privacy constraint. (Usually required once there's a DB + auth. A §6 *budget* line is a cost ceiling, not a secret-management signal — a paid-API budget surfaces as `external-integrations`, which already elevates `secrets`.) |
 | `data-lifecycle` | optional | §6 has a privacy constraint, **or** the data model holds PII / user-owned entities. |
 | `error-handling` | required | always (depth scales with `external-integrations` + destructive ops). |
 | `observability` | optional | §8 success metric implies running-in-production / multi-user operation. |

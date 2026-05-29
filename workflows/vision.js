@@ -238,8 +238,9 @@ function validateIntake(raw) {
 // ORACLE-GROUNDED (fixture 04-public-unauth-api): a §6 BUDGET line is a cost ceiling, NOT a
 // secret-management signal — elevating secrets on budget there manufactures a false required+excluded
 // contradiction. So secrets elevates only on authn / external-integrations / PRIVACY (not budget),
-// and data-lifecycle only on privacy / PII. docs/PLAN_CONCERNS.md + skills/vision/SKILL.md still say
-// "privacy/budget" for secrets — that prose should drop "budget"; tracked as a follow-up flag for /retro.
+// and data-lifecycle only on privacy / PII. A paid-API budget surfaces as external-integrations, which
+// already elevates secrets. (docs/PLAN_CONCERNS.md reconciled — "budget" dropped from the secrets
+// elevator, bead autonomous-build-lvl; skills/vision/SKILL.md no longer carries the prose post-ih5.5.)
 function deriveApplicability(signals) {
   const s = isObj(signals) ? signals : {};
   const sig = (k) => s[k] === true;
