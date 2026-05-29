@@ -15,7 +15,9 @@
 #                      hard fail on high/critical. GATE_SCA=advisory warns only; GATE_SCA=off skips
 # 6. coverage floor  — opt-in via GATE_COVERAGE_MIN=<pct>; off by default
 # 7. pre-commit safety — secret / large-file / merge-marker scan before anything commits
-# 8. Jankurai        — `jankurai audit` (advisory) + `jankurai witness` (hard fail if baseline exists)
+# 8. Jankurai        — `jankurai audit` (advisory) + regression-only ratchet parsed
+#                      from the audit receipt's decision.ratchet (hard fail on regression
+#                      when a baseline exists; never imports the absolute 85 floor)
 #
 # Stacks covered: Node/TS, Python, and Rust (the flagship core — fmt + clippy +
 # cargo test + cargo audit). Each stack runs only when its manifest is present.
@@ -62,6 +64,43 @@ function Run-Sca {
         Write-Host "FAIL: $name reported vulnerabilities (exit $($proc.ExitCode))"
         $script:failures += $name
     }
+}
+
+# Ratchet-Eval — regression-only Jankurai ratchet (autonomous-build-igu.1,
+# supersedes lbq.14). The PowerShell port of ratchet_eval() in post-build-gate.sh;
+# the two MUST stay behaviourally identical. Parses the AUDIT receipt's
+# decision.ratchet and returns @{ rc; reason }:
+#   rc 0 = PASS (no regression)  1 = BLOCK (regression)  2 = SKIP (can't evaluate)
+# Reads ONLY score_delta / new_hard_findings / new_caps — NEVER decision.passed or
+# ratchet.passed, which carry the absolute 85 floor and would deadlock a sub-85 app
+# (docs/JANKURAI_GATING_PROPOSAL.md rules 1, 9). Missing/unparseable/schema-skewed
+# receipt -> SKIP, not block (rule 5).
+function Ratchet-Eval {
+    param([string]$receipt, [int]$tol)
+    if (-not (Test-Path $receipt)) { return @{ rc = 2; reason = "receipt missing" } }
+    try { $d = Get-Content -Raw -Path $receipt | ConvertFrom-Json } catch { return @{ rc = 2; reason = "receipt unreadable: $_" } }
+    $sv = "$($d.schema_version)"
+    if (($sv -split '\.')[0] -ne '1') { return @{ rc = 2; reason = "schema_version '$sv' unsupported (expected 1.x)" } }
+    $r = $d.decision.ratchet
+    if ($null -eq $r) { return @{ rc = 2; reason = "no decision.ratchet block" } }
+    $hasAll = ($r.PSObject.Properties.Name -contains 'score_delta') -and
+              ($r.PSObject.Properties.Name -contains 'new_hard_findings') -and
+              ($r.PSObject.Properties.Name -contains 'new_caps')
+    if (-not $hasAll) { return @{ rc = 2; reason = "ratchet fields missing" } }
+    $sd = $r.score_delta; $nh = $r.new_hard_findings; $nc = $r.new_caps
+    # bool is not numeric in PS, so the numeric test naturally excludes a stray true/false.
+    $sdNum = ($sd -is [int]) -or ($sd -is [long]) -or ($sd -is [double]) -or ($sd -is [decimal])
+    $nhOk  = ($null -eq $nh) -or ($nh -is [Array])
+    $ncOk  = ($null -eq $nc) -or ($nc -is [Array])
+    if (-not ($sdNum -and $nhOk -and $ncOk)) { return @{ rc = 2; reason = "ratchet fields missing/wrong type" } }
+    $nhCount = if ($null -eq $nh) { 0 } else { @($nh).Count }
+    $ncCount = if ($null -eq $nc) { 0 } else { @($nc).Count }
+    $reasons = @()
+    if ($sd -lt (-$tol)) { $reasons += "score_delta $sd < -$tol" }
+    if ($nhCount -gt 0)  { $reasons += "$nhCount new hard finding(s)" }
+    if ($ncCount -gt 0)  { $reasons += "$ncCount new cap(s)" }
+    if ($reasons.Count -gt 0) { return @{ rc = 1; reason = ($reasons -join "; ") } }
+    return @{ rc = 0; reason = "score_delta=$sd >= -$tol, 0 new hard findings, 0 new caps" }
 }
 
 # normalize env knobs
@@ -235,19 +274,36 @@ if ($suspicious) {
 }
 
 # --- Jankurai (quality standard) ---
-# Audit is always advisory in the inner loop. Witness vs. baseline is hard-fail
-# only after a baseline has been accepted at agent/baselines/main.repo-score.json.
+# The audit is advisory; enforcement is a regression-ONLY ratchet parsed from the
+# audit receipt (igu.1, supersedes lbq.14). The old `jankurai witness` exit-code
+# gate baked in the absolute 85 floor and deadlocked every sub-85 app on its first
+# commit — so we stop calling witness for enforcement and read the receipt instead.
 if (Get-Command jankurai -ErrorAction SilentlyContinue) {
     New-Item -ItemType Directory -Force -Path "target/jankurai" | Out-Null
 
-    # Inner-loop advisory scan over changed files. Surfaces issues but does not
-    # fail the gate on its own — the witness step below is what enforces.
-    $auditCmd = "jankurai audit . --changed-fast --changed-from origin/main " +
-                "--json target/jankurai/audit-fast.json " +
-                "--md   target/jankurai/audit-fast.md " +
-                "--timings-json target/jankurai/audit-timings.json"
+    # Comparison base: a resolvable LOCAL ref only (rule 8). Pre-commit HEAD is the
+    # pre-change state; never origin/main (absent in a never-pushed repo -> fails open).
+    $baseRef  = (git rev-parse --verify --quiet HEAD 2>$null)
+    $baseline = "agent/baselines/main.repo-score.json"
+    $policy   = "agent/audit-policy.toml"
+
+    # One audit run produces the advisory MD and the receipt the ratchet parses.
+    # Pass a real --baseline when one exists (rule 2 — without it the ratchet
+    # self-references and is an inert no-op). --policy is forwarded if present; the
+    # BLOCK decision still ignores its floor verdict (rule 9). Baseline acceptance +
+    # policy authoring are decompose's job (igu.2); this gate only consumes them.
+    $auditCmd = "jankurai audit . --changed-fast"
+    if ($baseRef) { $auditCmd += " --changed-from $baseRef" }
+    $auditCmd += " --json target/jankurai/audit-fast.json " +
+                 "--md   target/jankurai/audit-fast.md " +
+                 "--timings-json target/jankurai/audit-timings.json"
+    if (Test-Path $baseline) {
+        $auditCmd += " --baseline $baseline"
+        if (Test-Path $policy) { $auditCmd += " --policy $policy" }
+    }
     Write-Host "=== jankurai audit (advisory) ==="
     Write-Host "  $ $auditCmd"
+    # rule 4: --changed-fast always exits 0; this exit code is advisory only.
     $auditProc = Start-Process -FilePath "pwsh" -ArgumentList "-NoProfile", "-Command", $auditCmd -NoNewWindow -PassThru -Wait
     if ($auditProc.ExitCode -ne 0) {
         Write-Host "ADVISORY: jankurai audit reported findings (exit $($auditProc.ExitCode)) — see target/jankurai/audit-fast.md"
@@ -255,18 +311,21 @@ if (Get-Command jankurai -ErrorAction SilentlyContinue) {
         Write-Host "PASS: jankurai audit (advisory)"
     }
 
-    # Witness ratchet: enforce if a baseline exists. /decompose populates this at
-    # scaffold time (lbq.14) so the ratchet is LIVE during the unattended build —
-    # a missing baseline now means a pre-lbq.14 app or a skipped decompose.
-    $baseline = "agent/baselines/main.repo-score.json"
-    if (Test-Path $baseline) {
-        $witnessCmd = "jankurai witness . --changed-from origin/main " +
-                      "--baseline $baseline " +
-                      "--out target/jankurai/merge-witness.json " +
-                      "--md  target/jankurai/merge-witness.md"
-        if (-not (Run-Step "jankurai witness" $witnessCmd)) { $failures += "jankurai-witness" }
+    # Regression-only ratchet: enforce only when a baseline exists. A missing
+    # baseline is a quiet SKIP here (meta mode, or pre-baseline); igu.3 turns that
+    # into a loud FAIL for app-mode callers via GATE_REQUIRE_BASELINE.
+    Write-Host "=== jankurai ratchet (regression-only) ==="
+    if (-not (Test-Path $baseline)) {
+        Write-Host "SKIP: jankurai ratchet (no baseline at $baseline — meta mode or pre-baseline; ratchet not live)"
+    } elseif (-not $baseRef) {
+        Write-Host "SKIP: jankurai ratchet (no resolvable local HEAD to diff against — treated as can't-evaluate, not block)"
     } else {
-        Write-Host "SKIP: jankurai witness (no baseline at $baseline — pre-lbq.14 app or decompose skipped; ratchet not live)"
+        $res = Ratchet-Eval "target/jankurai/audit-fast.json" 2
+        switch ($res.rc) {
+            0       { Write-Host "PASS: jankurai ratchet ($($res.reason))" }
+            1       { Write-Host "FAIL: jankurai ratchet — $($res.reason)"; $failures += "jankurai-ratchet" }
+            default { Write-Host "SKIP: jankurai ratchet (receipt not evaluable — $($res.reason); treated as crash, not block)" }
+        }
     }
 } else {
     Write-Host "SKIP: jankurai (not installed — see docs for install)"

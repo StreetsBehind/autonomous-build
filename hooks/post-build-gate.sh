@@ -19,7 +19,9 @@
 # 6. coverage floor  — opt-in via GATE_COVERAGE_MIN=<pct>; off by default so it never
 #                      retroactively breaks an app (the production-floor step turns it on)
 # 7. pre-commit safety — secret / large-file / merge-marker scan before anything commits
-# 8. Jankurai        — `jankurai audit` (advisory) + `jankurai witness` (hard fail if baseline exists)
+# 8. Jankurai        — `jankurai audit` (advisory) + regression-only ratchet parsed
+#                      from the audit receipt's decision.ratchet (hard fail on regression
+#                      when a baseline exists; never imports the absolute 85 floor)
 #
 # Stacks covered: Node/TS, Python, and Rust (the flagship core — fmt + clippy +
 # cargo test + cargo audit). Each stack runs only when its manifest is present.
@@ -86,6 +88,46 @@ run_step() {
 
 # has_cmd <name> — true if an executable is on PATH.
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# ratchet_eval <receipt.json> <tolerance> — regression-only Jankurai ratchet
+# (autonomous-build-igu.1, supersedes lbq.14). Parses the AUDIT receipt's
+# decision.ratchet and prints a one-line reason. Exit codes:
+#   0 = PASS  (no regression)   1 = BLOCK (regression)   2 = SKIP (can't evaluate)
+# Load-bearing (docs/JANKURAI_GATING_PROPOSAL.md): read ONLY score_delta /
+# new_hard_findings / new_caps — NEVER decision.passed or ratchet.passed, which
+# carry the absolute 85 floor and would deadlock every sub-85 app (rules 1, 9).
+# --changed-fast always exits 0, so the verdict comes from the receipt, not an
+# exit code (rule 4). A missing/unparseable/schema-skewed receipt is a SKIP, not
+# a block (crash-vs-block, rule 5).
+ratchet_eval() {
+  local receipt="$1" tol="$2"
+  has_cmd python3 || { echo "python3 not found — cannot parse receipt"; return 2; }
+  python3 - "$receipt" "$tol" <<'PY'
+import json, sys
+receipt, tol = sys.argv[1], int(sys.argv[2])
+try:
+    d = json.load(open(receipt))
+except Exception as e:
+    print(f"receipt unreadable: {e}"); sys.exit(2)
+sv = str(d.get("schema_version", ""))
+if sv.split(".")[0] != "1":                      # rule 5: schema skew -> SKIP, not block
+    print(f"schema_version {sv!r} unsupported (expected 1.x)"); sys.exit(2)
+r = (d.get("decision") or {}).get("ratchet")
+if not isinstance(r, dict):
+    print("no decision.ratchet block"); sys.exit(2)
+sd, nh, nc = r.get("score_delta"), r.get("new_hard_findings"), r.get("new_caps")
+# bool is a subclass of int — exclude it so a stray true/false never counts as a delta.
+if not isinstance(sd, (int, float)) or isinstance(sd, bool) or not isinstance(nh, list) or not isinstance(nc, list):
+    print("ratchet fields missing/wrong type"); sys.exit(2)
+reasons = []
+if sd < -tol:      reasons.append(f"score_delta {sd} < -{tol}")
+if len(nh) > 0:    reasons.append(f"{len(nh)} new hard finding(s)")
+if len(nc) > 0:    reasons.append(f"{len(nc)} new cap(s)")
+if reasons:
+    print("; ".join(reasons)); sys.exit(1)
+print(f"score_delta={sd} >= -{tol}, 0 new hard findings, 0 new caps"); sys.exit(0)
+PY
+}
 
 # npm_script <name> — true if package.json declares scripts.<name>.
 # node is guaranteed present when package.json exists (it's a Node project).
@@ -270,38 +312,58 @@ else
 fi
 
 # --- Jankurai (quality standard) ---
-# Audit is always advisory in the inner loop. Witness vs. baseline is hard-fail
-# only after a baseline has been accepted at agent/baselines/main.repo-score.json.
+# The audit is advisory; enforcement is a regression-ONLY ratchet parsed from the
+# audit receipt (igu.1, supersedes lbq.14). The old `jankurai witness` exit-code
+# gate baked in the absolute 85 floor and deadlocked every sub-85 app on its first
+# commit — so we stop calling witness for enforcement and read the receipt instead.
 if has_cmd jankurai; then
   mkdir -p "target/jankurai"
 
-  # Inner-loop advisory scan over changed files. Surfaces issues but does not
-  # fail the gate on its own — the witness step below is what enforces.
-  audit_cmd="jankurai audit . --changed-fast --changed-from origin/main \
---json target/jankurai/audit-fast.json \
+  # Comparison base: a resolvable LOCAL ref only (rule 8). Pre-commit HEAD is the
+  # pre-change state; never origin/main, which is absent in a never-pushed repo
+  # and makes the diff fail open.
+  base_ref="$(git rev-parse --verify --quiet HEAD || true)"
+  baseline="agent/baselines/main.repo-score.json"
+  policy="agent/audit-policy.toml"
+
+  # One audit run produces the advisory MD and the receipt the ratchet parses.
+  # Pass a real --baseline when one exists (rule 2 — without it the ratchet
+  # self-references and is an inert no-op). --policy is forwarded if present; the
+  # BLOCK decision still ignores its floor verdict (rule 9). Baseline acceptance +
+  # policy authoring are decompose's job (igu.2); this gate only consumes them.
+  audit_cmd="jankurai audit . --changed-fast"
+  [ -n "$base_ref" ] && audit_cmd="$audit_cmd --changed-from $base_ref"
+  audit_cmd="$audit_cmd --json target/jankurai/audit-fast.json \
 --md target/jankurai/audit-fast.md \
 --timings-json target/jankurai/audit-timings.json"
+  if [ -f "$baseline" ]; then
+    audit_cmd="$audit_cmd --baseline $baseline"
+    [ -f "$policy" ] && audit_cmd="$audit_cmd --policy $policy"
+  fi
   echo "=== jankurai audit (advisory) ==="
   echo "  \$ $audit_cmd"
+  # rule 4: --changed-fast always exits 0; this exit code is advisory only.
   if bash -c "$audit_cmd"; then
     echo "PASS: jankurai audit (advisory)"
   else
     echo "ADVISORY: jankurai audit reported findings (exit $?) — see target/jankurai/audit-fast.md"
   fi
 
-  # Witness ratchet: enforce if a baseline exists. /decompose populates this at
-  # scaffold time (lbq.14) so the ratchet is LIVE during the unattended build —
-  # a missing baseline now means a pre-lbq.14 app or a skipped decompose, not
-  # "waiting for a human to accept one".
-  baseline="agent/baselines/main.repo-score.json"
-  if [ -f "$baseline" ]; then
-    witness_cmd="jankurai witness . --changed-from origin/main \
---baseline $baseline \
---out target/jankurai/merge-witness.json \
---md target/jankurai/merge-witness.md"
-    run_step "jankurai witness" "$witness_cmd"
+  # Regression-only ratchet: enforce only when a baseline exists. A missing
+  # baseline is a quiet SKIP here (meta mode, or pre-baseline); igu.3 turns that
+  # into a loud FAIL for app-mode callers via GATE_REQUIRE_BASELINE.
+  echo "=== jankurai ratchet (regression-only) ==="
+  if [ ! -f "$baseline" ]; then
+    echo "SKIP: jankurai ratchet (no baseline at $baseline — meta mode or pre-baseline; ratchet not live)"
+  elif [ -z "$base_ref" ]; then
+    echo "SKIP: jankurai ratchet (no resolvable local HEAD to diff against — treated as can't-evaluate, not block)"
   else
-    echo "SKIP: jankurai witness (no baseline at $baseline — pre-lbq.14 app or decompose skipped; ratchet not live)"
+    reason="$(ratchet_eval target/jankurai/audit-fast.json 2)"; rc=$?
+    case "$rc" in
+      0) echo "PASS: jankurai ratchet ($reason)" ;;
+      1) echo "FAIL: jankurai ratchet — $reason"; failures+=("jankurai-ratchet") ;;
+      *) echo "SKIP: jankurai ratchet (receipt not evaluable — $reason; treated as crash, not block)" ;;
+    esac
   fi
 else
   echo "SKIP: jankurai (not installed — see docs for install)"
