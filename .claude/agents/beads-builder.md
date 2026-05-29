@@ -71,14 +71,12 @@ Pay attention to:
 
 Read `docs/ESCALATION_RULES.md` (in the worktree). Apply each hard-stop rule against the bead's title/description/acceptance:
 
-- Schema migration on populated table → blocked
-- Auth/authz model decision → blocked
 - New paid third-party API → blocked
-- Secrets handling → blocked
 - Public-facing copy/branding → blocked
 - Acceptance criteria you cannot self-verify → blocked
 - Same task previously failed gate twice (check `bd show $id --json | notes`) → blocked
 - Cumulative session cost over budget → blocked
+- A **new** auth/authz model, secrets, or migration decision → blocked, **unless plan.lock front-loaded it**: if `plan.lock.json` `concerns[]` has the relevant concern (authn/authz/secrets/data-lifecycle) `addressed` with evidence, the decision already exists — **implement the decided model and proceed.** A `touches-auth` label alone is not a block when the auth concern is decided (lbq.3). Block only when the concern is absent/`excluded`, or the bead needs a decision beyond what the plan decided.
 
 If any rule fires:
 

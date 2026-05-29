@@ -6,14 +6,23 @@ The loop's prime directive: **escalate over guess**. When in doubt, `bd update <
 
 | Trigger | Why |
 | --- | --- |
-| Schema migration on a table that already has data in a deployed environment | Destructive; reversal costs a backup restore. |
-| Authentication or authorization model choice (session vs. JWT, who can do what) | Wrong-direction work is hard to retrofit. |
+| Schema migration on a table that already has data in a deployed environment **— and the migration stance was not decided in plan.lock** | Destructive; reversal costs a backup restore. |
+| Making an authentication or authorization model choice **de novo** (session vs. JWT, who can do what) **that plan.lock did not already decide** | Wrong-direction work is hard to retrofit. |
 | Adding a paid third-party API (Stripe, Twilio, OpenAI, etc.) | Cost + credentials need human approval. |
-| Secrets handling (where keys live, how they're rotated) | Security incident risk. |
+| Deciding secrets handling **de novo** (where keys live, how they're rotated) **that plan.lock did not already decide** | Security incident risk. |
 | Public-facing copy or branding decisions | Subjective; better to ask than to redo. |
 | Any task whose acceptance criteria the builder cannot self-verify | If the gate can't tell you it's done, you don't know it's done. |
 | Same task fails the quality gate twice | Symptom of a wrong approach or missing context. |
 | Cumulative session API cost exceeds the budget in `plan.md` | Stop the burn. |
+
+### Front-loaded decisions are not escalations (auth / secrets / migration)
+
+These three escalate only when the decision is **unmade**. `/vision` front-loads them at human-present planning time into `plan.lock.json` `concerns[]`: the auth model under `authn`/`authz`, secrets handling under `secrets`, migration stance under `data-lifecycle` — each `addressed` with concrete, falsifiable evidence (the mechanism, the model, where secrets live, whether migrations are destructive). When a bead merely *touches* auth/secrets/migration and the relevant concern is **`addressed` in plan.lock**, the decision already exists — the builder **implements the decided model and proceeds; it does not block.** A `touches-auth` label by itself is therefore not a hard stop. Block only when:
+
+- the relevant concern is **absent or `excluded`** in plan.lock (no decision was front-loaded — pre-`/vision`-concerns app, or the lock omits it), **or**
+- the bead would require a **new** decision *beyond* what plan.lock decided (e.g. plan decided OIDC login but the bead must now pick an authz tenancy model the plan never addressed).
+
+The `needs-decision` label is unconditional — it is an explicit "a human must answer this" marker and always blocks.
 
 ## Soft stops — block if the formula or plan didn't pre-decide
 

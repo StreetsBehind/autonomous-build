@@ -210,7 +210,15 @@ Then `sleep 10 s` and continue.
 Dispatch-Bead(bead):
   # Escalation pre-check from the orchestrator's side (cheap rules only).
   # Anything that requires reading the file tree is the worker's job.
-  if 'needs-decision' in bead.labels or 'touches-auth' in bead.labels:
+  # needs-decision always escalates. touches-auth/secrets/migration escalate ONLY
+  # if plan.lock did not front-load the decision (lbq.3) — `decisions` is read
+  # once at pre-flight from plan.lock concerns[] (authn/authz/secrets/
+  # data-lifecycle addressed). A decided concern → the builder implements the
+  # decided model and the bead proceeds unattended.
+  if 'needs-decision' in bead.labels
+     or ('touches-auth' in bead.labels and not decisions.authDecided)
+     or ('touches-secrets' in bead.labels and not decisions.secretsDecided)
+     or ('touches-migration' in bead.labels and not decisions.migrationDecided):
     bd update bead.id --status=blocked --notes "label-based escalation: $bead.labels"
     blockedSet += bead.id
     return null

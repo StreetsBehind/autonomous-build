@@ -92,7 +92,8 @@ const preflightSchema = {
     status:        { enum: ['ok', 'done-no-work', 'blocked-only', 'failed'] },
     failedReason:  { type: 'string' },
     readyCount:    { type: 'number' },
-    blockedCount:  { type: 'number' }
+    blockedCount:  { type: 'number' },
+    decisions:     { type: 'object' }   // { authDecided, secretsDecided, migrationDecided } from plan.lock concerns
   }
 };
 
@@ -107,9 +108,14 @@ Run these checks IN ORDER and return JSON matching the schema:
    - \`bd blocked --json\`. If non-empty → return { "status": "blocked-only", "readyCount": 0, "blockedCount": N } — caller will invoke /escalate.
    - Else → return { "status": "done-no-work", "readyCount": 0, "blockedCount": 0 }.
 4. \`git status --porcelain\` on main must be empty. If dirty, return { "status": "failed", "failedReason": "main has uncommitted state — workers branch from main and would inherit it. Commit, stash, or revert first." }.
-5. If all pass: return { "status": "ok", "readyCount": <n>, "blockedCount": 0 }.
+5. Read \`plan.lock.json\` from cwd if present (it may be absent for a pre-/vision-concerns app). Compute front-loaded decision flags from its \`concerns[]\` array (lbq.3) — these let labeled beads clear unattended because the decision was made at /vision time:
+   - decisions.authDecided = a concerns[] entry with concernId "authn" OR "authz" has status == "addressed".
+   - decisions.secretsDecided = the "secrets" concern is "addressed".
+   - decisions.migrationDecided = the "data-lifecycle" concern is "addressed".
+   If plan.lock is absent or has no concerns[], all three are false.
+6. If all pass: return { "status": "ok", "readyCount": <n>, "blockedCount": 0, "decisions": { "authDecided": <bool>, "secretsDecided": <bool>, "migrationDecided": <bool> } }.
 
-Use Bash. Be thorough — failures stop the whole workflow (T1, T7).
+Use Bash, Read. Be thorough — failures stop the whole workflow (T1, T7).
 `, { label: 'preflight', phase: 'Pre-flight', schema: preflightSchema, agentType: 'general-purpose' });
 
 if (!preflight || preflight.status === 'failed') {
@@ -133,7 +139,13 @@ if (preflight.status === 'blocked-only') {
   return { refused: false, drained: false, postAction: 'escalate', blockedCount: preflight.blockedCount, merged: [], blocked: [], failed: [] };
 }
 
-log(`[BATCH START] workers=${parsedArgs.workers} max-merges=${parsedArgs.maxMerges || 'unbounded'} budget=${parsedArgs.budget != null ? '$' + parsedArgs.budget : 'unbounded'} ready=${preflight.readyCount}`);
+// Front-loaded auth/secrets/migration decisions from plan.lock (lbq.3). When a
+// decision was made at /vision time, a bead that merely *touches* that area is
+// NOT an escalation — the builder implements the decided model. Without this, a
+// login-bearing app blocks every touches-auth bead mid-run and pages an absent
+// human. needs-decision stays unconditional.
+const decisions = preflight.decisions || { authDecided: false, secretsDecided: false, migrationDecided: false };
+log(`[BATCH START] workers=${parsedArgs.workers} max-merges=${parsedArgs.maxMerges || 'unbounded'} budget=${parsedArgs.budget != null ? '$' + parsedArgs.budget : 'unbounded'} ready=${preflight.readyCount} decided={auth:${!!decisions.authDecided},secrets:${!!decisions.secretsDecided},migration:${!!decisions.migrationDecided}}`);
 
 // ---------------------------------------------------------------------------
 // Phase 2 — Dispatch + drain (wave-loop)
@@ -325,8 +337,17 @@ Use Bash + the bd CLI. Return at most ${parsedArgs.workers} candidates. If no be
   // ── Step 2: prep (claim + worktree create), serialized ──────────────────
   // Orchestrator-owned per the spec — workers do not claim or create their
   // worktree. One agent does all preps to keep bd writes serialized.
-  const labelEscalations = candidates.filter(c =>
-    (c.labels || []).includes('needs-decision') || (c.labels || []).includes('touches-auth'));
+  // needs-decision always escalates. touches-auth/secrets/migration escalate
+  // ONLY when plan.lock did not front-load that decision (lbq.3) — otherwise the
+  // builder implements the decided model and proceeds unattended.
+  const labelEscalations = candidates.filter(c => {
+    const labels = c.labels || [];
+    if (labels.includes('needs-decision')) return true;
+    if (labels.includes('touches-auth') && !decisions.authDecided) return true;
+    if (labels.includes('touches-secrets') && !decisions.secretsDecided) return true;
+    if (labels.includes('touches-migration') && !decisions.migrationDecided) return true;
+    return false;
+  });
 
   for (const c of labelEscalations) {
     log(`[ESCALATE-LABEL] ${c.id} — labels: ${(c.labels || []).join(', ')}`);

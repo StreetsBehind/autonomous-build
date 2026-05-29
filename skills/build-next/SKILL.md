@@ -110,13 +110,11 @@ The stale path is especially important when /retro has filed beads in batches �
 ### Step 4: escalation pre-check
 
 Before writing any code, check the issue against `docs/ESCALATION_RULES.md`:
-- Does this touch existing-data schema migrations? → block
 - Does this introduce a paid third-party API? → block
-- Does this make an auth/authz model decision? → block
-- Are secrets involved? → block
 - Cumulative session cost over budget? → block
+- Does this require a **new** auth/authz model, secrets, or migration decision? → block — **unless** that decision was front-loaded in `plan.lock.json` `concerns[]` (authn/authz/secrets/data-lifecycle `addressed` with evidence). If the relevant concern is `addressed`, the decision already exists: **implement the decided model and proceed, do not block.** Only block when the concern is absent/`excluded`, or the bead needs a decision *beyond* what the plan decided. A bare `touches-auth` label is not a block when the auth concern is decided (lbq.3).
 
-If any → `bd update $id --status=blocked --notes "<rule>"` and exit (loop will detect and call `/escalate`).
+If a genuine escalation fires → `bd update $id --status=blocked --notes "<rule>"` and exit (loop will detect and call `/escalate`).
 
 ### Step 5: worktree
 

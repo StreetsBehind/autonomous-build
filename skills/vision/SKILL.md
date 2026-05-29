@@ -80,6 +80,8 @@ Turn a `vision.md` into a `plan.md` the rest of the pipeline can consume.
 
    Write `concerns[]` into `plan.lock.json` (one entry per concern: `{concernId, status, evidence}` when addressed, `{concernId, status, reason}` when excluded). Add a `## Concerns` table to `plan.md` (see structure below). (The decidedness + required-excluded contradiction *gate* is step 8.6.)
 
+   **These decisions are front-loaded so the build loop never blocks on them (lbq.3).** The `authn`/`authz`/`secrets`/`data-lifecycle` evidence must be concrete enough that a builder can *implement the decided model without a follow-up decision* — the auth mechanism + model, where each secret lives, whether migrations are destructive. At build time, a bead labeled `touches-auth`/`touches-secrets`/`touches-migration` clears unattended precisely because the matching concern is `addressed` here; an `excluded` or vague entry sends that bead to escalation and pages an absent human. So decide these at human-present `/vision` time, concretely — do not defer them to "the builder will figure it out."
+
 8.6. **Concern decidedness gate (the teeth).** This turns the concerns table from documentation into enforcement — the concern analog of step 6.6. Two assertions, both routing through the same `openQuestions` → `incomplete: true` plumbing the must-have gate uses (so `/decompose` Phase 1 refuses with the reason; `decompose.spec.md` step 4 — no new downstream code):
 
    - **Decidedness.** Every concern whose derived applicability is `required` or `optional` (i.e. *applicable*) must have a decided `status` in `concerns[]`. An applicable concern left undecided (absent, or present with neither valid `evidence` nor `reason`) appends a blocking `openQuestions[]` entry:
