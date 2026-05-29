@@ -38,7 +38,7 @@ Ten concerns. The `concernId` strings are canonical and stable — `plan.lock.js
 | `observability` | Logging/metrics/tracing so failures are diagnosable | A feature/formula that emits them (e.g. "`otel-bootstrap-rust` emits traces+metrics") **or** `excluded` with reason. |
 | `external-integrations` | Third-party services/APIs the app depends on | Each integration named with its shape (auth, data flow, failure mode) **or** "none." A silent integration is a hidden dependency + a secrets/abuse surface. |
 | `perf-envelope` | The scale/latency target the design must hold | A concrete envelope **if** the success metric implies one (e.g. "p99 < 200ms on the streak endpoint at 100 concurrent users") **or** `excluded` ("v1 single-user, no perf target") — not a vibe. |
-| `abuse-surface` | Rate-limiting, input validation/bounds, abuse vectors | For each public surface: input-validation + rate-limit stance **or** `excluded` ("no public/unauthenticated network surface"). |
+| `abuse-surface` | Rate-limiting, input validation/bounds, abuse vectors | For each public surface: an input-validation + rate-limit stance. By default this is the **pinned abuse-surface posture** (DEFAULT_STACK §"Pinned abuse-surface posture": per-tenant `tower-governor` token-bucket + WAFv2 rate-based rule + body-size/`validator` bounds, realized by `concern-enforcement-abuse-surface`) — an auth'd/public app cites that DEFAULT_STACK pin + formula as evidence and is `addressed`, not blocked. `excluded` only when there is no public/unauthenticated network surface. |
 
 ---
 
