@@ -9,18 +9,9 @@ The feedback loop's analysis stage, implemented as a **dynamic workflow** (see h
 
 ## How this spec runs
 
-This file is a **workflow spec**, not a skill. The canonical generated script lives at `workflows/retro.js` in this repo and is hardlinked to `~/.claude/workflows/retro.js` by `install.ps1` so the runtime finds it user-globally from any app repo.
+This file is a **workflow spec**, not a skill. The canonical script lives at `workflows/retro.js` in this repo (hand-authored from this spec per bead `autonomous-build-lbq.21`) and is linked to `~/.claude/workflows/retro.js` by the installers (`install.sh` symlink / `install.ps1` hardlink) so the runtime finds it user-globally from any app repo.
 
-**First invocation (when `workflows/retro.js` does not exist yet):**
-
-1. Read this entire file.
-2. Run a dynamic workflow whose script implements the phases below. The word "workflow" in this instruction triggers the runtime's workflow-write path; the runtime generates the JS and executes it.
-3. When the run completes and the output matches this spec, save the generated script via `/workflows` → arrow-select the run → press `s` → **personal** location → save as `retro.js`. Then `cp ~/.claude/workflows/retro.js <autonomous-build>/workflows/retro.js` so the canonical copy is repo-tracked.
-4. Commit `workflows/retro.js` and re-run `install.ps1` (it will replace the personal-save copy with a hardlink to the repo version, keeping them in sync going forward).
-
-From then on, `/retro` invokes the saved workflow directly and this spec is read only when regenerating.
-
-**Regeneration:** when this spec changes meaningfully, delete `workflows/retro.js` (and `~/.claude/workflows/retro.js`), re-invoke `/retro` to regenerate, then re-save and re-install.
+`retro.js` **already exists** and is the source of truth the runtime executes. Keep it in sync with this spec **in the same commit**, the same convention `decompose.js`/`build-batch.js` follow — when this spec changes meaningfully, edit `workflows/retro.js` to match (do not rely on first-run regeneration; the script is hand-maintained). `/retro` invokes the saved workflow directly.
 
 **Why a workflow instead of a single-context skill:** independent data-source agents prevent cross-contamination, the adversarial cross-check pattern (two agents must agree before a workflow-improvement bead is filed) gives evidence-grounded findings, intermediate per-source JSON stays in script variables instead of bloating Claude's context, and the run is resumable in-session if a phase hits a transient failure.
 
@@ -225,7 +216,11 @@ When the workflow finishes:
 
 ---
 
-## Save-as-workflow checklist (one-time, after the first successful run)
+## Keeping `retro.js` in sync
+
+`retro.js` is already authored and hand-maintained. When this spec changes, edit `workflows/retro.js` in the same commit to match, then `./install.sh` (or `install.ps1`) keeps `~/.claude/workflows/retro.js` linked to it. The historical "generate via /workflows then save" path below is retained only for reference — the script is now repo-tracked and edited directly.
+
+### (Historical) save-as-workflow checklist — first-generation path
 
 1. `/workflows`
 2. Arrow-select this run
