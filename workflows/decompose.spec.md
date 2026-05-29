@@ -121,7 +121,9 @@ Three sources of non-feature work otherwise evaporate into advisory `tenets.md` 
 
 For each (skipping any already delivered by a product feature or an addressed concern — no double-pour), select an **enforcement formula** matching the concern class / NFR category / floor item and pour a dedicated bead whose **AC comes from the target** and **testPlan from `verify`**, reparented under the app epic. **T6/T1:** never hand-create via `bd create` and never remap to a near-miss formula — if no installed formula fits, record it under `missingFormula` / `nfrMissingFormula` / `floorMissingFormula` with a `recommendedFormula` description. `excluded` concerns are skipped.
 
-**Gate:** any `missingFormula` / `nfrMissingFormula` / `floorMissingFormula` (or enforcement-pour error) means a required target or production-floor capability will never be tested — this forces **NEEDS-FIX** (`concernEnforcementClean` in the verdict), surfaced in the report's "Concern + NFR + production-floor enforcement" section. Skipped entirely when `planSource != lock`.
+4. **The success-metric e2e acceptance bead** (`lbq.17`) — the lock's `successMetric.steps[]` is the user's one definition of done, the cross-feature journey. Pour exactly ONE end-to-end acceptance bead from an e2e/integration formula, binding the ordered steps as the journey the test walks (each step → an assertion). Empty steps ⇒ none. No fitting formula ⇒ `successMetricMissingFormula` (NEEDS-FIX) — "done" must be an executable test, not a coverage mapping.
+
+**Gate:** any `missingFormula` / `nfrMissingFormula` / `floorMissingFormula` / `successMetricMissingFormula` (or enforcement-pour error) means a required target, production-floor capability, or the success-metric definition-of-done will never be tested — this forces **NEEDS-FIX** (`concernEnforcementClean` in the verdict), surfaced in the report's enforcement section. Skipped entirely when `planSource != lock`.
 
 ---
 

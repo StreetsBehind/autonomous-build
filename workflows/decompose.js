@@ -332,7 +332,9 @@ if (Context.planSource === 'lock') {
       nfrMissingFormula:       { type: 'array', items: { type: 'object' } },
       floorApplies:            { type: 'object' },                        // { declaresAuth, declaresData }
       floorPoured:             { type: 'array', items: { type: 'object' } },
-      floorMissingFormula:     { type: 'array', items: { type: 'object' } }
+      floorMissingFormula:     { type: 'array', items: { type: 'object' } },
+      successMetricBead:       { type: ['object', 'null'] },              // { formula, pourRoot } | null
+      successMetricMissingFormula: { type: ['object', 'null'] }           // { steps, recommendedFormula } | null
     }
   };
   const ce = await agent(`
@@ -372,6 +374,9 @@ FINALLY, the MANDATORY PRODUCTION FLOOR (lbq.8 — production-readiness is not o
    For EACH applicable floor item: if it is ALREADY realized — an \`addressed\` concern poured above, or a product feature whose bead covers it — record nothing (no double-pour). Otherwise pour its enforcement formula (same formula-selection + var-validation rules as above): record under "floorPoured" ({floorItem, formula, pourRoot, acSummary}). If NO installed formula fits → record under "floorMissingFormula" ({floorItem, recommendedFormula}) — DO NOT hand-create (T6). A missing floor formula is a mandatory-floor gap (NEEDS-FIX), not a silent pass.
    If neither declaresData nor declaresAuth (a genuinely stateless, no-auth tool), the floor is empty — record floorApplies and move on.
 
+FINALLY, the SUCCESS-METRIC E2E ACCEPTANCE BEAD (lbq.17). The lock's \`successMetric.steps[]\` is the user's ONE definition of done — the cross-feature journey. Today it has no bead and is never verified as a path. Pour exactly ONE end-to-end acceptance bead:
+10. If \`successMetric.steps[]\` is non-empty: select an e2e/integration-test formula (the one whose purpose is a cross-feature end-to-end journey test). Bind the ordered \`steps[]\` as the journey the test walks — each step becomes an assertion in the test's acceptance/testPlan. Reparent the pour root under ${ParsedPlan.appEpicId} and cite "success metric" in its description. Record under "successMetricBead" ({formula, pourRoot, stepCount}). If NO e2e formula fits → record "successMetricMissingFormula" ({steps, recommendedFormula: "<one-line description, e.g. e2e-acceptance: walks the success-metric journey end-to-end asserting each step>"}) — DO NOT hand-create (T6). If \`successMetric.steps[]\` is empty, set successMetricBead = null (nothing to verify).
+
 Return JSON:
 {
   "poured": [{ "concernId": "...", "formula": "...", "pourRoot": "...", "acSummary": "..." }, ...],
@@ -382,7 +387,9 @@ Return JSON:
   "nfrMissingFormula": [{ "nfrId": "...", "category": "...", "statement": "...", "target": "...", "recommendedFormula": "..." }, ...],
   "floorApplies": { "declaresAuth": <bool>, "declaresData": <bool> },
   "floorPoured": [{ "floorItem": "...", "formula": "...", "pourRoot": "...", "acSummary": "..." }, ...],
-  "floorMissingFormula": [{ "floorItem": "...", "recommendedFormula": "..." }, ...]
+  "floorMissingFormula": [{ "floorItem": "...", "recommendedFormula": "..." }, ...],
+  "successMetricBead": { "formula": "...", "pourRoot": "...", "stepCount": <n> } | null,
+  "successMetricMissingFormula": { "steps": [...], "recommendedFormula": "..." } | null
 }
 `, { label: 'concern-enforcement', phase: 'Concern enforcement', schema: ceSchema, agentType: 'general-purpose' });
   concernEnforcement = ce || concernEnforcement;
@@ -391,7 +398,10 @@ Return JSON:
   concernEnforcement.nfrMissingFormula = concernEnforcement.nfrMissingFormula || [];
   concernEnforcement.floorPoured = concernEnforcement.floorPoured || [];
   concernEnforcement.floorMissingFormula = concernEnforcement.floorMissingFormula || [];
+  concernEnforcement.successMetricBead = concernEnforcement.successMetricBead || null;
+  concernEnforcement.successMetricMissingFormula = concernEnforcement.successMetricMissingFormula || null;
   log(`Concern+NFR+floor enforcement: ${concernEnforcement.poured.length} concern-poured, ${concernEnforcement.nfrPoured.length} nfr-poured, ${concernEnforcement.floorPoured.length} floor-poured, ${concernEnforcement.missingFormula.length + concernEnforcement.nfrMissingFormula.length + concernEnforcement.floorMissingFormula.length} missing-formula, ${concernEnforcement.skippedCoveredByFeature.length} covered-by-feature, ${concernEnforcement.errors.length} errors`);
+  log(`Success-metric e2e bead: ${concernEnforcement.successMetricBead ? concernEnforcement.successMetricBead.pourRoot : (concernEnforcement.successMetricMissingFormula ? 'MISSING FORMULA (NEEDS-FIX)' : 'none (no steps)')}`);
   if (concernEnforcement.floorApplies) log(`Production floor: declaresAuth=${concernEnforcement.floorApplies.declaresAuth}, declaresData=${concernEnforcement.floorApplies.declaresData}`);
 }
 
@@ -871,6 +881,7 @@ const concernEnforcementClean =
   (concernEnforcement.missingFormula || []).length === 0 &&
   (concernEnforcement.nfrMissingFormula || []).length === 0 &&
   (concernEnforcement.floorMissingFormula || []).length === 0 &&
+  !concernEnforcement.successMetricMissingFormula &&   // the definition of done must be an executable test (lbq.17)
   (concernEnforcement.errors || []).length === 0;
 const blessed =
   pourFailed.length === 0 &&
@@ -990,7 +1001,8 @@ Steps:
 - NFR enforcement beads poured: <concernEnforcement.nfrPoured: nfrId (category) → formula → pourRoot>
 - Production-floor beads poured: <concernEnforcement.floorPoured: floorItem → formula → pourRoot>
 - Covered by an existing feature/concern (no separate bead): <skippedCoveredByFeature>
-- **MISSING FORMULA (forces NEEDS-FIX):** <missingFormula + nfrMissingFormula + floorMissingFormula — each names the concern/NFR/floor item with no enforcement formula and the recommendedFormula that should exist. An unenforced NFR or a missing production-floor capability (observability/audit/authz/IaC) is work that will never be tested or gated.>
+- Success-metric e2e acceptance bead: <successMetricBead: formula → pourRoot (the §8 definition-of-done journey, now an executable test), or "none (no steps)">
+- **MISSING FORMULA (forces NEEDS-FIX):** <missingFormula + nfrMissingFormula + floorMissingFormula + successMetricMissingFormula — each names the concern/NFR/floor item/success-metric with no enforcement formula and the recommendedFormula that should exist. An unenforced NFR, a missing production-floor capability, or a success metric with no executable test is work whose "done" is undefined.>
 - Errors: <errors>
 
 ## Dep audit (Phase 7)
