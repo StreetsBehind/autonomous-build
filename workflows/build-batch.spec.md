@@ -106,7 +106,7 @@ mergeQueue      = []      # FIFO of beadIds whose workers emitted BUILD_COMPLETE
 mergeInFlight   = null    # { beadId, startTime } | null — only one merge at a time
 mergedSet       = []      # beadIds successfully merged + closed
 blockedSet      = []      # beadIds the worker filed as blocked
-failedSet       = []      # beadIds that failed unexpectedly (left in_progress)
+failedSet       = []      # beadIds that failed unexpectedly (marked blocked-for-inspection so they notify)
 ```
 
 `freeSlots = workers - len(activePipelines)` is the only number that decides whether to dispatch more work.
@@ -296,8 +296,11 @@ Process-WorkerCompletion(beadId, marker):
     "failed":
       print "[WORKER] $beadId failed: $marker.notes"
       failedSet += beadId
-      # Leave bead in_progress for human inspection. Do NOT remove the worktree —
-      # the human needs to see the worktree state to diagnose.
+      # Failed is the most severe outcome — it must NOT be silent. Mark the bead
+      # blocked with a diagnostic note so it surfaces in `bd blocked` and the
+      # Phase-3 /escalate notification reaches the human. Do NOT remove the
+      # worktree — the human needs that state to diagnose.
+      bd update beadId --status=blocked --notes "worker failed unexpectedly: $marker.notes — worktree left at $pipeline.worktreePath for inspection"
       print "  Worktree left at $pipeline.worktreePath for inspection."
 ```
 
@@ -391,8 +394,8 @@ After the poll loop exits.
    ```
 
 2. Conditional post-actions:
-   - If `len(blockedSet) > 0` → invoke `/escalate` (it builds the push notification from `bd blocked`).
-   - If `len(failedSet) > 0` → print the worktree paths for the human to inspect; do NOT auto-escalate (these need eyes, not a notification).
+   - **Failed beads are marked `blocked`** (with a `"worker failed unexpectedly … worktree left at <path>"` note) at the moment they fail — failed is the *most severe* outcome and must never be the silent one. Marking them blocked routes them through the same notification path and preserves the worktree for inspection.
+   - If `len(blockedSet) > 0` OR `len(failedSet) > 0` → invoke `/escalate` (it builds the push notification from `bd blocked`, which now includes the failed beads). Also print worktree paths so the human can find failed-bead worktrees.
    - If `len(blockedSet) == 0` and `len(failedSet) == 0` and `bd ready` is now empty → invoke `/retro` (matches /build-next's DONE path).
 
 **Output:** `BatchSummary = { merged: [...], blocked: [...], failed: [...], durationSec, postActions: [...] }`

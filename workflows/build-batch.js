@@ -475,8 +475,15 @@ The beads-builder for ${p.beadId} returned no structured output. Read \`${p.work
     }
 
     if (marker.status === 'failed') {
+      // Failed = unexpected error, the most severe outcome — must NOT be silent.
+      // Mark the bead blocked with a diagnostic note so it surfaces in `bd
+      // blocked` and the Phase-3 /escalate notification reaches the human.
+      // Leave the worktree intact (spec: failed worktrees need eyes to debug).
       log(`[WORKER] ${p.beadId} failed: ${marker.notes || '(no notes)'}`);
       log(`  Worktree left at ${p.worktreePath} for human inspection.`);
+      const note = `worker failed unexpectedly: ${marker.notes || '(no notes)'} — worktree left at ${p.worktreePath} for inspection`;
+      await agent(`Run: bd update ${p.beadId} --status=blocked --notes ${JSON.stringify(note)}. Return { "ok": true } or { "ok": false, "reason": "..." }.`,
+        { label: `failed-block-${p.beadId}`, phase: 'Dispatch + drain', agentType: 'general-purpose' });
       failedSet.push(p.beadId);
       continue;
     }
@@ -560,7 +567,8 @@ log(`  Blocked:  ${blockedSet.length} beads → ${blockedSet.join(', ') || '(non
 log(`  Failed:   ${failedSet.length} beads → ${failedSet.join(', ') || '(none)'}`);
 log(`  Duration: ${durationStr}`);
 
-// Post-action decision: /escalate if blockedSet non-empty; /retro if clean drain.
+// Post-action decision: /escalate if blockedSet OR failedSet non-empty (failed
+// beads were marked blocked above so they notify too); /retro if clean drain.
 let postAction = 'none';
 const summaryActions = await agent(`
 You are the summary agent for /build-batch Phase 3. Spec: workflows/build-batch.spec.md §"Phase 3 — Summary + post-actions".
@@ -570,16 +578,16 @@ Inputs:
   blocked: ${JSON.stringify(blockedSet)}
   failed:  ${JSON.stringify(failedSet)}
 
+Note: failed beads have already been marked \`blocked\` (with a "worker failed unexpectedly … worktree left at <path>" note) by the orchestrator, so they appear in \`bd blocked\` and their worktrees are preserved. Failed is the most severe outcome and must NOT be silent — it escalates like any other block.
+
 Decide and execute the post-action:
-1. If blocked.length > 0:
-   - Invoke /escalate by writing a one-line marker the runtime can pick up, OR by running the escalate skill's underlying behavior directly (read bd blocked, format push notification body). For v1, just record postAction="escalate"; do NOT attempt to spawn /escalate as a slash command from within the workflow — the orchestrator turn handles that.
-2. Else if failed.length > 0:
-   - Print worktree paths via Bash (\`git worktree list\`) so the human can inspect. Record postAction="inspect-failed".
-3. Else:
+1. If blocked.length > 0 OR failed.length > 0:
+   - These need a human (blocked = decision; failed = unexpected error to debug). Both are now in \`bd blocked\`. Also print worktree paths via Bash (\`git worktree list\`) so the human can find any failed-bead worktrees. Record postAction="escalate"; do NOT spawn /escalate as a slash command from within the workflow — the orchestrator turn handles the push notification from \`bd blocked\`.
+2. Else:
    - Run \`bd ready --json\` and filter epics. If the remaining list is empty AND merged.length > 0 (we actually did work and nothing else is ready), record postAction="retro-suggested".
    - Otherwise record postAction="none".
 
-Return JSON: { "postAction": "escalate" | "inspect-failed" | "retro-suggested" | "none", "rationale": "<one sentence>" }
+Return JSON: { "postAction": "escalate" | "retro-suggested" | "none", "rationale": "<one sentence>" }
 `, { label: 'summary', phase: 'Summary', agentType: 'general-purpose' });
 
 if (summaryActions?.postAction) {
