@@ -411,9 +411,11 @@ When the workflow finishes:
 
 ## Stage timeout
 
-Default `stageTimeout = 30 minutes` per worker. If a worker hasn't emitted BUILD_COMPLETE in 30 min, `TaskStop` it, mark the bead blocked with `"worker timeout"`, and continue. A worker that hangs without output is almost always wedged on a tool prompt or an interactive command.
+Default `STAGE_TIMEOUT_MIN = 30` per worker. If a worker hasn't emitted BUILD_COMPLETE in 30 min, the bead is marked blocked with `"worker timeout after 30 min"` and the batch continues. A worker that hangs without output is almost always wedged on a tool prompt or an interactive command.
 
 This is a per-worker timeout, not a batch-wide one. The batch's only wall-time bound is whatever `--max-merges` and `--budget` impose.
+
+**Implementation note (build-batch.js):** the script dispatches workers with `agent()`/`parallel()`, which gives no taskId to `TaskStop`. Instead each worker thunk races its `agent()` promise against a `setTimeout`-backed timer; if the timer wins, the thunk resolves to a synthetic `{ status: "timeout" }` marker so `parallel()` always returns. The orchestrator then sets the bead blocked (the abandoned worker never set bd state) and **leaves the worktree** (the worker may still hold it; the human needs that state to debug). The underlying agent may keep running in the runtime — it is abandoned, not killed — but it can no longer stall the batch. If the runtime exposes no `setTimeout`, the wrapper degrades to the prior no-timeout behavior rather than crashing.
 
 ---
 

@@ -172,6 +172,11 @@ const USD_PER_1M_OUTPUT_TOKENS = 15;    // approximate output-token price
 const USD_PER_WORKER_ESTIMATE  = 0.75;  // rough per-bead build cost (fallback)
 let workersDispatched = 0;
 
+// Per-worker stage timeout (spec default 30 min). A worker that hangs without
+// emitting BUILD_COMPLETE (wedged on a tool prompt or interactive command) would
+// otherwise make parallel() never resolve and stall the whole batch forever.
+const STAGE_TIMEOUT_MIN = 30;
+
 function estimatedSpendUSD() {
   if (typeof budget !== 'undefined' && budget && typeof budget.spent === 'function') {
     return (budget.spent() / 1_000_000) * USD_PER_1M_OUTPUT_TOKENS;
@@ -380,7 +385,13 @@ Run these serialized (one bead at a time) — concurrent bd writes can race on t
   // runtimes where structured output is lossy; we read the file IF the
   // structured return is missing.
   workersDispatched += prepped.length;  // for the fallback cost estimate
-  const buildTasks = prepped.map(p => () => agent(`
+  // Each worker thunk races the agent dispatch against a stage timeout. We can't
+  // TaskStop an agent() dispatch, but racing lets the orchestrator stop waiting
+  // on a wedged worker and block its bead instead of stalling the batch.
+  const buildTasks = prepped.map(p => () => {
+    let timer;
+    let work = Promise.resolve()
+      .then(() => agent(`
 beadId: ${p.beadId}
 worktree: ${p.worktreePath}
 
@@ -405,6 +416,20 @@ Return JSON exactly matching the marker schema:
   "notes":     "<one-line summary or failure reason>"
 }
 `, { label: `build-${p.beadId}`, phase: 'Dispatch + drain', schema: buildResultSchema, agentType: 'beads-builder' }));
+    // If the runtime has no timers, degrade to the prior no-timeout behavior
+    // rather than crashing on a missing global (strictly no worse than before).
+    if (typeof setTimeout !== 'function') return work;
+    work = work.then(r => { clearTimeout(timer); return r; },
+                     e => { clearTimeout(timer); throw e; });
+    work.catch(() => {});  // swallow a late rejection if work loses the race
+    const timeout = new Promise(resolve => {
+      timer = setTimeout(() => {
+        log(`[TIMEOUT] ${p.beadId} exceeded ${STAGE_TIMEOUT_MIN}min without BUILD_COMPLETE — abandoning worker, blocking bead`);
+        resolve({ status: 'timeout', beadId: p.beadId, notes: `worker timeout after ${STAGE_TIMEOUT_MIN} min` });
+      }, STAGE_TIMEOUT_MIN * 60 * 1000);
+    });
+    return Promise.race([work, timeout]);
+  });
 
   const buildResults = await parallel(buildTasks);
 
@@ -426,6 +451,18 @@ The beads-builder for ${p.beadId} returned no structured output. Read \`${p.work
     if (!marker || !marker.status) {
       log(`[WORKER] ${p.beadId} returned no marker — treating as failed`);
       failedSet.push(p.beadId);
+      continue;
+    }
+
+    if (marker.status === 'timeout') {
+      // Synthetic marker from the stage-timeout race — the abandoned worker
+      // never set bd state, so the orchestrator must mark the bead blocked.
+      // Leave the worktree: the worker may still be holding it; the human needs
+      // that state to see where it wedged.
+      log(`[WORKER] ${p.beadId} timed out — blocking bead; worktree left at ${p.worktreePath} for inspection`);
+      await agent(`Run: bd update ${p.beadId} --status=blocked --notes "${marker.notes}". Return { "ok": true } or { "ok": false, "reason": "..." }.`,
+        { label: `timeout-block-${p.beadId}`, phase: 'Dispatch + drain', agentType: 'general-purpose' });
+      blockedSet.push(p.beadId);
       continue;
     }
 
