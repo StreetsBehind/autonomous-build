@@ -51,11 +51,15 @@ plan.md + plan.lock.json  ──/decompose──▶  blessed beads DAG (epics + 
 ## Getting started
 
 1. Clone this repo.
-2. From the repo root, run `./install.ps1`. This walks `skills/` and creates a directory junction for each subdir in `~/.claude/skills/`, walks `formulas/` and creates a same-volume NTFS hard link for each file in `~/.beads/formulas/`, and walks `workflows/*.js` and hard-links each script into `~/.claude/workflows/` so the dynamic-workflow runtime finds them user-globally. It also cleans up any stale skill junctions whose source no longer exists in this repo (e.g. skills that have graduated to workflows). Idempotent — safe to re-run after `git pull` to pick up new skills, formulas, or workflows. Re-run with `-Force` to overwrite existing real directories or out-of-date files; re-run with `-DryRun` to plan without changing anything.
+2. From the repo root, run the installer for your platform:
+   - **Windows:** `./install.ps1` — creates a directory junction for each `skills/` subdir in `~/.claude/skills/`, a same-volume NTFS hard link for each `formulas/` file in `~/.beads/formulas/`, and a hard link for each `workflows/*.js` script in `~/.claude/workflows/`.
+   - **Linux / macOS:** `./install.sh` — the same wiring via symlinks (which need no admin off Windows). Flags mirror the PowerShell version: `--dry-run` to plan without changing anything, `--force` to overwrite mismatched links / real files / dirs.
+
+   Either installer makes the skills, formulas, and dynamic workflows resolvable user-globally so the runtime finds them from any app repo. Both also clean up stale skill links whose source no longer exists in this repo (e.g. skills that have graduated to workflows). Idempotent — safe to re-run after `git pull` to pick up new skills, formulas, or workflows.
 3. Install [Jankurai](https://github.com/neverhuman/jankurai) (`cargo install --path crates/jankurai --locked` from a checkout, or the release installer).
 4. In any new app repo: `bd init && bd setup claude --project`, then invoke `/vision`.
 
-See `docs/INSTALL.md` for the long-form notes, including why the installer uses junctions+hardlinks instead of symbolic links (no admin / Developer Mode requirement).
+See `docs/INSTALL.md` for the long-form notes, including why the Windows installer uses junctions+hardlinks instead of symbolic links (no admin / Developer Mode requirement) while `install.sh` uses plain symlinks.
 
 ## Quality standard
 
