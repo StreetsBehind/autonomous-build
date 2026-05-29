@@ -25,7 +25,7 @@ Outputs: a paired `plan.md` (human narrative) and `plan.lock.json` (schemaVersio
 
 The workflow runs four gates (forward-coverage, reverse-trace, decidedness, must-have↔non-goal) plus a required+excluded contradiction scan; any blocking question flips `incomplete: true`. The lock is built and validated against [`schemas/plan.lock.schema.json`](../schemas/plan.lock.schema.json) in pure JS before being written; field reference is in [`docs/PLAN_LOCK.md`](PLAN_LOCK.md). The lock is the source of truth `/decompose` consumes — `plan.md` exists for human review and as a fallback for repos that pre-date the lock; an `incomplete: true` lock is refused at `/decompose` pre-flight.
 
-This stage runs *with the user in the loop* (the shell holds the conversation; the workflow is headless). The plan is a contract — the loop won't second-guess it later.
+This stage runs *with the user in the loop* (the shell holds the conversation; the workflow is headless). The plan is a contract — the loop won't second-guess it later. For a large plan it may also propose a **phase split**, retaining deferred must-haves as `phase: 2+` entries (rather than dropping them) and presenting the proposed phases at the gate for the human to approve or edit (see *Phased builds* below).
 
 ### `/decompose` — plan.lock.json → blessed beads DAG
 
@@ -38,6 +38,8 @@ Reads `plan.lock.json` (falling back to `plan.md` regex parse with a deprecation
 - **Adversarial fidelity cross-check:** two independent agents must agree the DAG covers the source plan before it's blessed.
 
 Output: a populated beads DB with epics, tasks, and a working dep graph, plus a `decomposeReport.md` and a mechanical **`BLESSED` | `NEEDS-FIX`** verdict. The human reviews and authorizes the blessed DAG before any build stage runs. `bd ready` should then return the first true leaf tasks.
+
+When the plan is phased, `/decompose --phase N` is **re-entrant**: it bootstraps (`bd init`, Jankurai scaffold, baseline acceptance) only at phase 1, pours just the current phase's slice under a phase epic just-in-time, and scopes its fidelity/coverage checks to that slice — a must-have assigned to a *future* phase is a legitimate *covered-in-phase-N* deferral, not a coverage gap (see *Phased builds* below).
 
 ### `/build-batch` — parallel build (the concurrent sibling of `/build-next`)
 
@@ -89,6 +91,25 @@ Implemented as a **dynamic workflow** (`workflows/retro.spec.md` + `workflows/re
 Outputs:
 1. A markdown report at `retros/retro-<app>-<date>.md`, including a "Uncertain (human triage)" section for proposed improvements whose evidence or fix didn't survive cross-check
 2. Concrete improvement issues filed into autonomous-build's own beads DB under a per-retro epic, with `workflow-improvement`, `from-app:<name>`, and `retro-date:<date>` labels; acceptance criteria the loop can later self-verify (e.g. "edit `skills/vision/SKILL.md` to add SQLite bias for simple-v1 apps; verify by grep"). Idempotent — re-running the same retro will not duplicate previously-filed beads.
+
+### Phased builds — vision identifies the boundaries, the loop runs per-phase
+
+The stages above describe a single build pass, which is the **default**: a plan with one phase runs exactly as written (one `/decompose`, one build, one `/retro`). For a plan too big to review as one build — or one where a subset of must-haves isn't needed for the core end-to-end flow — `/vision` proposes a **phase split** (epic `autonomous-build-0ms`): phase 1 is the *walking skeleton* (the smallest feature set that makes the `successMetric` flow run end-to-end), and each later phase is one coherent layer. The human approves or edits the split at the vision gate. Phasing is additive and opt-in: a single-phase lock is byte-identical to the pre-phases shape.
+
+When a plan has multiple phases, the stages compose into a loop driven by `/orchestrate`:
+
+```
+/vision  → whole-project plan + phase boundaries   (human reviews the split)
+   │
+   ▼
+for each phase i = 1, 2, 3, … until phases exhausted:
+   /decompose --phase i   → beads for THIS phase only (just-in-time)
+   /build-batch           → drain phase i
+   /retro --phase i       → what did we learn
+   /replan i+1            → revise the next phase from the outcomes
+```
+
+The boundary is **not** a graph edge. Phases are isolated by **just-in-time decomposition** — while phase 1 builds, phase 2's beads do not exist yet, so there is nothing in `bd ready` to pick up early. This keeps beads the only state (principle #1) and the loop dumb (principle #3): no phase gate is encoded in the DAG. `/replan` is a scoped re-run of `/vision` (`/vision --replan-from N`) that freezes the already-built phases and re-derives the downstream provisional ones, feeding the prior phase's build outcomes + `/retro` report back in as added context; it may add, drop, reorder, or merge later phases. Cross-phase dependencies point backward only (phase `N+1` may depend on `N`, never the reverse — a forward dep would reference a bead that doesn't exist yet). Design of record: [`PHASED_BUILD_PROPOSAL.md`](PHASED_BUILD_PROPOSAL.md).
 
 ## The meta-loop
 

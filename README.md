@@ -4,7 +4,7 @@ Workflow infrastructure for going from a `vision.md` file to a shipped app, with
 
 ## The pipeline
 
-**Walk-away entry point:** `/orchestrate [--auto-bless]` drives the whole pipeline end-to-end from a filled `vision.md` — sequencing `/vision → /decompose → /build-batch → /escalate|/retro`, clearing the seams it can (with `--auto-bless`, a high-confidence BLESSED chains straight into the build) and stopping only at genuine human gates (incomplete vision, NEEDS-FIX plan). Invoke the stages individually for hands-on control, or `/orchestrate` to hand off and walk away.
+**Walk-away entry point:** `/orchestrate [--auto-bless]` drives the whole pipeline end-to-end from a filled `vision.md` — sequencing `/vision → /decompose → /build-batch → /escalate|/retro`, clearing the seams it can (with `--auto-bless`, a high-confidence BLESSED chains straight into the build) and stopping only at genuine human gates (incomplete vision, NEEDS-FIX plan). Invoke the stages individually for hands-on control, or `/orchestrate` to hand off and walk away. For a multi-phase plan, `/orchestrate` runs this sequence as a **per-phase loop** (see *Phased builds* below).
 
 ```
 vision.md   ──/vision──▶   plan.md + plan.lock.json + tenets.md
@@ -38,6 +38,17 @@ plan.md + plan.lock.json  ──/decompose──▶  blessed beads DAG (epics + 
                                              files improvements into
                                              autonomous-build's own beads)
 ```
+
+### Phased builds (opt-in)
+
+For a plan too big to review as one build, `/vision` proposes a **phase split** at the human gate: phase 1 is the *walking skeleton* (the smallest feature set that makes the success metric run end-to-end), later phases are coherent layers. `/orchestrate` then runs the pipeline as a **per-phase loop**:
+
+```
+for each phase i until phases exhausted:
+  /decompose --phase i  →  /build-batch  →  /retro --phase i  →  /replan i+1
+```
+
+`/decompose --phase i` pours beads for that phase **only**, just-in-time — so the next phase's beads don't exist yet and can't be picked up early — then the build drains it, `/retro --phase i` captures what was learned, and `/replan i+1` (a scoped re-run of `/vision`, `--replan-from N`) revises the next phase from those outcomes. **Single-phase is the default**: a one-phase plan runs the pipeline exactly once, unchanged. Design of record: [`docs/PHASED_BUILD_PROPOSAL.md`](docs/PHASED_BUILD_PROPOSAL.md).
 
 ## Repo layout
 
