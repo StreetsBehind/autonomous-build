@@ -1,11 +1,12 @@
 export const meta = {
   name: 'vision',
-  description: 'Workflow half of the hybrid /vision (epic autonomous-build-ih5). Turns a filled vision.md into the frozen skeleton + per-concern applicability the concern fan-out reasons against. Phase 1 intake validates the product brief (NEEDS-INPUT, never invents content, when §1/§3/§8 are unfilled); Phase 2 builds the frozen skeleton (data model + feature order + stack-native formula picks) and emits the observable signals from which a pure-JS deriveApplicability resolves each of the ten concerns. The concern fan-out (Phase 3) + reconcile/assemble (Phase 4) are appended by autonomous-build-ih5.3 / ih5.4. SYNC: spec is workflows/vision.spec.md (edit in lockstep, T3); CONCERN_IDS / EVIDENCE_BAR / GATE_TOKENS mirror docs/PLAN_CONCERNS.md + vision-eval.js; DEFAULT_STACK mirrors docs/DEFAULT_STACK.md.',
-  whenToUse: 'Invoked by the /vision skill shell for the concern-derivation engine, or directly (Workflow vision) for a headless run over a vision.md (the path vision-eval grades). Use --no-file to derive without writing, --selftest to CI the pure-JS intake/applicability/skeleton logic with NO agents.',
+  description: 'Workflow half of the hybrid /vision (epic autonomous-build-ih5). Turns a filled vision.md into the frozen skeleton + per-concern decisions the rest of the pipeline builds against. Phase 1 intake validates the product brief (NEEDS-INPUT, never invents content, when §1/§3/§8 are unfilled); Phase 2 builds the frozen skeleton (data model + feature order + stack-native formula picks) and emits the observable signals from which a pure-JS deriveApplicability resolves each of the ten concerns; Phase 3 fans out one agent per APPLICABLE concern over the frozen skeleton, each seeing ONLY its own concern bar — addressed-with-falsifiable-evidence or excluded-with-reason, undecidable -> a concern-decidedness block. Reconcile/assemble (Phase 4) is appended by autonomous-build-ih5.4. SYNC: spec is workflows/vision.spec.md (edit in lockstep, T3); CONCERN_IDS / CONCERN_BARS / EVIDENCE_BAR / GATE_TOKENS mirror docs/PLAN_CONCERNS.md + vision-eval.js; DEFAULT_STACK mirrors docs/DEFAULT_STACK.md.',
+  whenToUse: 'Invoked by the /vision skill shell for the concern-derivation engine, or directly (Workflow vision) for a headless run over a vision.md (the path vision-eval grades). Use --no-file to derive without writing, --selftest to CI the pure-JS intake/applicability/skeleton/concern logic with NO agents.',
   phases: [
     { title: 'Intake',   detail: 'Read + validate vision.md; NEEDS-INPUT on unfilled §1/§3/§8 (1 agent)' },
-    { title: 'Skeleton', detail: 'Build the frozen skeleton + observable signals; derive applicability in pure JS (1 agent)' }
-    // Phase 3 (concern fan-out) + Phase 4 (reconcile/assemble) are appended by autonomous-build-ih5.3 / ih5.4.
+    { title: 'Skeleton', detail: 'Build the frozen skeleton + observable signals; derive applicability in pure JS (1 agent)' },
+    { title: 'Concerns', detail: 'Fan out 1 agent per applicable concern over the frozen skeleton (addressed+evidence | excluded+reason | block)' }
+    // Phase 4 (reconcile + four gates + decidedness verdict + assemble lock/tenets/plan.md) is appended by autonomous-build-ih5.4.
   ]
 };
 
@@ -65,6 +66,22 @@ const EVIDENCE_BAR = `An "addressed" concern's evidence must point at something 
   4. the quality gate (hooks/post-build-gate.{sh,ps1}),
   5. a DEFAULT_STACK.md pin.
 A BARE ASSERTION ("handled", "we handle auth", "we take security seriously", "standard practices", "users log in", "permissions enforced", "we use env vars") is NOT evidence — it is unfalsifiable and FAILS the bar. Naming a concrete mechanism cited to one of the five anchors above passes; a vibe does not.`;
+
+// SYNC: docs/PLAN_CONCERNS.md "The concern vocabulary" table, column "addressed requires (falsifiable)" — verbatim
+// per concern. Each Phase-3 concern agent receives ONLY its own line (it must never see the others' contracts or
+// outputs — that is the independence the fan-out exists for). One entry per CONCERN_ID (selftest asserts coverage).
+const CONCERN_BARS = {
+  'data-model': `Every must-have entity appears in the plan's Data model with fields + relationships — not "we'll have a database."`,
+  'authn': `Names *who* authenticates (which §2 role) **and** the mechanism, cited to a feature/formula (e.g. "OIDC login for the Operator role via \`oidc-client-rust\`") — not "users log in."`,
+  'authz': `The authorization boundary: who may read/write whose data, cited to a feature or enforcement point (e.g. "OpenFGA model: a user reads only their own habits; tenants isolated") — not "permissions enforced."`,
+  'secrets': `Where each secret lives + that it is not in the repo, enumerated (e.g. "DB URL + OIDC client secret via env from the host secret store; \`.env\` gitignored") — not "we use env vars."`,
+  'data-lifecycle': `Retention/deletion stance for user data **and** whether migrations are destructive (e.g. "habits soft-deleted; user hard-delete cascades; migrations additive in v1"). Ties to **T5 reversibility** + **T8 idempotency**.`,
+  'error-handling': `Names the failure modes that need *design* (partial failure, retries, dependency-down) **and** cites **T7** for the rest — not silence. Cheap to address, but must be named.`,
+  'observability': `A feature/formula that emits them (e.g. "\`otel-bootstrap-rust\` emits traces+metrics") **or** \`excluded\` with reason.`,
+  'external-integrations': `Each integration named with its shape (auth, data flow, failure mode) **or** "none." A silent integration is a hidden dependency + a secrets/abuse surface.`,
+  'perf-envelope': `A concrete envelope **if** the success metric implies one (e.g. "p99 < 200ms on the streak endpoint at 100 concurrent users") **or** \`excluded\` ("v1 single-user, no perf target") — not a vibe.`,
+  'abuse-surface': `For each public surface: input-validation + rate-limit stance **or** \`excluded\` ("no public/unauthenticated network surface").`
+};
 
 // SYNC: skills/vision/SKILL.md gates + vision-eval.js GATE_TOKENS. The controlled openQuestions[].context
 // vocabulary; each blocking question's context STARTS WITH one of these tokens so downstream maps it.
@@ -316,6 +333,79 @@ function detectOffEnumPicks(featureOrder) {
   return off;
 }
 
+// ---- Phase 3 (concern fan-out) pure helpers ----
+
+// A Phase-3 ConcernResult.blockingQuestion: { question, context } whose context LEADS WITH the
+// concern-decidedness gate token so Phase 4's gate 6.5 can route it (mkBlocking adds blockingCompose
+// when it is promoted to an openQuestion). Reuses the agent's own context detail when it gave one.
+function concernBlock(concernId, question, agentContext) {
+  const detail = nonEmptyStr(agentContext) ? agentContext.replace(/^\s*concern-decidedness:\s*/i, '').trim() : '';
+  return { question, context: `concern-decidedness: ${detail || question}` };
+}
+
+// A ConcernResult is DECIDED when addressed-with-evidence or excluded-with-reason; anything carrying a
+// blockingQuestion (status 'failed') is UNDECIDED and trips the Phase-4 decidedness gate (T7: never silent).
+function isDecided(r) {
+  return isObj(r) && (r.status === 'addressed' || r.status === 'excluded');
+}
+
+// Build the per-agent inputs for the Phase-3 fan-out: ONE entry per APPLICABLE concern, each carrying
+// ONLY its own CONCERN_BARS line + the shared EVIDENCE_BAR + the frozen skeleton + the read vision sections.
+// excluded-by-default concerns are NOT fanned out (Phase 4 folds them in directly) — same rule applicableConcerns uses.
+function concernInputs(frozen, applicability, sections) {
+  return applicableConcerns(applicability).map((concernId) => ({
+    concernId,
+    applicability: applicability[concernId],
+    concernBar: CONCERN_BARS[concernId],
+    frozenSkeleton: frozen,
+    visionSections: isObj(sections) ? sections : {}
+  }));
+}
+
+// Coerce + validate a concern agent's reply into the canonical ConcernResult and enforce the contract the
+// JSON schema cannot express: addressed REQUIRES falsifiable evidence; excluded REQUIRES a reason; an explicit
+// blockingQuestion / a 'failed' / a garbled reply is undecided. The bare-assertion screen is the agent's job
+// (it holds the EVIDENCE_BAR + its concernBar), but an addressed claim with NO evidence at all is downgraded
+// here to undecided rather than passed silently (T7) — never let a rubber-stamp slip the gate.
+function normalizeConcernResult(raw, concernId, applicability) {
+  const r = isObj(raw) ? raw : {};
+  const cid = nonEmptyStr(r.concernId) ? r.concernId : concernId;
+  const appl = nonEmptyStr(r.applicability) ? r.applicability : applicability;
+  const bq = isObj(r.blockingQuestion) ? r.blockingQuestion : null;
+
+  // Explicit undecidable, agent-reported failure, or a blocking question -> undecided.
+  if (r.status === 'failed' || (bq && nonEmptyStr(bq.question))) {
+    const q = (bq && nonEmptyStr(bq.question)) ? bq.question
+      : (nonEmptyStr(r.reason) ? r.reason : `concern ${cid} could not be decided from the skeleton + vision`);
+    return { concernId: cid, applicability: appl, status: 'failed', blockingQuestion: concernBlock(cid, q, bq && bq.context) };
+  }
+
+  if (r.status === 'addressed') {
+    if (!nonEmptyStr(r.evidence)) {
+      const q = `concern ${cid} was claimed addressed with no falsifiable evidence`;
+      return { concernId: cid, applicability: appl, status: 'failed', blockingQuestion: concernBlock(cid, q) };
+    }
+    const out = { concernId: cid, applicability: appl, status: 'addressed', evidence: r.evidence };
+    if (isObj(r.coverageLink) && nonEmptyStr(r.coverageLink.mustHaveId) && isArr(r.coverageLink.features)) {
+      const features = r.coverageLink.features.filter(nonEmptyStr);
+      if (features.length) out.coverageLink = { mustHaveId: r.coverageLink.mustHaveId, features };
+    }
+    return out;
+  }
+
+  if (r.status === 'excluded') {
+    if (!nonEmptyStr(r.reason)) {
+      const q = `concern ${cid} was marked excluded with no reason`;
+      return { concernId: cid, applicability: appl, status: 'failed', blockingQuestion: concernBlock(cid, q) };
+    }
+    return { concernId: cid, applicability: appl, status: 'excluded', reason: r.reason };
+  }
+
+  // Unrecognized / missing status -> undecided (never a silent drop).
+  const q = `concern ${cid} returned an unrecognized status ${JSON.stringify(r.status)}`;
+  return { concernId: cid, applicability: appl, status: 'failed', blockingQuestion: concernBlock(cid, q) };
+}
+
 // ===========================================================================
 // Agent prompts (self-contained — the agents run in the app cwd, no repo docs).
 // ===========================================================================
@@ -369,6 +459,41 @@ PRODUCE (return ONLY the structured object; its schema is enforced):
    - externalIntegrations: the app depends on a third-party service/API (a real v1 dependency, not a nice-to-have you exclude).
    - scaleTarget: the success metric names a concrete scale / latency / throughput number.
    - publicSurface: the app exposes a public or unauthenticated network surface.
+`.trim();
+}
+
+// One per APPLICABLE concern. Self-contained: the frozen skeleton, the vision sections, this concern's OWN
+// bar, and the shared EVIDENCE_BAR are all inlined — the agent runs in the app cwd and cannot read any repo
+// doc, and it must never see another concern's contract or another agent's output (the fan-out is the isolation).
+function concernPrompt(C) {
+  return `
+You are the CONCERN agent for the /vision workflow (Phase 3). You decide EXACTLY ONE concern: "${C.concernId}" (applicability: ${C.applicability}). You run in the APP repo's cwd. You see ONLY this concern — you do not know how any other concern was decided and must not assume it. The FROZEN skeleton below is READ-ONLY: reason against it, never propose to change it (T10).
+
+Decide this concern against the frozen skeleton + the vision sections. Return exactly one of:
+  - status:"addressed" — the skeleton actually delivers this concern, WITH falsifiable evidence (see the bars).
+  - status:"excluded"  — the concern legitimately does not apply here, WITH a one-line reason.
+  - a blockingQuestion — the concern CANNOT be honestly decided from the skeleton + vision (genuinely underspecified). Do NOT guess (T1).
+
+THIS CONCERN'S "addressed requires" CONTRACT (the ONLY concern bar that applies to you — derived from docs/PLAN_CONCERNS.md, inlined):
+${C.concernBar}
+
+THE EVIDENCE BAR (what makes "addressed" evidence falsifiable):
+${EVIDENCE_BAR}
+
+FROZEN SKELETON (read-only):
+${JSON.stringify(C.frozenSkeleton, null, 2)}
+
+VISION SECTIONS (the human's product brief — read-only context):
+${JSON.stringify(C.visionSections, null, 2)}
+
+RULES:
+- "addressed" REQUIRES "evidence" meeting the bar above — cite a featureOrder[] entry by name, a formula, a numbered tenet (T#), the quality gate, or a DEFAULT_STACK pin. A BARE ASSERTION ("handled", "we use env vars", "permissions enforced") is NOT evidence and is REJECTED. If the only honest evidence would be a bare assertion, the concern is NOT addressed: mark it "excluded" with a reason, OR (if it SHOULD be addressed but no feature delivers it) return a blockingQuestion.
+- "excluded" REQUIRES a one-line "reason" ("CLI tool, no network surface").
+- If your "addressed" evidence cites a featureOrder[] feature that delivers a §3 must-have, ALSO emit "coverageLink": { "mustHaveId": "<the M-id>", "features": ["<feature name>"] } so reconcile can assemble coverage[].
+- A blockingQuestion's "context" MUST START WITH the literal token "concern-decidedness:" so the downstream gate can route it.
+- Echo "concernId":"${C.concernId}" and "applicability":"${C.applicability}" verbatim.
+
+Return ONLY the structured object (its schema is enforced).
 `.trim();
 }
 
@@ -432,6 +557,22 @@ const SKELETON_SCHEMA = {
       properties: Object.fromEntries(SIGNAL_NAMES.map((k) => [k, { type: 'boolean' }]))
     },
     blocks: { type: 'array', items: { type: 'object', required: ['token', 'note'], properties: { token: { type: 'string' }, note: { type: 'string' } } } }
+  }
+};
+
+// Phase 3 per-concern result. status is enforced; the addressed-needs-evidence / excluded-needs-reason
+// contract the schema cannot express is enforced in normalizeConcernResult (a defensive JS backstop, T7).
+const CONCERN_SCHEMA = {
+  type: 'object',
+  required: ['concernId', 'status', 'applicability'],
+  properties: {
+    concernId: { type: 'string' },
+    status: { type: 'string', enum: ['addressed', 'excluded', 'failed'] },
+    applicability: { type: 'string' },
+    evidence: { type: 'string' },
+    reason: { type: 'string' },
+    coverageLink: { type: 'object', required: ['mustHaveId', 'features'], properties: { mustHaveId: { type: 'string' }, features: { type: 'array', items: { type: 'string' } } } },
+    blockingQuestion: { type: 'object', required: ['question', 'context'], properties: { question: { type: 'string' }, context: { type: 'string' } } }
   }
 };
 
@@ -538,6 +679,60 @@ function runSelftest() {
   check('detectOffEnumPicks flags a generic formula bound off-enum (package_manager=cargo)', detectOffEnumPicks([{ name: 'Core', formulas: ['app-skeleton'], vars: { package_manager: 'cargo' } }]).length === 1);
   check('detectOffEnumPicks passes a stack-native pick', detectOffEnumPicks([{ name: 'Core', formulas: ['app-skeleton-rust-cargo'], vars: { package_manager: 'cargo' } }]).length === 0);
 
+  // ---- Phase 3: CONCERN_BARS sync + concern fan-out plumbing ----
+  check('CONCERN_BARS has one non-empty bar per CONCERN_ID (SYNC with PLAN_CONCERNS.md)',
+    CONCERN_IDS.every((id) => nonEmptyStr(CONCERN_BARS[id])));
+  check('CONCERN_BARS carries no concern outside the vocabulary',
+    Object.keys(CONCERN_BARS).every((id) => CONCERN_IDS.includes(id)) && Object.keys(CONCERN_BARS).length === CONCERN_IDS.length);
+
+  // concernInputs: one input per APPLICABLE concern, each with ONLY its own bar; excluded-by-default dropped.
+  const ci = concernInputs(frozen, none, coherentRaw.sections);
+  check('concernInputs yields one input per applicable concern (excludes excluded-by-default)',
+    ci.length === applicableConcerns(none).length && !ci.some((i) => i.concernId === 'authn') && ci.some((i) => i.concernId === 'data-model'));
+  check('each concern input carries ONLY its own bar + the frozen skeleton',
+    ci.every((i) => i.concernBar === CONCERN_BARS[i.concernId] && i.frozenSkeleton === frozen));
+
+  // concernPrompt: self-contained (inlines this concern's bar + the EVIDENCE_BAR + the skeleton); never tells
+  // the agent to read a repo doc by relative path; instructs the concern-decidedness block token.
+  const cPrompt = concernPrompt(ci.find((i) => i.concernId === 'data-model'));
+  check('concernPrompt inlines this concern bar + EVIDENCE_BAR + skeleton (self-contained)',
+    cPrompt.includes(CONCERN_BARS['data-model']) && cPrompt.includes('falsifiable') && cPrompt.includes('Tasklane'));
+  check('concernPrompt never instructs reading PLAN_CONCERNS.md / vision.spec.md by relative path',
+    !/Read .*PLAN_CONCERNS\.md/i.test(cPrompt) && !cPrompt.includes('vision.spec.md'));
+  check('concernPrompt instructs the concern-decidedness block token',
+    cPrompt.includes('concern-decidedness:'));
+
+  // normalizeConcernResult: the contract the schema can't express.
+  const addr = normalizeConcernResult({ concernId: 'data-model', status: 'addressed', evidence: 'User entity in Data model with fields', applicability: 'required', coverageLink: { mustHaveId: 'M1', features: ['Auth'] } }, 'data-model', 'required');
+  check('normalize: addressed+evidence is decided and keeps coverageLink',
+    addr.status === 'addressed' && isDecided(addr) && addr.coverageLink.mustHaveId === 'M1' && addr.coverageLink.features[0] === 'Auth');
+  const bareAddr = normalizeConcernResult({ concernId: 'authn', status: 'addressed', applicability: 'required' }, 'authn', 'required');
+  check('normalize: addressed WITHOUT evidence downgrades to undecided (no silent rubber-stamp, T7)',
+    bareAddr.status === 'failed' && !isDecided(bareAddr) && /^concern-decidedness:/.test(bareAddr.blockingQuestion.context));
+  const excl = normalizeConcernResult({ concernId: 'abuse-surface', status: 'excluded', reason: 'no public surface', applicability: 'required' }, 'abuse-surface', 'required');
+  check('normalize: excluded+reason is decided', excl.status === 'excluded' && isDecided(excl) && excl.reason === 'no public surface');
+  const exclNoReason = normalizeConcernResult({ concernId: 'secrets', status: 'excluded', applicability: 'required' }, 'secrets', 'required');
+  check('normalize: excluded WITHOUT reason downgrades to undecided', exclNoReason.status === 'failed' && !isDecided(exclNoReason));
+  const blocked = normalizeConcernResult({ concernId: 'authz', status: 'addressed', blockingQuestion: { question: 'who owns whose data?', context: 'underspecified' }, applicability: 'required' }, 'authz', 'required');
+  check('normalize: a blockingQuestion is undecided and its context leads with the gate token',
+    blocked.status === 'failed' && /^concern-decidedness:/.test(blocked.blockingQuestion.context) && GATE_TOKENS['concern-decidedness'].test(blocked.blockingQuestion.context));
+  const garbled = normalizeConcernResult('not an object', 'observability', 'optional');
+  check('normalize: a garbled / unrecognized reply is undecided, never dropped (T7)',
+    garbled.status === 'failed' && garbled.concernId === 'observability' && !isDecided(garbled));
+
+  // concernBlock: context always leads with the token (reuses agent detail when present).
+  check('concernBlock leads with the concern-decidedness token and reuses agent context detail',
+    concernBlock('x', 'q?', 'concern-decidedness: needs an IdP').context === 'concern-decidedness: needs an IdP' &&
+    concernBlock('x', 'q?').context === 'concern-decidedness: q?');
+
+  // Fan-out shape (the bead's "Verify"): one DECIDED record per applicable concern when every agent answers well.
+  const fakeReplies = ci.map((i) => i.concernId === 'data-model'
+    ? { concernId: i.concernId, status: 'addressed', evidence: 'User entity in Data model', applicability: i.applicability }
+    : { concernId: i.concernId, status: 'excluded', reason: `not applicable to ${i.concernId}`, applicability: i.applicability });
+  const fanned = ci.map((i, k) => normalizeConcernResult(fakeReplies[k], i.concernId, i.applicability));
+  check('fan-out yields exactly one record per applicable concern, all decided',
+    fanned.length === ci.length && fanned.every(isDecided) && new Set(fanned.map((r) => r.concernId)).size === ci.length);
+
   const passed = results.filter((r) => r.pass).length;
   return { results, passed, total: results.length, ok: passed === results.length };
 }
@@ -584,18 +779,43 @@ async function main() {
   const applicable = applicableConcerns(applicability);
   log(`vision: skeleton frozen — ${frozen.featureOrder.length} feature(s), ${applicable.length}/${CONCERN_IDS.length} concern(s) applicable${blocks.length ? `, ${blocks.length} carried block(s)` : ''}.`);
 
-  // Phases 3-4 (concern fan-out, reconcile + assemble lock/tenets/plan.md) are appended by
-  // autonomous-build-ih5.3 / ih5.4. ih5.2 returns the frozen skeleton + applicability so the
-  // skill-shell <-> workflow seam is exercisable end-to-end now.
+  // ---- Phase 3: concern fan-out (1 agent per applicable concern, parallel over the frozen skeleton) ----
+  // Each agent decides ONE concern against the frozen skeleton with ONLY its own concernBar; the runtime
+  // fan-out is the isolation (no agent sees another's contract or output). excluded-by-default concerns are
+  // NOT spawned — Phase 4 folds them in directly. Any error/skip becomes a 'failed' (undecided) result, never
+  // a silent drop (T7): a thunk that rejects is caught here; a user-skip (null) is backfilled in the map.
+  phase('Concerns');
+  const inputs = concernInputs(frozen, applicability, intake.sections);
+  log(`vision: fanning out ${inputs.length} concern agent(s): ${inputs.map((i) => i.concernId).join(', ') || '(none)'}`);
+  const concerns = (await parallel(inputs.map((C) => () =>
+    agent(concernPrompt(C), { label: `concern:${C.concernId}`, phase: 'Concerns', schema: CONCERN_SCHEMA })
+      .then((raw) => normalizeConcernResult(raw, C.concernId, C.applicability))
+      .catch((e) => ({
+        concernId: C.concernId, applicability: C.applicability, status: 'failed',
+        blockingQuestion: concernBlock(C.concernId, `concern ${C.concernId} agent errored: ${(e && e.message) ? e.message : String(e)}`)
+      }))
+  ))).map((r, i) => r || ({
+    concernId: inputs[i].concernId, applicability: inputs[i].applicability, status: 'failed',
+    blockingQuestion: concernBlock(inputs[i].concernId, `concern ${inputs[i].concernId} agent returned no result (skipped)`)
+  }));
+
+  const undecided = concerns.filter((r) => !isDecided(r));
+  log(`vision: concerns decided — ${concerns.length - undecided.length}/${concerns.length} decided${undecided.length ? `, ${undecided.length} undecided (concern-decidedness): ${undecided.map((r) => r.concernId).join(', ')}` : ''}.`);
+
+  // Phase 4 (reconcile: fold in excluded-by-default concerns + the four gates + decidedness verdict +
+  // assemble lock v2/tenets/plan.md) is appended by autonomous-build-ih5.4. ih5.3 returns the frozen skeleton
+  // + applicability + the per-concern fan-out results so the seam is exercisable end-to-end now. `incomplete`
+  // here is NOT the final verdict — Phase 4 computes it from these blocking questions + the coverage gates.
   return {
     status: 'ok',
     skeleton: frozen,
     signals: skelRaw && skelRaw.signals,
     applicability,
     applicableConcerns: applicable,
+    concerns,
     blocks,
-    incomplete: false, // NOT the final verdict — Phases 3-4 set it from the concern + reconcile gates.
-    note: 'Phases 1-2 only (autonomous-build-ih5.2); concern fan-out + reconcile land in ih5.3/ih5.4.'
+    incomplete: false, // placeholder — Phase 4 (ih5.4) sets the real verdict from concerns[] + the gates.
+    note: 'Phases 1-3 (autonomous-build-ih5.3); reconcile + decidedness verdict + assemble land in ih5.4.'
   };
 }
 
@@ -615,8 +835,9 @@ if (typeof agent === 'function') {
     extractJson, deepFreeze, hasContent, stripBullet, mkBlocking,
     validateIntake, buildNeedsInput, deriveApplicability, applicableConcerns,
     normalizeSkeleton, detectOffEnumPicks, runSelftest,
-    intakePrompt, skeletonPrompt, parseArgs,
-    CONCERN_IDS, EVIDENCE_BAR, GATE_TOKENS, DEFAULT_STACK, SIGNAL_NAMES, LOAD_BEARING,
-    INTAKE_SCHEMA, SKELETON_SCHEMA
+    concernBlock, isDecided, concernInputs, normalizeConcernResult,
+    intakePrompt, skeletonPrompt, concernPrompt, parseArgs,
+    CONCERN_IDS, CONCERN_BARS, EVIDENCE_BAR, GATE_TOKENS, DEFAULT_STACK, SIGNAL_NAMES, LOAD_BEARING,
+    INTAKE_SCHEMA, SKELETON_SCHEMA, CONCERN_SCHEMA
   };
 }
