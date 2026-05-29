@@ -5,220 +5,88 @@ description: Convert a filled-out vision.md into a concrete plan.md (tech stack,
 
 # vision
 
-Turn a `vision.md` into a `plan.md` the rest of the pipeline can consume.
+`/vision` is the product checkpoint of the pipeline — the last human-in-the-loop gate before the autonomous build begins. It is implemented as a **hybrid** (epic `autonomous-build-ih5`): this skill is the **thin conversational shell**, and the deterministic planning engine lives in the **`vision` dynamic workflow** (`workflows/vision.js`, spec `workflows/vision.spec.md`).
+
+**This skill does NOT contain the planning procedure.** Stack resolution, the data model, feature order, formula picks, the concern fan-out (one agent per applicable concern), the four gates (forward-coverage, reverse-trace, decidedness, must-have↔non-goal), the required+excluded contradiction scan, NFR lifting, `plan.lock.json` schema validation, and `plan.md` / `tenets.md` rendering **all live in the workflow.** The shell only holds the parts that need a human turn: the product conversation, the off-stack consult, and presenting the gate. (Meta vs app discipline: keeping the heavy logic in the workflow is the whole point of the hybrid.)
 
 ## Inputs
 
 - `vision.md` in the current working directory (filled out from `autonomous-build/templates/vision.md`).
-- [`docs/DEFAULT_STACK.md`](../../docs/DEFAULT_STACK.md) — the pinned Jankurai stack the plan resolves against. **Read this first.**
-- [`docs/PLAN_CONCERNS.md`](../../docs/PLAN_CONCERNS.md) — the pinned cross-cutting concern vocabulary (`data-model`, `authn`, `authz`, `secrets`, `data-lifecycle`, `error-handling`, `observability`, `external-integrations`, `perf-envelope`, `abuse-surface`), each with its `addressed`-means bar and the rule that derives its applicability from the vision. Read alongside `DEFAULT_STACK.md`; the concern step (8.5) binds to it.
-- The user is present for this stage — it's the last human-in-the-loop checkpoint before the autonomous build begins. **The checkpoint is for product, not tech.**
+- The user is present — **the checkpoint is for product, not tech.** Stack, framework, database, auth, hosting, tests, lint all come from the pinned `docs/DEFAULT_STACK.md`, which the workflow reads itself. Never ask the user a technical question.
+- The workflow inlines `docs/DEFAULT_STACK.md` and `docs/PLAN_CONCERNS.md` (it runs in the app cwd where those docs don't exist), so the shell does not need to read them.
 
 ## Process
 
-1. **Read `vision.md` end to end.** Do not skim. Then:
-   - **Assign a stable ID to each §3 must-have** — `M1`, `M2`, … in document order. These IDs are load-bearing: they become `mustHaves[]` in the lock and the left column of the coverage map, and the forward-coverage gate (step 6.5) checks every one is delivered. One ID per discrete must-have; if a §3 bullet bundles two independent capabilities, split it into two IDs.
-   - **Decompose the §8 success metric into observable steps** — `S1`, `S2`, … one per observable action/assertion in the metric (e.g. "I can sign up, create a habit, log it 3 days, see a streak of 3" → S1 sign up, S2 create habit, S3 log 3 days, S4 streak shows 3). These become `successMetric.steps[]`.
-   - **Quote back** to the user the *non-goals*, *constraints*, *success metric*, **and the IDed must-haves** (`M1: …`, `M2: …`) so they can correct you — including catching a must-have you mis-split or missed — before you commit to choices.
+### 1. Read `vision.md` and quote it back for correction
 
-2. **Resolve the stack from [`docs/DEFAULT_STACK.md`](../../docs/DEFAULT_STACK.md), silently.** Do **not** ask the user any technical questions — not language, framework, database, auth, hosting, tests, or lint. The stack is pinned at the repo level; per-app stack negotiation is forbidden. If `vision.md` §7 ("Tech preferences") expresses a preference, ignore it unless it materially conflicts with the pinned stack — in which case treat the conflict as a *product/scope* issue (see step 8), not a tech question.
+Read it end to end — do not skim. Then, **for the human-correction quote-back only** (the workflow re-derives these canonically), assign:
+- a stable ID to each §3 must-have — `M1`, `M2`, … in document order (one per discrete capability; split a bullet that bundles two);
+- a step ID to each observable in the §8 success metric — `S1`, `S2`, …
 
-3. **Fill the architecture rows from the default stack.** Every row in the `plan.md` Stack table comes from `docs/DEFAULT_STACK.md`. Copy the choices verbatim; the "Why" cell cites the default stack file in one line.
+**Quote back** to the user the §5 *non-goals*, §6 *constraints*, §8 *success metric*, and the IDed §3 *must-haves* (`M1: …`, `M2: …`) so they can catch a mis-split or missed must-have **before** the engine runs. Do **not** ask any technical question.
 
-4. **Sketch the data model.** Entities, key fields, relationships. Just enough to drive the first migration. Assume Postgres.
+### 2. Fill missing product sections (conversation, not invention)
 
-5. **Order the features.** List from must-haves §3 in dependency order. Each feature is one to a few formulas (see `~/.beads/formulas/`). As you place each feature, note which must-have ID(s) (`M1`, `M2`, …) it delivers — you will turn this into the coverage map in step 6.5.
+The workflow's load-bearing sections are §1 (problem), §3 (must-haves), §8 (success metric). If any is empty or still a template placeholder, **help the human fill it now** — otherwise the workflow returns NEEDS-INPUT with a `missing-product-sections` block. Missing §7 (tech preferences) is fine; that section is ignored. **Do not invent product content** (T1) — ask the human.
 
-6. **Pick formulas — stack-native variant first, then bind variables against the formula contract, not from memory.** For each feature, identify the capability, then choose the **stack-native formula variant** per the [`docs/DEFAULT_STACK.md`](../../docs/DEFAULT_STACK.md) "Stack-native formulas" map: when both a generic formula (`app-skeleton`, `crud-feature`, `background-job`, `integration-http`) and a native variant (e.g. `app-skeleton-rust-cargo`, `crud-feature-rust`, `tenant-boot-rust`, `audit-chain-rust`, `otel-bootstrap-rust`, `oidc-client-rust`, `openfga-model`, `composer-grammar-version`, `grpc-tonic-service`, `terraform-aws-baseline`) cover the capability, **pick the native variant.** A generic formula is a fallback used only when no native variant exists for the capability (currently only `migration`). The **off-enum tell** is the detector: if binding the feature to a generic formula forces an off-enum value for a required enum var (`package_manager=cargo`, `trigger_type=internal|cron`, `language=rust`), that is proof the generic formula is the wrong pick — switch to the stack-native variant rather than remapping to a near-miss value (T1: do not guess; do not bind off-enum). Then, for **each** chosen formula, run `bd formula show <name>` and read its declared `[vars.*]` blocks. Bind **only** the declared variable names — never invent a variable (e.g. do not write `auth_scheme` when the formula declares `auth_strategy`) — and for any variable whose description enumerates a closed set of allowed values, use **only** an enum-valid value verbatim. If the feature's real need has no matching enum value (e.g. the API uses HTTP Basic but the enum lacks a `basic` slot), that is a **formula gap**: note it under "Open questions for human" and escalate before `/decompose` runs — do not bind an off-enum value or remap to a near-miss (T1: do not guess). If no formula fits at all, note "needs new formula" — escalate to the user before `/decompose` runs (this is a *workflow* gap, not a tech preference).
+### 3. Off-stack consult — the one technical decision the shell owns
 
-6.5. **Build the coverage map.** Turn the must-have→feature notes from step 5 into the `coverage[]` map: one entry per `mustHaveId`, listing the `features` (by `featureOrder[].name`) that deliver it and **`how`**. `how` must state *how* the feature delivers the must-have — concrete, falsifiable evidence, not a restatement of the link. "M2 covered by the Streaks feature" is a bare link and is rejected; "the Streaks feature computes a consecutive-day count from logged completions and renders it per habit" is evidence. This mirrors `/decompose`'s anti-vagueness invariant: a verifier must be able to check the claim against the feature. Every `M`-ID from step 1 gets a coverage entry. (The assertion that no must-have is left uncovered is step 6.6.)
+If a §3 must-have plainly needs something outside the pinned stack (a queue, a websocket gateway, a vector DB, a third-party API integration shape), do **not** page the human and do **not** add a tech question. Spawn the 3-agent consult in a single message:
+- `Agent(subagent_type=Plan, prompt="Given the Jankurai stack in docs/DEFAULT_STACK.md and feature <X>, propose the minimal addition or an alternative that stays on-stack. Argue for your recommendation.")`
+- `Agent(subagent_type=general-purpose, prompt="For feature <X> on the Jankurai stack, list the load-bearing risks of any off-stack addition and what we lose by staying on-stack.")`
+- `Agent(subagent_type=general-purpose, prompt="Argue that feature <X> can be served entirely from the Jankurai stack with no additions. Show how.")`
 
-6.6. **Forward-coverage assertion (the gate).** This is what turns the coverage map from documentation into enforcement. Assert that **every** `mustHaves[].id` from step 1 appears in `coverage[]` with **≥1** `features` entry. For each must-have that is missing from `coverage[]` (or present with an empty `features` array), append an `openQuestions[]` entry:
+Synthesize one decision. To feed it into the engine, record it as a `Decided: <one line>` note in `vision.md` §10 (anything-else) so the workflow's headless skeleton build picks it up, **or** carry it in a frozen skeleton and pass `--skeleton` (see step 4). Most apps are fully on-stack and skip this step entirely.
 
-   ```jsonc
-   {
-     "question": "Must-have <Mn> (\"<text>\") maps to no feature — which feature delivers it, or should it move to nice-to-haves (§4)?",
-     "blockingCompose": true,
-     "context": "Forward-coverage gate: every §3 must-have must map to >=1 feature, else it would be silently dropped during the build."
-   }
-   ```
+### 4. Invoke the workflow
 
-   Any `blockingCompose: true` entry forces `incomplete: true` in the lock (per the schema/`incomplete` rule). No new downstream code is needed: `/decompose` Phase 1 already refuses when `incomplete == true` and prints the blocking `openQuestions` list (`decompose.spec.md` step 4), so a dropped must-have now stops the build with a named reason instead of vanishing. Do **not** paper over an uncovered must-have by inventing a feature to cover it — surface it as the blocking question and let the human decide (add a feature, or demote the must-have). Report PASS/uncovered in the closing summary (see "Closing summary").
+Hand off to the `vision` dynamic workflow — the engine that builds + freezes the skeleton, fans out one agent per applicable concern over it, runs the four gates + the required+excluded scan, computes the decidedness verdict, and **assembles + validates + writes** `plan.lock.json` (schemaVersion 2) + `plan.md` + `tenets.md`. The shell writes none of those files itself.
 
-6.7. **Reverse-trace + success-metric oracle (hardening).** Two further checks, both routing through the same blocking `openQuestions` → `incomplete: true` wiring as step 6.6 (the vision-level analog of `/decompose` Phase 6.B traceability):
+Invoke it with the **Workflow tool**, not as a slash command:
 
-   - **Reverse trace (no orphan features).** Every `featureOrder[]` entry must trace to ≥1 must-have (it appears in some `coverage[].features`) **or** a §4 nice-to-have. A feature that delivers neither is plan-time scope drift — something is being built that no must-have or nice-to-have asked for. Append a blocking `openQuestions[]` entry: `{ "question": "Feature \"<name>\" traces to no must-have or §4 nice-to-have — is it scope creep, or which must-have/nice-to-have does it serve?", "blockingCompose": true, "context": "Reverse-trace: every planned feature must answer to the vision." }`.
-
-   - **Success-metric oracle.** Every `successMetric.steps[]` entry (`S1`, `S2`, … from step 1) must map to ≥1 *covered* feature — a feature that appears in `coverage[]`. A step no covered feature can satisfy is the failure mode where each must-have is individually present but they do not compose into the working end-to-end flow the §8 metric describes. Append a blocking `openQuestions[]` entry: `{ "question": "Success-metric step <Sn> (\"<text>\") is not satisfiable by any covered feature — which feature realizes it?", "blockingCompose": true, "context": "Success-metric oracle: the §8 flow must be deliverable by the planned features, not just the individual must-haves." }`.
-
-   Same plumbing, same non-papering-over rule as step 6.6. Report PASS/offenders in the closing summary.
-
-7. **Off-stack technical decisions → agent consult, not human.** If a must-have feature needs something outside the pinned stack (e.g. a queue, a websocket gateway, a vector DB, a third-party API integration shape), do **not** add it to "Open questions for human." Instead, spawn a parallel 3-agent consult in a single message:
-   - `Agent(subagent_type=Plan, description="Architect: minimal off-stack addition", prompt="Given the Jankurai stack in docs/DEFAULT_STACK.md and feature <X>, propose the minimal addition or an alternative shape that stays on-stack. Argue for your recommendation.")`
-   - `Agent(subagent_type=general-purpose, description="Reviewer: risks of going off-stack", prompt="For feature <X> on the Jankurai stack, list the load-bearing risks of any off-stack addition and what we lose by staying on-stack. Be specific.")`
-   - `Agent(subagent_type=general-purpose, description="Counter-arguer: stay on-stack", prompt="Argue that feature <X> can be served entirely from the Jankurai stack with no additions. Show how.")`
-   
-   Synthesize the three into one decision and record it in `plan.md` under a top-level section:
-   
-   ```markdown
-   ## Decided by agent consult
-   - **Question**: <what we asked>
-   - **Decision**: <one line>
-   - **Rationale**: <2–4 lines, citing whichever agent's argument carried>
-   - **Reversal cost**: <what changes if we change our minds in 3 months>
-   ```
-   
-   The human reviews `plan.md` after — they can reverse the decision at the gate, but they are **not** paged for it during planning.
-
-8. **Set the escalation budget.** Copy from vision.md §9, fill defaults for anything left blank.
-
-8.5. **Derive and decide the cross-cutting concerns.** Read [`docs/PLAN_CONCERNS.md`](../../docs/PLAN_CONCERNS.md) (the same way you read `DEFAULT_STACK.md`). For each of the ten concerns in its vocabulary:
-
-   - **Derive applicability** from the human's product input per that doc's derivation rules — never invent it. Drive it from vision.md §3 (a must-have implying user accounts/per-user data → `authn`, and `authz` if >1 principal or cross-user data), §6 (a privacy/budget/infra constraint → `secrets` + `data-lifecycle`), and §8 (a success metric naming scale/latency/throughput → `perf-envelope`). `external-integrations` is always decided (even "none"); `data-model` and `error-handling` are always required. A concern resolves to `required`, `optional`, or `excluded-by-default`; **applicable** = `required` or `optional`.
-   - **Decide a status** for every concern (applicable or not — `excluded-by-default` concerns are recorded as `excluded` with the standard reason so the decision is explicit and auditable). `addressed` requires *falsifiable evidence* meeting that concern's "addressed means…" bar: a `featureOrder[].name`, a formula, a tenet (by number), the quality gate, or a `DEFAULT_STACK.md` pin. A bare assertion ("we handle auth", "security is covered") is rejected, mirroring the coverage `how` rule and `/decompose`'s anti-vagueness invariant. `excluded` requires a one-line `reason`.
-   - When addressing a concern needs an off-stack decision (e.g. `external-integrations` pulling in a queue or third-party API), that goes through the step 7 agent consult; the concern's evidence then cites the consult/decision.
-
-   Write `concerns[]` into `plan.lock.json` (one entry per concern: `{concernId, status, evidence}` when addressed, `{concernId, status, reason}` when excluded). Add a `## Concerns` table to `plan.md` (see structure below). (The decidedness + required-excluded contradiction *gate* is step 8.6.)
-
-   **These decisions are front-loaded so the build loop never blocks on them (lbq.3).** The `authn`/`authz`/`secrets`/`data-lifecycle` evidence must be concrete enough that a builder can *implement the decided model without a follow-up decision* — the auth mechanism + model, where each secret lives, whether migrations are destructive. At build time, a bead labeled `touches-auth`/`touches-secrets`/`touches-migration` clears unattended precisely because the matching concern is `addressed` here; an `excluded` or vague entry sends that bead to escalation and pages an absent human. So decide these at human-present `/vision` time, concretely — do not defer them to "the builder will figure it out."
-
-8.6. **Concern decidedness gate (the teeth).** This turns the concerns table from documentation into enforcement — the concern analog of step 6.6. Two assertions, both routing through the same `openQuestions` → `incomplete: true` plumbing the must-have gate uses (so `/decompose` Phase 1 refuses with the reason; `decompose.spec.md` step 4 — no new downstream code):
-
-   - **Decidedness.** Every concern whose derived applicability is `required` or `optional` (i.e. *applicable*) must have a decided `status` in `concerns[]`. An applicable concern left undecided (absent, or present with neither valid `evidence` nor `reason`) appends a blocking `openQuestions[]` entry:
-
-     ```jsonc
-     { "question": "Concern <concernId> is applicable (<required|optional>) but left undecided — address it (with evidence) or exclude it (with reason).", "blockingCompose": true, "context": "Concern decidedness gate (docs/PLAN_CONCERNS.md): silence is the failure mode this prevents." }
-     ```
-
-   - **Required + excluded contradiction.** A concern whose derived applicability is `required` but whose `status` is `excluded` is a contradiction — the plan excluded something the product needs, or the derivation misread the product. `/vision` does **not** resolve it; it appends a blocking `openQuestions[]` entry for the human:
-
-     ```jsonc
-     { "question": "Concern <concernId> is REQUIRED by the vision (<which §3/§6/§8 signal>) but the plan marks it excluded (\"<reason>\") — correct the vision or confirm the exclusion.", "blockingCompose": true, "context": "Required+excluded contradiction (docs/PLAN_CONCERNS.md decided-state rule)." }
-     ```
-
-   Either case flips `incomplete: true`. Do **not** paper over an undecided or contradicted concern — surface the blocking question and let the human resolve it. Report PASS/offenders in the closing summary (see "Closing summary").
-
-8.7. **Lift measurable NFRs into `nfrs[]`.** A §6 constraint with a *measurable, testable* bar — a performance/latency/throughput target, a security requirement, a privacy/PII rule, a compliance or **data-residency** requirement ("data stays in my region"), an availability target — must become a first-class `nfrs[]` entry, NOT just a prose tenet. Each entry is `{id (N1, N2, …), category (performance|security|privacy|compliance|data-residency|availability|accessibility|other), statement, target, verify}`, where `target` is the falsifiable bar and `verify` states how a test would check it. `/decompose` Phase 3.5 pours a dedicated enforcement bead per NFR (AC from `target`, test from `verify`) and **gates** it — that is what stops "data stays in my region" from evaporating into an advisory sentence that is never tested. A constraint that is genuinely *not* mechanically testable (a soft preference) stays a tenet; do not invent a fake target. `nfrs[]` is optional in the schema, so omit it only when §6 has no measurable constraint.
-
-9. **Derive the tenets.** Tenets are the principles the loop falls back on for build-time judgment calls — what to do when the bead spec, formula, gate, and lock don't decide for it. Produce `tenets.md` in the app repo from [`autonomous-build/templates/tenets.md`](../../templates/tenets.md):
-
-   - The "Inherited workflow tenets" section is copied verbatim from the template — it summarizes T1–T10 from [`autonomous-build/docs/TENETS.md`](../../docs/TENETS.md). Do not paraphrase; the bullets are deliberately load-bearing.
-   - The "App-specific tenets" section is generated:
-     - **From vision.md §5 (non-goals)**: one `A_n` tenet per non-goal, restated as a "do not X" rule. Empty §5 → omit the subsection.
-     - **From vision.md §6 (constraints)**: one tenet per binding constraint (privacy, budget, infra, deadline). Skip cosmetic constraints, and skip any constraint already lifted into `nfrs[]` in step 8.7 — a measurable NFR is enforced by a gated bead, so duplicating it as a soft tenet only muddies which is load-bearing (reference the NFR id in the why if context helps).
-     - **From plan.lock §stack**: one fixed tenet — "Stack is locked at /vision time; mid-build swaps require re-running /vision." Always include.
-     - **From plan.lock §agentConsults**: one tenet per consult decision so the same question is not re-litigated mid-build. The decision becomes the rule; the rationale becomes the why; the reversalCost is carried forward.
-     - **From plan.lock §openQuestions where `blockingCompose: false`**: the chosen default becomes a tenet, with the question recorded in the why so a future builder knows it was deliberately deferred. Omit the subsection if there are no non-blocking open questions.
-   - The "Escalation budget" section mirrors `plan.lock.escalationBudget`. This duplication is intentional — the builder reads tenets first.
-   - Number A-tenets sequentially across all subsections (A1, A2, A3, ...). The numbering is local to the app; T-numbers stay reserved for the workflow tenets.
-
-   Tenets are derived, not negotiated with the user. If a tenet would conflict with a workflow tenet (T1–T10), do not write the app tenet — surface the conflict in the `/vision` summary so the human can resolve it (usually by rephrasing the vision non-goal).
-
-## Outputs: `plan.md` + `plan.lock.json` + `tenets.md`
-
-`/vision` writes three paired files in the app repo CWD:
-
-- **`plan.md`** — the human-readable contract (structure below). Quoted to the user, edited if they want, and kept in git as the narrative.
-- **`plan.lock.json`** — the machine-readable mirror that `/decompose` consumes (schema v2). Same content in structured form, validated against [`autonomous-build/schemas/plan.lock.schema.json`](../../schemas/plan.lock.schema.json) before writing. In addition to the stack/data-model/feature fields, write the v2 coverage fields: `mustHaves[]` ({id, text} from step 1), `successMetric.steps[]` ({id, text} from step 1), `coverage[]` ({mustHaveId, features, how} from step 6.5), `concerns[]` (one decided entry per concern from step 8.5), and `nfrs[]` ({id, category, statement, target, verify} from step 8.7, when §6 has measurable constraints). See [`docs/PLAN_LOCK.md`](../../docs/PLAN_LOCK.md) for the field reference.
-- **`tenets.md`** — the build-time judgment-call reference, derived from [`autonomous-build/templates/tenets.md`](../../templates/tenets.md) per step 9. Read by `/build-next` when an agent faces a question the bead spec / formula / gate don't answer.
-
-Write all three. Before writing the lock, cross-check each `featureOrder[].vars` entry against its formula's declared vars (from `bd formula show`): every bound key must be a declared variable name, and every value of an enum-typed variable must be enum-valid. A key that isn't declared, or an off-enum value, is a hard stop — fix the binding (step 6) or escalate the formula gap; do not write a lock that pours will reject or that improvises a rename. **An off-enum value on a generic formula (`package_manager=cargo`, `trigger_type=internal|cron`, `language=rust`) is the wrong-formula signal from step 6, not a binding to patch — switch to the stack-native variant per the `docs/DEFAULT_STACK.md` map, do not coerce the value to fit the generic formula.** If schema validation fails on the lock, stop — do not write a partial lock or a tenets file derived from a partial lock. If `plan.md` §"Open questions for human" has any items the user must answer before /decompose runs, write the lock anyway with `incomplete: true` and `openQuestions[].blockingCompose: true` for those items, and still write `tenets.md` (the blocking questions become tenets that say "do not proceed until the human answers"); `/decompose` will refuse cleanly with the structured reason.
-
-### Closing summary
-
-After writing the three files, print a closing summary to the user. It must include:
-
-- the **coverage table** — every must-have (`M1`, `M2`, …) with the feature(s) that deliver it — so the human sees, at the gate, exactly which feature carries each must-have. State **PASS** (every must-have covered) explicitly; if the forward-coverage assertion (step 6.6) found an uncovered must-have — or the reverse-trace / success-metric oracle (step 6.7) found an orphan feature or an unsatisfiable success-metric step — list the offenders and note that `incomplete: true` was written and `/decompose` will refuse until the vision or coverage is fixed.
-- the **concerns table** — every concern with its applicability, status, and evidence/reason (step 8.5). State **PASS** (every applicable concern decided, no required+excluded contradictions) explicitly; if the decidedness gate (step 8.6) found an undecided applicable concern or a required+excluded contradiction, list the offending concerns and note that `incomplete: true` was written and `/decompose` will refuse.
-
-### `plan.md` structure
-
-Use this exact structure so `/decompose`'s fallback parser (for repos that pre-date plan.lock.json) still works:
-
-```markdown
-# Plan: <app name>
-
-## Stack
-| Layer | Choice | Why |
-| --- | --- | --- |
-| Language | ... | ... |
-| Backend framework | ... | ... |
-| Frontend framework | ... | ... |
-| Database | ... | ... |
-| ORM/driver | ... | ... |
-| Auth | ... | ... |
-| Hosting | ... | ... |
-| Tests | ... | ... |
-| Lint/format | ... | ... |
-
-## Data model
-- **Entity**: fields, relationships, notes
-- ...
-
-## Feature order
-1. <feature> — formulas: `[app-skeleton]`, vars: `{name=...}`
-2. <feature> — formulas: `[crud-feature]`, vars: `{entity=Habit, fields=[name,description]}`
-3. ...
-
-## Coverage
-> Every must-have (§3) maps to the feature(s) that deliver it and HOW. Mirrors `coverage[]` in the lock. Every M-ID appears exactly once; an uncovered must-have blocks /decompose (see step 6.6).
-
-| Must-have | Delivered by | How |
-| --- | --- | --- |
-| M1: <text> | <feature name> | <how the feature delivers it — evidence, not a restatement> |
-| M2: <text> | <feature name(s)> | ... |
-
-### Success metric steps
-> §8 decomposed into observable steps. Mirrors `successMetric.steps[]`.
-
-- **S1**: <observable>
-- **S2**: <observable>
-
-## Concerns
-> Every cross-cutting concern (docs/PLAN_CONCERNS.md) decided: addressed (with falsifiable evidence) or excluded (with reason). Mirrors `concerns[]` in the lock. One row per concern; silence is not an option (see step 8.5).
-
-| Concern | Applicability | Status | Evidence / Reason |
-| --- | --- | --- | --- |
-| data-model | required | addressed | <entities in Data model> |
-| authn | required | addressed | <feature/formula citing who + mechanism> |
-| ... | ... | ... | ... |
-| abuse-surface | excluded-by-default | excluded | <no public unauthenticated surface> |
-
-## Cross-feature dependencies
-- Feature 3 depends on feature 1's auth tasks (use `bd dep add`)
-
-## Decided by agent consult
-> One block per off-stack decision. Empty section is fine; omit the section entirely if there were no consults.
-- **Question**: ...
-- **Decision**: ...
-- **Rationale**: ...
-- **Reversal cost**: ...
-
-## Escalation budget
-- Max session cost: $...
-- Max failures per task: ...
-- Additional block triggers: ...
-
-## Open questions for human
-> Product/scope only. Tech ambiguity does NOT belong here — see "Decided by agent consult" above.
-> If this section is non-empty, /decompose will NOT run. Resolve here first.
-- ...
 ```
+Workflow(name: "vision", args: "--vision vision.md")
+```
+
+- Add `--no-file` to dry-run the derivation and inspect the would-be lock + verdict before anything lands.
+- Pass `--skeleton <path>` only when step 3 produced a frozen skeleton to inject a consult decision; otherwise the workflow builds the skeleton headlessly from `vision.md`.
+
+The workflow returns:
+
+```
+{ status: 'ok' | 'needs-input' | 'failed', incomplete: <bool>, openQuestions: [...], reportPaths: { planLock, planMd, tenets } }
+```
+
+### 5. Present the gate (the human checkpoint)
+
+Branch on the return. This is the surface `/orchestrate` Stage 1 reads, so relay `incomplete` + `openQuestions` faithfully.
+
+- **COMPLETE** (`status: 'ok'`, `incomplete: false`) — present the gate. Show the human the written `plan.md`, and from it the **Coverage table** (every must-have → the feature(s) that deliver it + *how*) and the **Concerns table** (every concern → status + falsifiable evidence / exclusion reason). State **PASS** explicitly. The human can edit `plan.md` or reverse a consult here; otherwise: *"ready for /decompose."*
+
+- **NEEDS-INPUT** (`status: 'needs-input'`, `incomplete: true`) — surface the blocking `openQuestions`, grouped by their gate token (the `context` prefix):
+  - `missing-product-sections` → name the empty §section to fill.
+  - `forward-coverage` (a must-have maps to no feature) / `reverse-trace` (an orphan feature) / `musthave-nongoal-contradiction` / `required-excluded-contradiction` / `concern-decidedness` → state the product question to resolve.
+  - `no-matching-formula` or a stack-deviation block → this is an **off-stack signal**, not a human gate: run the step-3 consult, record the decision, and re-run. Do **not** page the human for it.
+
+  For the product blocks, instruct the human to **edit `vision.md`** (the durable input — edits land there, not as in-chat patches; T10), then **re-run `/vision`**. The lock was written with `incomplete: true`, so `/decompose` pre-flight refuses it cleanly until the questions are resolved.
+
+- **FAILED** (`status: 'failed'`) — the assembled lock failed schema validation. This is a *workflow bug*, not a product gap; nothing was written. Surface the `validationErrors` and treat it as a `/flag --upstream` signal, not a human product gate.
+
+## Outputs
+
+The workflow writes the three paired files in the app repo CWD: `plan.md` (human-readable contract), `plan.lock.json` (schemaVersion 2, validated against `schemas/plan.lock.schema.json`), and `tenets.md` (T1–T10 inherited + app-specific). The shell writes nothing — it relays the verdict and presents the gate.
 
 ## Stopping conditions
 
-Only **product/scope** ambiguities stop the plan. Tech ambiguity is never a stopping condition — it routes to step 7 (agent consult) or to `docs/DEFAULT_STACK.md`.
+Only **product/scope** ambiguity stops the plan; tech ambiguity is never a stopping condition — it routes to the step-3 consult or to `docs/DEFAULT_STACK.md`.
 
-- vision.md has internal contradictions in *product/scope* (e.g. a must-have that the non-goals exclude, a success metric the must-haves cannot satisfy) → list them under "Open questions", ask the user, do not write a plan.
-- A must-have feature has no matching formula → list under "Open questions" as a workflow gap, recommend either picking a closer formula with adjustments or writing a new one in `autonomous-build/formulas/`. (This is a workflow question for the human, not a tech preference.)
-- vision.md is missing entire product sections (problem, users, must-haves, non-goals, success metric) → ask the user to fill them in before continuing. Missing tech preferences (§7) are *fine* — that section is now ignored.
+- A load-bearing product section (§1/§3/§8) is empty → fill it with the human (step 2) before invoking.
+- The workflow returns a blocking `openQuestion` on a product gate → surface it, the human edits `vision.md`, re-run.
 
 ## Do not
 
+- **Do not re-implement the planning procedure in this skill.** Stack resolution, data model, feature order, formula picks, concern derivation, the gates, NFR lifting, validation, and rendering live in `workflows/vision.js`. If the engine needs a change, edit the workflow (and its spec, in lockstep) — not this shell.
 - Do not run `bd init` or create any issues — that is `/decompose`'s job.
-- Do not start implementing — even a `package.json` is too early.
-- **Do not ask the user any technical question.** Stack, framework, database, auth, hosting, tests, lint — all come from `docs/DEFAULT_STACK.md`. Off-stack needs go through the 3-agent consult, not the human.
-- Do not put tech choices in `plan.md` §"Open questions for human" — that section is product/scope only.
-- Do not invent a stack row that isn't in `docs/DEFAULT_STACK.md` without going through the agent consult and recording the decision under "Decided by agent consult".
-- **Do not ask the user about tenets.** Tenets are *derived* from vision.md non-goals/constraints + plan.lock agentConsults + deferred openQuestions. If you can't derive a tenet, the source section is empty — omit the subsection. Do not invent tenets that aren't grounded in the vision or lock.
-- Do not paraphrase the inherited workflow tenets (T1–T10). Copy them verbatim from `templates/tenets.md`; their phrasing is load-bearing for downstream skills that grep for tenet IDs.
+- **Do not ask the user any technical question.** Off-stack needs go through the step-3 consult, not the human.
+- Do not edit `vision.md` yourself to paper over a NEEDS-INPUT block — the human edits it and re-runs (T10). (The one exception: recording a step-3 consult `Decided:` note in §10.)
+- Do not invent product content (must-haves, users, features) to get past a NEEDS-INPUT (T1).
