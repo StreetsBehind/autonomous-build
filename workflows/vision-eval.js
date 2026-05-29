@@ -1,12 +1,13 @@
 export const meta = {
   name: 'vision-eval',
-  description: 'Scale harness that grades /vision output against the hand-authored oracle corpus in tests/vision-eval/. Runs each fixture vision.md through /vision K times, then scores the plan.lock.json with mechanical pure-JS layers — L1 contract validation, L2 expectation assertions vs the manifest, L3 K-run stability — plus an opt-in L4 LLM evidence-quality judge (--judge → vaguenessRate). Emits a per-fixture table + a ratcheted scorecard. Implements autonomous-build-4vj.2 (L1-L3), 4vj.4 (scorecard ratchet), 4vj.3 (L4 judge).',
+  description: 'Scale harness that grades /vision output against the hand-authored oracle corpus in tests/vision-eval/. Runs each fixture vision.md through /vision K times, then scores the plan.lock.json with mechanical pure-JS layers — L1 contract validation, L2 expectation assertions vs the manifest, L3 K-run stability — plus opt-in LLM layers: L4 evidence-quality judge (--judge → vaguenessRate) and L5 downstream propagation (--propagate → /decompose --dry-run + bfo.9 leakage). Emits a per-fixture table + a ratcheted scorecard. Implements autonomous-build-4vj.2 (L1-L3), 4vj.4 (scorecard ratchet), 4vj.3 (L4 judge), 4vj.5 (L5 propagation).',
   whenToUse: 'When you want a numbers-on-a-dashboard answer to "is /vision deterministic / in line with the oracle?". Cheap grading, but the inputs are heavy: a full run is fixtures*k /vision passes (10*5=50 by default), and --judge adds an adversarial panel per addressed concern. Use --k 1 / --only for a cheap smoke, --judge (periodic) for the vagueness rate, --selftest to CI the harness logic with no agents.',
   phases: [
     { title: 'Enumerate',          detail: 'List fixture slugs under the corpus root (1 agent)' },
     { title: 'Run + grade',        detail: 'Per fixture: read manifest, run /vision K times headless, grade L1/L2/L3 in pure JS' },
     { title: 'Report',             detail: 'Assemble + log the per-fixture result table' },
     { title: 'Evidence judge',     detail: 'L4 (opt-in --judge): adversarial panel per addressed-concern evidence → vagueness rate' },
+    { title: 'Propagation (L5)',   detail: 'L5 (opt-in --propagate): sampled BLESSED locks through /decompose --dry-run → bfo.9 leakage report' },
     { title: 'Scorecard + ratchet', detail: 'Build scorecard (incl. vaguenessRate), diff vs blessed baseline, write artifact, fail on regression' }
   ]
 };
@@ -30,7 +31,8 @@ function parseArgs(s) {
     fixturesDir: 'tests/vision-eval/fixtures', k: 5, only: null, selftest: false,
     baselinePath: 'agent/baselines/vision-eval.json', updateBaseline: false, noGate: false,
     tolPass: DEFAULT_TOLS.pass, tolStability: DEFAULT_TOLS.stability,
-    judge: false, judgePanel: 3, judgeSample: 0
+    judge: false, judgePanel: 3, judgeSample: 0,
+    propagate: false, propagateSample: 1
   };
   const tokens = (typeof s === 'string') ? s.trim().split(/\s+/).filter(Boolean) : (Array.isArray(s) ? s : []);
   for (let i = 0; i < tokens.length; i++) {
@@ -48,6 +50,11 @@ function parseArgs(s) {
     else if (tokens[i] === '--judge') { out.judge = true; }
     else if (tokens[i] === '--judge-panel' && tokens[i + 1]) { const n = parseInt(tokens[++i], 10); if (Number.isFinite(n) && n >= 1) out.judgePanel = n; }
     else if (tokens[i] === '--judge-sample' && tokens[i + 1]) { const n = parseInt(tokens[++i], 10); if (Number.isFinite(n) && n >= 0) out.judgeSample = n; }
+    // L5 downstream propagation (autonomous-build-4vj.5). The most expensive, least frequent
+    // layer: it runs sampled BLESSED locks through /decompose --dry-run and checks the bfo.9
+    // forward-coverage invariant. Opt-in + small-sample; report-only (does not gate CI).
+    else if (tokens[i] === '--propagate') { out.propagate = true; }
+    else if (tokens[i] === '--propagate-sample' && tokens[i + 1]) { const n = parseInt(tokens[++i], 10); if (Number.isFinite(n) && n >= 1) out.propagateSample = n; }
     else if (tokens[i] === '--selftest') { out.selftest = true; }
   }
   return out;
@@ -369,6 +376,84 @@ function tallyVagueness(judged) {
   };
 }
 
+// ===========================================================================
+// L5 — downstream propagation (autonomous-build-4vj.5). The end-to-end question:
+// do BLESSED plans survive /decompose, and did the bfo.9 forward-coverage gate
+// catch lying concerns? These pure-JS functions are an INDEPENDENT oracle that
+// re-checks the bfo.9 invariant over a /decompose --dry-run DAG and reports
+// leakage as a metric (the live decompose run is the only LLM part; the check is
+// pure, so "a lying concern is caught" is unit-testable without agents).
+// ===========================================================================
+
+// Parse an addressed-concern evidence string for a featureOrder[] name it cites.
+// Mirrors bfo.9: evidence that cites a feature must map to a bead; evidence citing
+// only a tenet/gate/stack-pin cites no feature → returns null (exempt, nothing to map).
+function citedFeature(evidence, featureOrder) {
+  const e = String(evidence || '').toLowerCase();
+  const names = (isArr(featureOrder) ? featureOrder : [])
+    .map(f => (isObj(f) ? f.name : f)).filter(nonEmptyStr)
+    .sort((a, b) => b.length - a.length); // longest-first so "Account login" wins over "login"
+  for (const n of names) if (e.includes(n.toLowerCase())) return n;
+  return null;
+}
+
+// Normalize a dry-run bead's feature into the set of feature names it carries
+// (either a `feature` field or one/more `feature:<name>` labels).
+function beadFeatures(bead) {
+  if (!isObj(bead)) return [];
+  const out = [];
+  if (nonEmptyStr(bead.feature)) out.push(bead.feature);
+  for (const l of (isArr(bead.labels) ? bead.labels : [])) {
+    const m = /^feature:(.+)$/.exec(String(l));
+    if (m) out.push(m[1]);
+  }
+  return out;
+}
+
+// The L5 propagation oracle. Given a blessed plan.lock and the bead DAG a
+// /decompose --dry-run emitted, assert the bfo.9 invariant INDEPENDENTLY and
+// report leakage: every addressed-concern evidence that cites a feature must map
+// to >=1 bead, and every must-have must map (via its coverage[].features) to >=1
+// bead. Returns counts + the specific leaks + a leakageRate.
+function checkPropagation(planLock, beads) {
+  const pl = isObj(planLock) ? planLock : {};
+  const bd = isArr(beads) ? beads.filter(isObj) : [];
+  const featuresWithBead = new Set();
+  for (const b of bd) for (const f of beadFeatures(b)) featuresWithBead.add(f);
+
+  // concerns: every addressed concern whose evidence cites a feature -> >=1 bead.
+  const concernLeaks = [];
+  let concernsCited = 0;
+  for (const c of (isArr(pl.concerns) ? pl.concerns : [])) {
+    if (!isObj(c) || c.status !== 'addressed') continue;
+    const feat = citedFeature(c.evidence, pl.featureOrder);
+    if (!feat) continue; // cites a tenet/gate/stack-pin (or nothing) -> exempt
+    concernsCited++;
+    if (!featuresWithBead.has(feat)) concernLeaks.push({ concernId: c.concernId, citedFeature: feat, evidence: c.evidence });
+  }
+
+  // must-haves: every must-have -> >=1 bead, resolved via its coverage[].features.
+  const coverage = isArr(pl.coverage) ? pl.coverage : [];
+  const mustHaveLeaks = [];
+  let mustHavesChecked = 0;
+  for (const m of (isArr(pl.mustHaves) ? pl.mustHaves : [])) {
+    if (!isObj(m) || !nonEmptyStr(m.id)) continue;
+    mustHavesChecked++;
+    const feats = coverage.filter(c => isObj(c) && c.mustHaveId === m.id).flatMap(c => isArr(c.features) ? c.features : []);
+    if (!feats.some(f => featuresWithBead.has(f))) mustHaveLeaks.push({ mustHaveId: m.id, coveringFeatures: feats });
+  }
+
+  const totalChecked = concernsCited + mustHavesChecked;
+  const totalLeaks = concernLeaks.length + mustHaveLeaks.length;
+  return {
+    ok: totalLeaks === 0,
+    beadCount: bd.length,
+    concernsCited, concernLeaks,
+    mustHavesChecked, mustHaveLeaks,
+    leakageRate: totalChecked ? Math.round((totalLeaks / totalChecked) * 1000) / 1000 : null
+  };
+}
+
 // Roll a fixture's K runs into one printable row.
 function gradeFixture(slug, manifest, planLockTexts, concernIds = CONCERN_IDS) {
   const parsed = (planLockTexts || []).map(extractJson);
@@ -486,6 +571,37 @@ THE EVIDENCE UNDER JUDGEMENT:
 
 Decide: does this evidence cite at least one of the five falsifiable anchors (a named feature, a named formula, a numbered tenet, the gate, or a DEFAULT_STACK pin) concretely enough that a verifier could check it exists? A bare assertion fails.
 Return JSON ONLY: { "falsifiable": true|false, "reason": "<one sentence: which anchor it cites, or why it is a bare assertion>" }.
+`.trim();
+}
+
+// ===========================================================================
+// L5 decompose-dry-run prompt (headless /decompose). Same pattern as
+// runVisionPrompt: the agent executes the /decompose PROCEDURE headlessly in
+// --dry-run — it derives the bead DAG and returns it, WITHOUT creating any beads
+// or writing any files. checkPropagation then re-verifies coverage independently.
+// ===========================================================================
+function decomposeDryRunPrompt(slug, planLock) {
+  return `
+You are executing the /decompose skill HEADLESSLY in --dry-run for the L5 propagation eval (fixture "${slug}"). There is NO human, and you must CREATE NO BEADS and WRITE NO FILES — this is a dry run that only DERIVES and RETURNS the DAG.
+
+INPUTS (read the procedure):
+- workflows/decompose.spec.md (the /decompose procedure — follow Phases 2-3 to derive the DAG).
+- The blessed plan.lock.json under test (inline below — treat it as the app's plan lock):
+${JSON.stringify(planLock)}
+
+DERIVE THE DAG (decompose Phases 2-3, dry-run):
+- From featureOrder[] and crossFeatureDependencies[], derive one bead per feature slice (one formula pour each). Split a bead that would pour more than one formula (Phase 3).
+- Each bead carries: a title, the formula name it pours, and the plan feature it implements as a "feature:<name>" label (the SAME feature name from featureOrder[] — verbatim, this is load-bearing for the coverage check).
+- Apply the cross-feature dependency edges as blocks/blocked-by (you do not need to return edges for this eval, only the feature mapping).
+
+RULES:
+- Do NOT run \`bd create\`, do NOT touch any .beads store, do NOT write files. Derive in-memory only.
+- Do NOT invent features that are not in featureOrder[]; do NOT drop a feature that is in featureOrder[]. The DAG must reflect the plan as written (a missing feature is exactly the leakage L5 exists to detect — do not paper over it).
+
+OUTPUT (raw JSON only, no prose/fences):
+{ "beads": [ { "title": "<bead title>", "feature": "<the featureOrder name it implements>", "formula": "<formula name>" }, ... ],
+  "decomposeOk": <true if the forward-coverage gate (every must-have + every feature-citing addressed concern maps to >=1 bead) would PASS, else false>,
+  "error": <null, or a one-line reason decompose could not derive a DAG> }
 `.trim();
 }
 
@@ -709,6 +825,48 @@ function runSelftest() {
   check('ratchet tolerates a sub-tolerance vaguenessRate rise',
     compareToBaseline(buildScorecard(rowsA, 'k=5', 0.15), vagueBase).status === 'pass');
 
+  // 25-30. L5 downstream propagation (autonomous-build-4vj.5). The /decompose run is the
+  // only LLM part; the bfo.9 re-check is pure JS, so the "lying concern" acceptance is
+  // unit-testable with a synthetic DAG.
+  const propLock = {
+    schemaVersion: 2, app: { name: 'Demo' },
+    mustHaves: [{ id: 'M1', text: 'log in' }, { id: 'M2', text: 'see telemetry' }],
+    featureOrder: [{ name: 'Account login', formulas: ['oidc-client-rust'] }, { name: 'Telemetry', formulas: ['otel-bootstrap-rust'] }],
+    coverage: [{ mustHaveId: 'M1', features: ['Account login'], how: 'x' }, { mustHaveId: 'M2', features: ['Telemetry'], how: 'y' }],
+    concerns: [
+      { concernId: 'authn', status: 'addressed', evidence: "feature 'Account login' via oidc-client-rust" },
+      { concernId: 'observability', status: 'addressed', evidence: "feature 'Telemetry' via otel-bootstrap-rust" },
+      { concernId: 'error-handling', status: 'addressed', evidence: 'T7: no swallowed exceptions' } // cites a tenet -> exempt
+    ],
+    incomplete: false
+  };
+  // citedFeature: finds a feature name; returns null for tenet-only evidence.
+  check('L5 citedFeature finds a cited featureOrder name',
+    citedFeature("feature 'Account login' via oidc-client-rust", propLock.featureOrder) === 'Account login');
+  check('L5 citedFeature returns null for tenet/gate/stack-pin evidence (exempt)',
+    citedFeature('T7: no swallowed exceptions', propLock.featureOrder) === null);
+
+  // Full DAG -> no leaks; the tenet-citing concern is exempt (not counted).
+  const fullDag = [
+    { title: 'Account login', labels: ['feature:Account login'] },
+    { title: 'Telemetry', feature: 'Telemetry' }
+  ];
+  const propOk = checkPropagation(propLock, fullDag);
+  check('L5 checkPropagation: complete DAG has no leaks + exempts tenet-cited concern',
+    propOk.ok === true && propOk.concernsCited === 2 && propOk.leakageRate === 0);
+
+  // ACCEPTANCE (4vj.5): a deliberately LYING concern (Telemetry addressed, but no bead
+  // carries feature:Telemetry) is caught and reported.
+  const lyingDag = [{ title: 'Account login', labels: ['feature:Account login'] }]; // Telemetry bead dropped
+  const propLeak = checkPropagation(propLock, lyingDag);
+  check('L5 ACCEPTANCE: a lying concern (feature with no bead) is caught + reported',
+    propLeak.ok === false &&
+    propLeak.concernLeaks.some(l => l.concernId === 'observability' && l.citedFeature === 'Telemetry'));
+  check('L5 also reports the must-have whose feature has no bead',
+    propLeak.mustHaveLeaks.some(l => l.mustHaveId === 'M2') && propLeak.leakageRate > 0);
+  check('L5 beadFeatures parses both feature field and feature:<name> labels',
+    beadFeatures({ feature: 'A', labels: ['feature:B', 'other'] }).sort().join(',') === 'A,B');
+
   const passed = results.filter(r => r.pass).length;
   return { passed, total: results.length, ok: passed === results.length, results };
 }
@@ -798,13 +956,19 @@ Read ${A.fixturesDir}/${slug}/expect.json and return it verbatim as {"manifest":
         agent(runVisionPrompt(A.fixturesDir, slug, k + 1), { label: `vision:${slug}#${k + 1}`, phase: 'Run + grade' })
       );
       return parallel(runThunks).then(texts => {
-        const clean = texts.filter(t => t != null);
-        const row = gradeFixture(slug, prev.manifest, clean, CONCERN_IDS);
-        // L4 prep (pure JS, cheap): stash this fixture's addressed-concern evidence so
-        // the Evidence-judge phase can fan a panel over it. Only when --judge is on.
-        if (A.judge) {
-          const parsed = clean.map(extractJson).filter(isObj);
-          row.addressedEvidence = collectAddressedEvidence(parsed).map(e => Object.assign({ slug }, e));
+        const cleanTexts = texts.filter(t => t != null);
+        const row = gradeFixture(slug, prev.manifest, cleanTexts, CONCERN_IDS);
+        // L4/L5 prep (pure JS, cheap): reuse this fixture's runs so neither layer
+        // re-runs /vision. Only when the relevant layer is enabled.
+        if (A.judge || A.propagate) {
+          const parsed = cleanTexts.map(extractJson).filter(isObj);
+          // L4: stash addressed-concern evidence for the judge panel.
+          if (A.judge) row.addressedEvidence = collectAddressedEvidence(parsed).map(e => Object.assign({ slug }, e));
+          // L5: stash the first BLESSED lock (schema-valid + complete) for /decompose.
+          if (A.propagate) {
+            const blessed = parsed.find(pl => validatePlanLock(pl, CONCERN_IDS).ok && pl.incomplete === false);
+            if (blessed) row.blessedLock = blessed;
+          }
         }
         return row;
       });
@@ -857,6 +1021,44 @@ Read ${A.fixturesDir}/${slug}/expect.json and return it verbatim as {"manifest":
     }
   }
 
+  // ---- Phase 3.6: L5 downstream propagation (autonomous-build-4vj.5, opt-in) ----
+  // The most expensive, least frequent layer: run a small sample of BLESSED locks
+  // through /decompose --dry-run and re-check the bfo.9 forward-coverage invariant
+  // INDEPENDENTLY, reporting leakage. Report-only — does NOT gate CI by default.
+  let propagation = null;
+  if (A.propagate) {
+    phase('Propagation (L5)');
+    const candidates = clean.filter(r => r.blessedLock).slice(0, A.propagateSample);
+    if (!candidates.length) {
+      log('L5 propagation: no BLESSED plan.lock in the sampled runs (need a complete, schema-valid lock) — nothing to propagate.');
+    } else {
+      const dagSchema = {
+        type: 'object', required: ['beads'],
+        properties: {
+          beads: { type: 'array', items: { type: 'object', properties: { title: { type: 'string' }, feature: { type: ['string', 'null'] }, formula: { type: ['string', 'null'] } } } },
+          decomposeOk: { type: 'boolean' },
+          error: { type: ['string', 'null'] }
+        }
+      };
+      const results = await parallel(candidates.map(r => () =>
+        agent(decomposeDryRunPrompt(r.slug, r.blessedLock), { label: `propagate:${r.slug}`, phase: 'Propagation (L5)', schema: dagSchema })
+          .then(d => ({ slug: r.slug, lock: r.blessedLock, dag: d }))
+      ));
+      propagation = { sampled: candidates.length, sample: [] };
+      for (const res of results.filter(Boolean)) {
+        const beads = (res.dag && isArr(res.dag.beads)) ? res.dag.beads : [];
+        const prop = checkPropagation(res.lock, beads);
+        propagation.sample.push(Object.assign({ slug: res.slug, decomposeOk: !!(res.dag && res.dag.decomposeOk), decomposeError: (res.dag && res.dag.error) || null }, prop));
+        log(`L5 ${res.slug}: ${beads.length} beads · ${prop.concernLeaks.length} concern-leak(s) · ${prop.mustHaveLeaks.length} must-have-leak(s) · leakageRate=${prop.leakageRate} · decomposeOk=${!!(res.dag && res.dag.decomposeOk)}`);
+        for (const cl of prop.concernLeaks) log(`    LEAK concern "${cl.concernId}" cites feature "${cl.citedFeature}" but NO bead carries feature:${cl.citedFeature} (lying concern)`);
+        for (const ml of prop.mustHaveLeaks) log(`    LEAK must-have "${ml.mustHaveId}" maps to no emitted bead (covering features: ${(ml.coveringFeatures || []).join(', ') || 'none'})`);
+        if (res.dag && res.dag.error) log(`    decompose dry-run note: ${res.dag.error}`);
+      }
+      const totalLeaks = propagation.sample.reduce((a, s) => a + s.concernLeaks.length + s.mustHaveLeaks.length, 0);
+      log(`L5 propagation summary: ${propagation.sample.length} plan(s) decomposed, ${totalLeaks} total leak(s). Report-only (does not gate CI).`);
+    }
+  }
+
   // ---- Phase 4: scorecard + baseline ratchet ----
   phase('Scorecard + ratchet');
   const baseRead = await agent(`
@@ -900,7 +1102,7 @@ Then confirm the path you wrote.
   if (cmp.status === 'block' && !A.noGate && !A.updateBaseline) {
     throw new Error(`vision-eval REGRESSION vs baseline: ${cmp.regressions.map(r => `${r.metric} ${r.current}<${r.baseline}-${r.tol}`).join('; ')}`);
   }
-  return { rows: clean, scope, scorecard, ratchet: cmp, vaguenessRate };
+  return { rows: clean, scope, scorecard, ratchet: cmp, vaguenessRate, propagation };
 }
 
 // Entry point — guarded so `node`/`import` (for the selftest harness checks) never
@@ -921,6 +1123,7 @@ if (typeof agent === 'function') {
     extractJson, validatePlanLock, gradeAgainstManifest, computeStability,
     gradeFixture, renderTable, buildScorecard, compareToBaseline, runSelftest,
     collectAddressedEvidence, dedupeEvidence, judgePanelMajority, tallyVagueness, evidenceJudgePrompt,
+    citedFeature, beadFeatures, checkPropagation, decomposeDryRunPrompt,
     CONCERN_IDS, GATE_TOKENS, DEFAULT_TOLS, EVIDENCE_BAR
   };
 }
