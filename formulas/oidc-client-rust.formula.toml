@@ -268,7 +268,7 @@ Wire {{idp_provider}} OIDC + WebAuthn credentials from the chosen secret store (
 
 **Why this is a separate step on its own branch (per integration-http convention):**
 - Every other step ships using hardcoded fake creds + a small in-process mock IdP fixture for tests.
-- This step blocks for human decision on the secret store + provisioning + access-control (`touches-secrets` escalation per docs/ESCALATION_RULES.md).
+- This step blocks for human decision on the secret store + provisioning + access-control (`touches-secrets` escalation — the concrete questions are in the Escalation block below).
 - Putting it on its own dep branch means the verifier + endpoints + frontend + tests all ship in parallel while the human provisions Zitadel.
 
 **Escalation: /build-next BLOCKS on `touches-secrets`. The human must:**

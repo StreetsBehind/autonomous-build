@@ -477,7 +477,7 @@ Wire OpenFGA store ID + API token from the chosen secret store (AWS Secrets Mana
 
 **Why this is a separate step on its own branch (per integration-http convention):**
 - Every other step ships using a hardcoded test store_id + token against a local OpenFGA from testcontainers.
-- This step blocks for human decision on the OpenFGA deployment topology + secret provisioning (`touches-secrets` escalation per docs/ESCALATION_RULES.md).
+- This step blocks for human decision on the OpenFGA deployment topology + secret provisioning (`touches-secrets` escalation — the concrete questions are in the Escalation block below).
 - Putting it on its own dep branch means the model + client + trait + CLI + integration tests all ship in parallel while the human deploys OpenFGA.
 
 **Escalation: /build-next BLOCKS on `touches-secrets`. The human must:**

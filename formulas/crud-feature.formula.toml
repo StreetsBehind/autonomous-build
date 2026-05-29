@@ -66,7 +66,10 @@ Create the schema migration for {{entity}}.
 - Reverting the migration leaves no orphaned objects
 
 **Escalation:** if this migration would run against existing data in a deployed
-environment (vs. fresh local dev), block per docs/ESCALATION_RULES.md.
+environment (vs. fresh local dev), BLOCK the bead (`bd update <id> --status=blocked`)
+and escalate to the human — do not write or apply it until they confirm the backfill
+strategy, the lock-acquisition plan, and the downtime budget. Fresh-DB migrations
+proceed without a block.
 """
 
 [[steps]]

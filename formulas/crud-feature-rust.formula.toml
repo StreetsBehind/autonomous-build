@@ -167,7 +167,7 @@ Author the forward-only sqlx-cli migration for `{{entity_snake_plural}}`.
 - Round-trip (up -> down -> up) is idempotent
 
 **Escalation:**
-`needs-decision` label is treated as fresh-DB auto-approve (touches_existing_data=false). If the builder discovers production data exists in this environment, BLOCK and escalate per docs/ESCALATION_RULES.md.
+`needs-decision` label is treated as fresh-DB auto-approve (touches_existing_data=false). If the builder discovers production data exists in this environment, BLOCK the bead (`bd update <id> --status=blocked`) and escalate to the human — do not apply the migration until they confirm the backfill strategy, lock-acquisition plan, and downtime budget.
 """
 
 [[steps]]

@@ -105,7 +105,7 @@ Wire {{integration_name}} credentials from the chosen secret store (env, AWS Sec
 
 **Why this is a separate step on its own branch:**
 - The client step ships without this — happy-path and error-path tests construct the client with hardcoded fake credentials directly
-- This step blocks for human decision on secret store, rotation policy, and access-control (touches-secrets escalation per docs/ESCALATION_RULES.md)
+- This step blocks for human decision on secret store, rotation policy, and access-control (`touches-secrets` escalation — the concrete questions are in the Escalation block below)
 - Putting this on its own dep branch means the loop can finish 3 of the 4 steps in parallel while waiting for the human
 
 **Escalation:** /build-next blocks on touches-secrets. The human must answer BEFORE this step proceeds:
