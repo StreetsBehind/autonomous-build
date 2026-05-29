@@ -1,0 +1,213 @@
+# concern-enforcement-abuse-surface: enforce the pinned abuse-surface floor posture.
+#
+# Realizes the `abuse-surface` mandatory auth-floor item (docs/DEFAULT_STACK.md
+# §"Pinned abuse-surface posture") + the `abuse-surface` concern
+# (docs/PLAN_CONCERNS.md): rate-limiting + input-validation/bounds on every
+# exposed surface. /decompose Phase 3.5 selects this formula by purpose for an
+# auth'd app whose abuse-surface floor item is not already realized by a feature.
+#
+# The pinned posture (DEFAULT_STACK, decided in bead autonomous-build-noh):
+#   - Edge:   AWS WAFv2 rate-based rule in front of the ALB (terraform module).
+#   - In-app: per-tenant tower-governor token-bucket on every public Axum route,
+#             keyed on the authenticated tenant (IP fallback for unauth routes).
+#   - Bounds: request body-size cap (tower-http) + validator-derive DTO bounds.
+# All three are overridable per app via the formula vars below.
+#
+# Dependency-graph design (matters for /build-batch parallelism):
+#   governor-layer ──── abuse-integration-test
+#   input-bounds        (independent — touches DTO/validation only)
+#   waf-edge-module     (independent — touches infra/terraform/ only)
+#
+# Real enforcement testing (no mocks, T-14): abuse-integration-test stands up the
+# real instrumented router on a bound TcpListener and drives it with a live HTTP
+# client — it proves the layer throttles, not that a mock was called.
+#
+# Out of scope for v1 (separate follow-on formulas):
+# - Distributed/shared rate-limit state across replicas (Redis token-bucket):
+#   concern-enforcement-abuse-surface-distributed. v1 is per-instance in-memory.
+# - Bot/credential-stuffing detection, CAPTCHA, AWS Shield Advanced: edge follow-ons.
+
+formula = "concern-enforcement-abuse-surface"
+description = """
+Enforce the pinned abuse-surface floor posture on a Rust + Axum app: a per-tenant tower-governor token-bucket rate-limit layer (token-bucket keyed on the authenticated tenant, IP fallback), request body-size + validator-derive input bounds, and an AWS WAFv2 rate-based-rule Terraform edge module — plus a real (no-mocks) integration test that drives the bound router over HTTP and asserts the limiter returns 429 over burst while isolating tenants. Selected by /decompose Phase 3.5 for the abuse-surface floor item / concern (rate-limit + input-validation on exposed surfaces).
+"""
+type = "workflow"
+version = 1
+
+[vars.api_crate]
+description = "The crate that hosts the public Axum router (e.g. smbuild-api). Receives the governor layer, body-limit layer, and the validation module."
+default = "smbuild-api"
+
+[vars.public_route_prefix]
+description = "Path prefix of the exposed surface the rate-limit + body-limit layers apply to (e.g. /api). Routes under this prefix are rate-limited; health/metrics endpoints are typically excluded."
+default = "/api"
+
+[vars.rate_per_sec]
+description = "Per-tenant sustained request rate (token-bucket refill, requests/second). The DEFAULT_STACK pinned default is 10; override per app for a tighter or looser surface."
+default = "10"
+
+[vars.rate_burst]
+description = "Per-tenant burst size (token-bucket capacity). The DEFAULT_STACK pinned default is 20; a single tenant may burst this many requests before throttling to rate_per_sec."
+default = "20"
+
+[vars.body_limit_bytes]
+description = "Max request body size in bytes (tower-http RequestBodyLimitLayer). Oversized bodies are rejected with 413. DEFAULT_STACK pinned default is 1 MiB."
+default = "1048576"
+
+[vars.waf_module_dir]
+description = "Terraform module directory for the WAFv2 edge rate-based rule. The IaC baseline associates the resulting web ACL with the ALB."
+default = "infra/terraform/modules/edge-security"
+
+[vars.waf_rate_limit]
+description = "WAFv2 rate-based-rule limit: max requests per 5-minute window per source IP before the rule blocks. AWS minimum is 100; DEFAULT_STACK pinned default is 2000."
+default = "2000"
+
+# =============================================================================
+# In-app per-tenant token-bucket (tower-governor)
+# =============================================================================
+
+[[steps]]
+id = "governor-layer"
+title = "{{api_crate}}: per-tenant tower-governor rate-limit layer"
+type = "feature"
+priority = 1
+files = [
+  "crates/{{api_crate}}/src/abuse/rate_limit.rs",
+  "crates/{{api_crate}}/src/abuse/mod.rs",
+  "crates/{{api_crate}}/Cargo.toml",
+]
+description = """
+Add a per-tenant token-bucket rate-limit layer to the public router under `{{public_route_prefix}}`.
+
+**Cargo deps:** `tower_governor = "0.4"` (Axum 0.7-compatible), `governor = "0.6"`.
+
+**Body:**
+1. Implement a `TenantKeyExtractor` that implements `tower_governor::key_extractor::KeyExtractor`. Its `extract` reads the authenticated tenant id from the request's `Extension<TenantCtx>` (the tenant-boot chokepoint sets it); when no `TenantCtx` is present (unauthenticated route), fall back to the peer IP via the same logic as `tower_governor::key_extractor::SmartIpKeyExtractor`. The key type is an enum `RateKey { Tenant(String), Ip(IpAddr) }` so a tenant and an IP never collide.
+2. Build a `GovernorConfigBuilder` with `.per_second({{rate_per_sec}})`, `.burst_size({{rate_burst}})`, `.key_extractor(TenantKeyExtractor)`, `.finish()`. Expose `pub fn rate_limit_layer() -> GovernorLayer<...>`.
+3. Document wiring: `Router::new().nest("{{public_route_prefix}}", api_routes).layer({{api_crate}}::abuse::rate_limit_layer())`. The layer is applied to the public surface only — exclude `/health` and `/metrics`.
+
+**Acceptance:**
+- `cargo build -p {{api_crate}}` succeeds.
+- `pub fn rate_limit_layer()` exists and is wired onto the `{{public_route_prefix}}` router (not the health/metrics routes).
+- `RateKey` distinguishes `Tenant` vs `Ip` so cross-keyspace collisions are impossible (a unit test asserts two equal-id-but-different-variant keys are unequal).
+- The per-second rate and burst are sourced from the layer config (a unit test reads the configured `per_second`/`burst` and asserts they equal {{rate_per_sec}}/{{rate_burst}}).
+"""
+
+[steps.testPlan]
+file = "crates/{{api_crate}}/src/abuse/rate_limit.rs"
+cases = 3
+coverage = "TenantKeyExtractor returns Tenant(id) when Extension<TenantCtx> present and Ip(addr) otherwise; RateKey::Tenant(x) != RateKey::Ip(x) (no cross-keyspace collision); GovernorConfig reports the configured per_second/burst"
+
+# =============================================================================
+# Input bounds: body-size cap + validator-derive DTO bounds
+# =============================================================================
+
+[[steps]]
+id = "input-bounds"
+title = "{{api_crate}}: request body-size cap + validator-derive input bounds"
+type = "feature"
+priority = 2
+files = [
+  "crates/{{api_crate}}/src/abuse/validation.rs",
+  "crates/{{api_crate}}/src/abuse/mod.rs",
+  "crates/{{api_crate}}/Cargo.toml",
+]
+description = """
+Bound the input surface against oversized and malformed payloads.
+
+**Cargo deps:** `tower-http = { version = "0.5", features = ["limit"] }`, `validator = { version = "0.18", features = ["derive"] }`.
+
+**Body:**
+1. Add `tower_http::limit::RequestBodyLimitLayer::new({{body_limit_bytes}})` to the public router. An over-limit body is rejected with `413 Payload Too Large` before the handler runs.
+2. Provide a `ValidatedJson<T>` Axum extractor that wraps `axum::Json<T>`, runs `validator::Validate::validate(&value)`, and returns `400 Bad Request` with the field-error map on failure. Handlers take `ValidatedJson<Dto>` instead of `Json<Dto>`.
+3. Document the convention: every request DTO derives `#[derive(Deserialize, validator::Validate)]` and annotates bounds (`#[validate(length(max = ...))]`, `#[validate(range(...))]`). The `[package.metadata.agent].invariants` records "all public request DTOs use ValidatedJson + derive Validate".
+
+**Acceptance:**
+- `cargo build -p {{api_crate}}` succeeds.
+- A request body larger than {{body_limit_bytes}} bytes is rejected `413` (covered by the integration test below; here a unit test asserts the layer is constructed with the configured limit).
+- `ValidatedJson<T>` returns `400` with a non-empty field-error body when `validate()` fails, and passes the deserialized value through when it succeeds.
+"""
+
+[steps.testPlan]
+file = "crates/{{api_crate}}/src/abuse/validation.rs"
+cases = 2
+coverage = "ValidatedJson rejects a DTO that fails a #[validate] bound with 400 + field errors; ValidatedJson passes a valid DTO through to the handler unchanged"
+
+# =============================================================================
+# Edge: AWS WAFv2 rate-based-rule Terraform module
+# =============================================================================
+
+[[steps]]
+id = "waf-edge-module"
+title = "Terraform edge-security module: WAFv2 rate-based rule for the ALB"
+type = "feature"
+priority = 1
+files = [
+  "{{waf_module_dir}}/main.tf",
+  "{{waf_module_dir}}/variables.tf",
+  "{{waf_module_dir}}/outputs.tf",
+  "{{waf_module_dir}}/agent.yaml",
+]
+description = """
+Terraform module exporting an `aws_wafv2_web_acl` (scope `REGIONAL`, for the ALB) with a rate-based rule, plus an `aws_wafv2_web_acl_association` to the ALB ARN.
+
+**Resources:**
+- `aws_wafv2_web_acl` with one rule of type `rate_based_statement`: `limit = {{waf_rate_limit}}`, `aggregate_key_type = "IP"`, action `block`. `visibility_config` with CloudWatch metrics enabled.
+- `aws_wafv2_web_acl_association` binding the web ACL to `var.alb_arn`.
+
+**Inputs (variables.tf):** `alb_arn` (required), `name_prefix`, `rate_limit` (default {{waf_rate_limit}}).
+**Outputs (outputs.tf):** `web_acl_arn`.
+
+**Per-module `agent.yaml`** (Jankurai HLT-022):
+- `purpose = "WAFv2 edge rate-based rule fronting the ALB — the edge layer of the pinned abuse-surface posture"`
+- `owned_paths = ["{{waf_module_dir}}/"]`
+- `invariants = ["rate-based rule action is block, not count", "web ACL scope is REGIONAL (ALB), not CLOUDFRONT", "no rule allows unbounded request rate"]`
+- `local_validate = ["terraform fmt -check", "terraform validate", "tflint"]`
+- `risk = "medium"`
+
+**Acceptance:**
+- `terraform validate` in `{{waf_module_dir}}/` succeeds and `tflint` is clean.
+- The web ACL contains exactly one rate-based rule with `limit = {{waf_rate_limit}}`, `aggregate_key_type = "IP"`, and a `block` action (assert via `terraform plan -json` or a `grep` of the rendered config in a `terraform test` / `.tftest.hcl` assertion).
+- `web_acl_arn` is exported and the association references `var.alb_arn`.
+"""
+
+[steps.testPlan]
+file = "{{waf_module_dir}}/tests/waf.tftest.hcl"
+cases = 1
+coverage = "terraform test asserts the web ACL has a rate-based rule with the configured limit, IP aggregation, and block action, associated to the supplied ALB ARN"
+
+# =============================================================================
+# Real-wiring integration test (no mocks, T-14)
+# =============================================================================
+
+[[steps]]
+id = "abuse-integration-test"
+title = "{{api_crate}}: real HTTP integration test for the rate-limit layer"
+type = "feature"
+priority = 3
+needs = ["governor-layer"]
+files = [
+  "crates/{{api_crate}}/tests/abuse_surface.rs",
+]
+description = """
+Real-wiring enforcement test, no mocks (T-14). Proves the layer actually throttles over HTTP.
+
+**Setup:**
+- Build the real public router with `rate_limit_layer()` applied and one trivial `GET {{public_route_prefix}}/ping` handler returning 200.
+- Bind it to an ephemeral `TcpListener` (`127.0.0.1:0`), serve in a spawned task, and drive it with a live `reqwest` client (or `hyper` client) — no `oneshot`, no mock service.
+- Stamp each request with an `Extension<TenantCtx>` (or the header the tenant layer reads) so requests are attributed to a tenant.
+
+**Assertions:**
+1. As tenant A, fire `{{rate_burst}} + 1` requests back-to-back: the first `{{rate_burst}}` return `200`, the next returns `429 Too Many Requests`.
+2. Immediately fire one request as tenant B: it returns `200` (per-tenant isolation — A's exhausted bucket does not throttle B).
+3. After ~1s (one refill window at {{rate_per_sec}}/s), tenant A's next request returns `200` again (bucket refills).
+
+**Acceptance:**
+- `cargo nextest run -p {{api_crate}} abuse_surface` passes in a single retry-free run.
+- The over-burst request is `429`; the cross-tenant request is `200`; the post-refill request is `200`.
+"""
+
+[steps.testPlan]
+file = "crates/{{api_crate}}/tests/abuse_surface.rs"
+cases = 1
+coverage = "real bound-listener router throttles tenant A to 429 over burst, isolates tenant B at 200, and refills A after the rate window (no mocks, T-14)"

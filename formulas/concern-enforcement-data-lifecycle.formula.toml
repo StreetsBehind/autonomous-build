@@ -1,0 +1,182 @@
+# concern-enforcement-data-lifecycle: enforce retention / deletion / cascade.
+#
+# Realizes the `data-lifecycle` concern (docs/PLAN_CONCERNS.md): the retention /
+# deletion stance for user data and whether destructive migrations are reversible.
+# /decompose Phase 3.5 selects this formula by purpose when the data-lifecycle
+# concern is applicable (data model holds PII / user-owned entities, or §6 has a
+# privacy constraint) and is not already realized by a feature. Binds the named
+# user-owned entities + the owner principal + the retention window into its vars.
+#
+# Ties to T5 (reversibility — every migration ships a down) and T8 (idempotency —
+# the retention purge is a safe no-op on re-run).
+#
+# Dependency-graph design:
+#   soft-delete-migration ──┬── soft-delete-repo
+#                           ├── hard-delete-cascade
+#                           └── retention-job
+#
+# Real Postgres testing (no mocks, T-14): every test runs migrations against a
+# testcontainers Postgres and asserts the actual row state — soft-deletes hide,
+# cascades remove, the purge job deletes only the aged rows.
+#
+# Out of scope for v1 (separate follow-on formulas):
+# - Backup/restore + point-in-time recovery posture (that's an iac/ops concern).
+# - GDPR data-export (right-to-portability): concern-enforcement-data-export.
+# - Field-level encryption-at-rest for specific PII columns.
+
+formula = "concern-enforcement-data-lifecycle"
+description = """
+Enforce the data-lifecycle stance on a Rust + sqlx + Postgres app: a reversible soft-delete migration (deleted_at + partial active-row index) for the named user-owned entities, repository queries that hide soft-deleted rows by default, a transactional hard-delete cascade from the owner principal to all owned entities, and an idempotent retention-purge background job that hard-deletes soft-deleted rows past the retention window (no-op when retention is indefinite). All tests run against a real testcontainers Postgres (T-14); every migration ships a down (T5); the purge is a safe no-op on re-run (T8). Selected by /decompose Phase 3.5 for the data-lifecycle concern.
+"""
+type = "workflow"
+version = 1
+
+[vars.db_crate]
+description = "Crate that owns the sqlx migrations + repository layer (e.g. smbuild-api). Receives the repo changes and the retention job."
+default = "smbuild-api"
+
+[vars.migrations_dir]
+description = "Directory holding sqlx migrations, relative to the db crate (e.g. migrations). New soft-delete and cascade migrations land here."
+default = "migrations"
+
+[vars.user_owned_entities]
+description = "Comma-separated entities that hold user data and receive soft-delete + cascade (bound by /decompose from the data model's user-owned entities, e.g. 'Habit,Note,Attachment'). The builder iterates this list."
+required = true
+
+[vars.owner_entity]
+description = "The principal entity whose hard-deletion cascades to all user_owned_entities (e.g. User, Account, Tenant). Deleting one row here removes that principal's owned data."
+default = "User"
+
+[vars.retention_days]
+description = "Hard-purge soft-deleted rows older than this many days. 0 = retain indefinitely (the purge job is a no-op). Override per app from the §6 privacy/retention constraint."
+default = "0"
+
+# =============================================================================
+# Soft-delete migration (reversible — T5)
+# =============================================================================
+
+[[steps]]
+id = "soft-delete-migration"
+title = "{{owner_entity}}/owned: soft-delete migration (deleted_at + active index)"
+type = "feature"
+priority = 1
+files = [
+  "crates/{{db_crate}}/{{migrations_dir}}/*_soft_delete.up.sql",
+  "crates/{{db_crate}}/{{migrations_dir}}/*_soft_delete.down.sql",
+]
+description = """
+Add reversible soft-delete support to each entity in `{{user_owned_entities}}` (and `{{owner_entity}}`).
+
+**up.sql:** for each entity, `ALTER TABLE <t> ADD COLUMN deleted_at TIMESTAMPTZ NULL;` plus a partial index for the hot active-row path: `CREATE INDEX <t>_active_idx ON <t> (id) WHERE deleted_at IS NULL;`.
+**down.sql (T5 — reversibility):** drop the index then the column for each entity, in reverse order. The down must cleanly reverse the up against a populated table.
+
+**Acceptance:**
+- The migration applies cleanly (`sqlx migrate run`) against a fresh Postgres.
+- The down migration reverses it cleanly against a populated table (no orphaned index, column gone) — verified by an up→down→up round-trip in the testcontainers test.
+- Each entity in `{{user_owned_entities}}` and `{{owner_entity}}` has a nullable `deleted_at` and a partial active-row index.
+"""
+
+[steps.testPlan]
+file = "crates/{{db_crate}}/tests/data_lifecycle_migration.rs"
+cases = 2
+coverage = "soft-delete up migration adds deleted_at + partial index to every named entity on a real testcontainers Postgres; up->down->up round-trip is clean (T5 reversibility)"
+
+# =============================================================================
+# Repository: hide soft-deleted rows by default
+# =============================================================================
+
+[[steps]]
+id = "soft-delete-repo"
+title = "{{db_crate}}: repos hide soft-deleted rows + soft_delete() setter"
+type = "feature"
+priority = 2
+needs = ["soft-delete-migration"]
+files = [
+  "crates/{{db_crate}}/src/repo/soft_delete.rs",
+  "crates/{{db_crate}}/src/repo/mod.rs",
+]
+description = """
+Make soft-delete the default read semantics for the user-owned entities.
+
+**Body:**
+1. Every default list/get query for an entity in `{{user_owned_entities}}` appends `AND deleted_at IS NULL` (or a shared query builder enforces it).
+2. `pub async fn soft_delete(&self, id) -> Result<()>` sets `deleted_at = now()` instead of `DELETE`.
+3. An explicit `with_deleted()` variant includes soft-deleted rows for admin/audit reads — the only way to see them.
+
+Record in `[package.metadata.agent].invariants`: "user-owned reads filter deleted_at IS NULL unless with_deleted() is used; no default query returns soft-deleted rows".
+
+**Acceptance:**
+- `cargo build -p {{db_crate}}` succeeds.
+- A soft-deleted row is absent from the default list/get and present only via `with_deleted()` — proven against a testcontainers Postgres.
+- `soft_delete(id)` sets `deleted_at` and does not physically remove the row.
+"""
+
+[steps.testPlan]
+file = "crates/{{db_crate}}/tests/data_lifecycle_repo.rs"
+cases = 3
+coverage = "soft_delete() sets deleted_at without removing the row; default list/get excludes the soft-deleted row; with_deleted() includes it (real Postgres)"
+
+# =============================================================================
+# Hard-delete cascade from the owner principal
+# =============================================================================
+
+[[steps]]
+id = "hard-delete-cascade"
+title = "{{owner_entity}} hard-delete cascades to all owned entities"
+type = "feature"
+priority = 2
+needs = ["soft-delete-migration"]
+files = [
+  "crates/{{db_crate}}/src/repo/cascade.rs",
+  "crates/{{db_crate}}/{{migrations_dir}}/*_cascade_fk.up.sql",
+  "crates/{{db_crate}}/{{migrations_dir}}/*_cascade_fk.down.sql",
+]
+description = """
+Implement the GDPR-style hard delete: removing a `{{owner_entity}}` removes all of that principal's data in `{{user_owned_entities}}`.
+
+**Approach:** ensure each owned entity's FK to `{{owner_entity}}` is `ON DELETE CASCADE` (migration), and provide `pub async fn hard_delete_owner(&self, owner_id) -> Result<DeletionReceipt>` that runs the delete in a single transaction and returns counts per entity (an auditable receipt). The down migration restores the prior FK action (T5).
+
+**Acceptance:**
+- Deleting one `{{owner_entity}}` row removes every related row across `{{user_owned_entities}}` in one transaction — proven against a testcontainers Postgres seeded with an owner + N owned rows; post-delete counts are 0 for every owned table.
+- The operation is transactional: a forced failure mid-cascade rolls back entirely (no partial deletion) — verified by a test that injects a failure and asserts all rows remain.
+- The FK migration ships a working down (T5).
+"""
+
+[steps.testPlan]
+file = "crates/{{db_crate}}/tests/data_lifecycle_cascade.rs"
+cases = 2
+coverage = "deleting an owner cascades to zero owned rows across all entities (real Postgres); a mid-cascade failure rolls back with no partial deletion (transactional)"
+
+# =============================================================================
+# Idempotent retention-purge job (T8)
+# =============================================================================
+
+[[steps]]
+id = "retention-job"
+title = "{{db_crate}}: idempotent retention purge of aged soft-deleted rows"
+type = "feature"
+priority = 3
+needs = ["soft-delete-migration"]
+files = [
+  "crates/{{db_crate}}/src/jobs/retention.rs",
+  "crates/{{db_crate}}/src/jobs/mod.rs",
+]
+description = """
+A background job that hard-deletes soft-deleted rows older than the retention window.
+
+**Body:**
+- `pub async fn purge_expired(retention_days: i64) -> Result<PurgeReceipt>` — when `retention_days <= 0`, return an empty receipt immediately (indefinite retention; no-op). Otherwise, for each entity in `{{user_owned_entities}}`, `DELETE ... WHERE deleted_at IS NOT NULL AND deleted_at < now() - (retention_days || ' days')::interval`, returning per-entity counts.
+- Default `retention_days = {{retention_days}}`. Wire as a scheduled job (mirrors the background-job / tenant-boot scheduling convention).
+- **Idempotent (T8):** running twice deletes the same set once — the second run is a no-op (its receipt counts are 0).
+
+**Acceptance:**
+- `cargo build -p {{db_crate}}` succeeds.
+- With `retention_days > 0`: rows soft-deleted before the window are purged; rows soft-deleted within the window and non-deleted rows are retained — proven against a testcontainers Postgres with rows at varied `deleted_at` ages.
+- With `retention_days = 0`: `purge_expired` deletes nothing (no-op).
+- Re-running `purge_expired` immediately is a no-op (idempotent, T8) — second-run receipt counts are all 0.
+"""
+
+[steps.testPlan]
+file = "crates/{{db_crate}}/tests/data_lifecycle_retention.rs"
+cases = 3
+coverage = "purge_expired removes only rows aged past retention_days, retaining newer + non-deleted rows (real Postgres); retention_days=0 is a no-op; a second immediate run deletes nothing (T8 idempotent)"

@@ -1,0 +1,161 @@
+# e2e-acceptance: the success-metric end-to-end definition-of-done test.
+#
+# Realizes the success-metric E2E acceptance bead (/decompose Phase 3.5 step 10,
+# lbq.17): the lock's successMetric.steps[] is the user's ONE definition of done
+# — the cross-feature journey — and today nothing verifies it as a path. This
+# formula pours a single end-to-end test that walks the ordered journey against
+# the *deployed-to-dev* app (the iac-deploy floor target) and asserts each step
+# plus the success-metric condition. /decompose binds successMetric.steps[] into
+# `journey_steps` and the metric into `success_assertion`.
+#
+# Stack-native by construction: an API-level black-box journey in Rust (reqwest
+# against base_url), not a browser driver — Playwright/browser e2e would add an
+# off-stack dependency (an agent-consult decision, DEFAULT_STACK §Off-stack), so
+# v1 walks the journey through the public API. A UI-level variant
+# (e2e-acceptance-playwright) is a documented follow-on.
+#
+# Dependency-graph design:
+#   e2e-crate ──┬── journey-test
+#               └── e2e-post-deploy-ci
+#
+# Real target, no mocks (T-14): the journey test hits the live deployed-to-dev
+# app via base_url; it is #[ignore]'d at unit-gate time (no target) and run with
+# --ignored in the post-deploy CI step once iac-deploy exports the dev URL. The
+# crate also ships one always-collected unit test so the gate never sees an
+# empty suite.
+#
+# Out of scope for v1 (separate follow-on formulas):
+# - UI-level browser journey (Playwright): e2e-acceptance-playwright.
+# - Synthetic-monitoring / continuous canary of the same journey in prod.
+
+formula = "e2e-acceptance"
+description = """
+Pour the success-metric end-to-end definition-of-done test for a Rust + Postgres app: scaffold an e2e crate that reads the deployed-to-dev base URL from an env var, a single journey test that walks the ordered success-metric steps against the live app via reqwest (threading state step-to-step) and asserts the success-metric condition, and a post-deploy CI step that runs it with --ignored after iac-deploy exports the dev URL. Selected by /decompose Phase 3.5 step 10 to give the lock's successMetric.steps[] a real, falsifiable verification path. API-level black-box (stack-native); no off-stack browser driver.
+"""
+type = "workflow"
+version = 1
+
+[vars.app_name]
+description = "App slug used to name the e2e crate (crates/{{app_name}}-e2e) and in CI job names (e.g. 'smbuild')."
+default = "smbuild"
+
+[vars.base_url_env]
+description = "Env var the e2e crate reads for the deployed-to-dev base URL (set from the iac-deploy dev output in the post-deploy CI step). When unset, the live journey test self-ignores rather than failing the unit gate."
+default = "E2E_BASE_URL"
+
+[vars.journey_name]
+description = "Human-readable name of the success-metric journey (e.g. 'operator-onboards-customer'). Used as the test name and CI job label."
+default = "primary-journey"
+
+[vars.journey_steps]
+description = "Ordered, semicolon-separated success-metric steps — bound by /decompose from the lock's successMetric.steps[]. Each step becomes one HTTP call + assertion in the journey test, with state (ids) threaded from earlier steps into later ones."
+default = ""
+
+[vars.success_assertion]
+description = "The success-metric definition-of-done condition asserted at the end of the journey, bound from the lock's successMetric (e.g. 'all steps return 2xx and the created invoice is retrievable', or a latency/SLA budget). Falsifiable — not a vibe."
+default = "every journey step returns a 2xx response and the final created resource is retrievable"
+
+# =============================================================================
+# e2e crate scaffold
+# =============================================================================
+
+[[steps]]
+id = "e2e-crate"
+title = "{{app_name}}-e2e: scaffold the end-to-end acceptance crate"
+type = "chore"
+priority = 1
+files = [
+  "crates/{{app_name}}-e2e/Cargo.toml",
+  "crates/{{app_name}}-e2e/src/lib.rs",
+  "crates/{{app_name}}-e2e/README.md",
+]
+description = """
+Create `crates/{{app_name}}-e2e/` as a Cargo workspace member for the success-metric end-to-end journey.
+
+**Cargo.toml [package.metadata.agent]:**
+- `purpose = "Success-metric end-to-end acceptance journey against the deployed-to-dev app"`
+- `owned_paths = ["crates/{{app_name}}-e2e/"]`
+- `invariants = ["the journey hits a real deployed app via {{base_url_env}}, never a mock or in-process server (T-14)", "the live journey test self-ignores when {{base_url_env}} is unset — it never silently passes"]`
+- `local_validate = ["cargo fmt --check -p {{app_name}}-e2e", "cargo clippy -p {{app_name}}-e2e -- -D warnings", "cargo nextest run -p {{app_name}}-e2e"]`
+- `risk = "low"`
+
+**Deps:** `reqwest = { version = "0.12", features = ["json"] }`, `tokio = { version = "1", features = ["macros", "rt-multi-thread"] }`, `serde_json = "1"`, `anyhow = "1"`.
+
+**Body (src/lib.rs):**
+- `pub fn base_url() -> Option<String>` reads `std::env::var("{{base_url_env}}")` and returns `Some(trimmed_no_trailing_slash)` or `None`.
+- A `pub struct Journey { client: reqwest::Client, base: String }` with helpers `get`/`post_json` that prefix `base` and return the parsed JSON + status.
+
+**Acceptance:**
+- `cargo check -p {{app_name}}-e2e` succeeds and the crate is in the workspace root `members`.
+- `[package.metadata.agent]` block present with the invariants above.
+- `base_url()` returns `None` when the env var is unset and a trailing-slash-trimmed URL when set (covered by the always-collected unit test).
+"""
+
+[steps.testPlan]
+file = "crates/{{app_name}}-e2e/src/lib.rs"
+cases = 2
+coverage = "base_url() returns None when {{base_url_env}} unset; base_url() trims a trailing slash when set (always-collected unit tests so the gate never sees an empty suite)"
+
+# =============================================================================
+# The success-metric journey test
+# =============================================================================
+
+[[steps]]
+id = "journey-test"
+title = "{{app_name}}-e2e: walk the '{{journey_name}}' success-metric journey"
+type = "feature"
+priority = 2
+needs = ["e2e-crate"]
+files = [
+  "crates/{{app_name}}-e2e/tests/{{journey_name}}.rs",
+]
+description = """
+Implement the end-to-end journey test that walks the ordered success-metric steps against the live deployed-to-dev app. No mocks, no in-process server (T-14).
+
+**Journey steps (bound from successMetric.steps[]):** `{{journey_steps}}`
+Each step becomes one HTTP interaction + assertion, in order, threading state (e.g. the id returned by a create step is used by the next step).
+
+**Test shape:**
+- `#[tokio::test]` named after `{{journey_name}}`, marked `#[ignore]` so the unit gate (which has no live target) does not run it; the post-deploy CI step runs it with `--ignored`.
+- First line: `let Some(base) = {{app_name}}_e2e::base_url() else { eprintln!("SKIP {{journey_name}}: {{base_url_env}} unset"); return; };` — a loud skip, never a silent pass.
+- Build a `Journey` against `base`, then for each step in `{{journey_steps}}` issue the call and assert the step's expected outcome (2xx + the documented response shape), threading ids forward.
+- Final assertion encodes the success-metric definition of done: `{{success_assertion}}`.
+
+**Acceptance:**
+- `cargo nextest run -p {{app_name}}-e2e --ignored {{journey_name}}` passes against a running dev deployment, walking every step in `{{journey_steps}}` in order.
+- Each step asserts a 2xx + its response shape; the final assertion verifies `{{success_assertion}}`.
+- With `{{base_url_env}}` unset the test exits via the loud SKIP branch (no panic, no false green) — verified by running it without the env var.
+"""
+
+[steps.testPlan]
+file = "crates/{{app_name}}-e2e/tests/{{journey_name}}.rs"
+cases = 1
+coverage = "the ordered success-metric journey ({{journey_steps}}) runs end-to-end against the live dev deployment, each step asserts 2xx + shape, the final assertion verifies the success metric; unset base URL takes the loud SKIP branch"
+
+# =============================================================================
+# Post-deploy CI wiring
+# =============================================================================
+
+[[steps]]
+id = "e2e-post-deploy-ci"
+title = "CI: run the {{journey_name}} journey after the dev deploy"
+type = "chore"
+priority = 3
+needs = ["e2e-crate"]
+files = [
+  ".github/workflows/e2e-acceptance.yml",
+]
+description = """
+Wire the journey test to run as a post-deploy smoke, after the iac-deploy dev `terraform apply` (the floor's unattended deploy-to-dev), so the success metric is verified on every dev deploy.
+
+**Workflow:**
+- Triggers after the dev deploy job (workflow_run on the deploy workflow's success, or a downstream job needing the deploy job).
+- Reads the deployed dev base URL from the deploy job's output / Terraform output and exports it as `{{base_url_env}}`.
+- Runs `cargo nextest run -p {{app_name}}-e2e --ignored {{journey_name}}` (or `cargo test -p {{app_name}}-e2e -- --ignored`).
+- Fails the pipeline if the journey fails — the success metric is a release gate, not advisory.
+
+**Acceptance:**
+- `.github/workflows/e2e-acceptance.yml` exists, runs after the dev deploy, sets `{{base_url_env}}` from the deploy output, and invokes the `--ignored` journey test.
+- The job fails (non-zero) when the journey test fails — confirmed by the workflow not marking the e2e step `continue-on-error`.
+- A YAML lint / `actionlint` pass on the workflow is clean.
+"""

@@ -1,0 +1,165 @@
+# concern-enforcement-perf: assert the perf-envelope under concurrent load.
+#
+# Realizes the `perf-envelope` concern (docs/PLAN_CONCERNS.md): the scale/latency
+# target the design must hold. /decompose Phase 3.5 selects this formula by purpose
+# when the perf-envelope concern is applicable (§8 success metric names a latency,
+# throughput, or scale target) and is not already realized by a feature. Binds the
+# target endpoint + the p99 budget + the concurrency into its vars so the poured
+# bead carries a concrete, falsifiable load assertion.
+#
+# Stack-native by construction: a Rust load harness (tokio + reqwest + hdrhistogram)
+# that drives the *deployed-to-dev* app, not an off-stack tool (k6/JMeter would be an
+# agent-consult dependency decision, DEFAULT_STACK §Off-stack). criterion is a
+# micro-benchmark (in-process, single-call latency) and cannot express a concurrent
+# HTTP envelope — so this harness is the right shape for a p99-at-N-concurrency target.
+#
+# Dependency-graph design:
+#   loadtest-crate ──┬── latency-assertion
+#                    └── perf-ci
+#
+# Real target, no mocks (T-14): the load test hits the live deployed-to-dev app via
+# base_url; it is #[ignore]'d at unit-gate time (no target) and run with --ignored in
+# the post-deploy perf CI step once iac-deploy exports the dev URL. The crate ships an
+# always-collected unit test (percentile math) so the gate never sees an empty suite.
+#
+# Out of scope for v1 (separate follow-on formulas):
+# - Soak/endurance tests (hours): concern-enforcement-perf-soak.
+# - Distributed load generation across runners (single-runner is enough for v1 targets).
+# - Continuous perf regression tracking dashboard.
+
+formula = "concern-enforcement-perf"
+description = """
+Assert the perf-envelope of a Rust + Postgres app under concurrent HTTP load: scaffold a load-test crate (tokio + reqwest + hdrhistogram) reading the deployed-to-dev base URL, a load test that drives the target endpoint at the configured concurrency for the configured duration and asserts p99 latency is under budget with an acceptable error rate, and a post-deploy CI step that runs it with --ignored after iac-deploy exports the dev URL. Real target, no mocks (T-14); the live test self-ignores without a target so the unit gate never falsely passes. Selected by /decompose Phase 3.5 for the perf-envelope concern.
+"""
+type = "workflow"
+version = 1
+
+[vars.app_name]
+description = "App slug used to name the load-test crate (crates/{{app_name}}-loadtest) and CI job (e.g. 'smbuild')."
+default = "smbuild"
+
+[vars.base_url_env]
+description = "Env var the load-test crate reads for the deployed-to-dev base URL (set from the iac-deploy dev output in the post-deploy CI step). When unset, the live load test self-ignores rather than failing the unit gate."
+default = "PERF_BASE_URL"
+
+[vars.target_endpoint]
+description = "The endpoint whose latency envelope is asserted, bound by /decompose from the perf-envelope target (e.g. /api/streak). Path is appended to the base URL."
+default = "/api/health"
+
+[vars.p99_ms]
+description = "The p99 latency budget in milliseconds the target endpoint must hold under load, bound from the §8 success metric (e.g. 200 for 'p99 < 200ms'). The assertion fails if measured p99 exceeds this."
+default = "200"
+
+[vars.concurrency]
+description = "Number of concurrent virtual clients driving the endpoint, bound from the §8 scale target (e.g. 100 for 'at 100 concurrent users')."
+default = "100"
+
+[vars.duration_secs]
+description = "How long (seconds) to sustain the concurrent load while collecting latencies into the histogram before asserting the percentile."
+default = "30"
+
+[vars.max_error_rate]
+description = "Maximum tolerated fraction of non-2xx / failed responses during the load run (0 = zero errors allowed). The assertion fails if the measured error rate exceeds this."
+default = "0"
+
+# =============================================================================
+# Load-test crate scaffold
+# =============================================================================
+
+[[steps]]
+id = "loadtest-crate"
+title = "{{app_name}}-loadtest: scaffold the perf-envelope load-test crate"
+type = "chore"
+priority = 1
+files = [
+  "crates/{{app_name}}-loadtest/Cargo.toml",
+  "crates/{{app_name}}-loadtest/src/lib.rs",
+  "crates/{{app_name}}-loadtest/README.md",
+]
+description = """
+Create `crates/{{app_name}}-loadtest/` as a Cargo workspace member for the perf-envelope load assertion.
+
+**Cargo.toml [package.metadata.agent]:**
+- `purpose = "Assert the perf-envelope (p99 latency under concurrent load) against the deployed-to-dev app"`
+- `owned_paths = ["crates/{{app_name}}-loadtest/"]`
+- `invariants = ["the load test hits a real deployed app via {{base_url_env}}, never an in-process server or mock (T-14)", "the live load test self-ignores when {{base_url_env}} is unset — it never silently passes", "the assertion reads measured p99 from the histogram, never a hardcoded pass"]`
+- `local_validate = ["cargo fmt --check -p {{app_name}}-loadtest", "cargo clippy -p {{app_name}}-loadtest -- -D warnings", "cargo nextest run -p {{app_name}}-loadtest"]`
+- `risk = "low"`
+
+**Deps:** `reqwest = { version = "0.12" }`, `tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }`, `hdrhistogram = "7"`, `anyhow = "1"`.
+
+**Body (src/lib.rs):**
+- `pub fn base_url() -> Option<String>` reads `{{base_url_env}}` (trimmed, no trailing slash) or `None`.
+- `pub struct LoadResult { pub p99_ms: f64, pub error_rate: f64, pub total: u64 }` and `pub async fn run_load(base: &str, path: &str, concurrency: usize, duration_secs: u64) -> LoadResult` — spawns `concurrency` tasks looping for `duration_secs`, each recording per-request latency (ms) into a shared `hdrhistogram::Histogram<u64>` and counting non-2xx/errors; returns p99 from the histogram + error rate.
+
+**Acceptance:**
+- `cargo check -p {{app_name}}-loadtest` succeeds and the crate is in the workspace root `members`.
+- `[package.metadata.agent]` block present with the invariants above.
+- `LoadResult::p99_ms` is computed from the histogram's 99th percentile (an always-collected unit test feeds a known latency distribution into the histogram and asserts the reported p99 matches the expected value), and `base_url()` returns `None` when unset.
+"""
+
+[steps.testPlan]
+file = "crates/{{app_name}}-loadtest/src/lib.rs"
+cases = 2
+coverage = "p99 reported from a histogram seeded with a known distribution matches the expected 99th percentile; base_url() returns None when {{base_url_env}} unset (always-collected unit tests so the gate never sees an empty suite)"
+
+# =============================================================================
+# The perf-envelope assertion
+# =============================================================================
+
+[[steps]]
+id = "latency-assertion"
+title = "{{app_name}}-loadtest: assert p99({{target_endpoint}}) < {{p99_ms}}ms at {{concurrency}} concurrent"
+type = "feature"
+priority = 2
+needs = ["loadtest-crate"]
+files = [
+  "crates/{{app_name}}-loadtest/tests/perf_envelope.rs",
+]
+description = """
+Implement the load test that asserts the perf-envelope against the live deployed-to-dev app. No mocks, no in-process server (T-14).
+
+**Test shape:**
+- `#[tokio::test(flavor = "multi_thread")]` marked `#[ignore]` so the unit gate (no live target) skips it; the post-deploy perf CI step runs it with `--ignored`.
+- First line: `let Some(base) = {{app_name}}_loadtest::base_url() else { eprintln!("SKIP perf_envelope: {{base_url_env}} unset"); return; };` — a loud skip, never a silent pass.
+- `let r = run_load(&base, "{{target_endpoint}}", {{concurrency}}, {{duration_secs}}).await;`
+- Assert `r.p99_ms <= {{p99_ms}}.0` (the latency budget) AND `r.error_rate <= {{max_error_rate}}.0` (the error budget). On failure, the panic message reports the measured p99 + error rate so the breach is diagnosable.
+
+**Acceptance:**
+- `cargo nextest run -p {{app_name}}-loadtest --ignored perf_envelope` passes against a running dev deployment when the endpoint holds p99 ≤ {{p99_ms}}ms at {{concurrency}} concurrent with error rate ≤ {{max_error_rate}}.
+- The assertion reads the measured p99/error-rate from `run_load` (not a constant) and fails with a diagnostic message reporting both when either budget is exceeded.
+- With `{{base_url_env}}` unset the test exits via the loud SKIP branch (no panic, no false green).
+"""
+
+[steps.testPlan]
+file = "crates/{{app_name}}-loadtest/tests/perf_envelope.rs"
+cases = 1
+coverage = "run_load against the live dev deployment yields p99 <= {{p99_ms}}ms and error_rate <= {{max_error_rate}} at {{concurrency}} concurrent for {{duration_secs}}s; unset base URL takes the loud SKIP branch"
+
+# =============================================================================
+# Post-deploy perf CI wiring
+# =============================================================================
+
+[[steps]]
+id = "perf-ci"
+title = "CI: run the perf-envelope load test after the dev deploy"
+type = "chore"
+priority = 3
+needs = ["loadtest-crate"]
+files = [
+  ".github/workflows/perf-envelope.yml",
+]
+description = """
+Wire the load test to run as a post-deploy perf gate, after the iac-deploy dev `terraform apply`, so the perf-envelope is verified on every dev deploy.
+
+**Workflow:**
+- Triggers after the dev deploy job (workflow_run on the deploy workflow's success, or a downstream job needing the deploy job).
+- Reads the deployed dev base URL from the deploy job's output / Terraform output and exports it as `{{base_url_env}}`.
+- Runs `cargo nextest run -p {{app_name}}-loadtest --ignored perf_envelope`.
+- Fails the pipeline when the envelope is breached — the perf target is a release gate. (A `continue-on-error` advisory mode is documented as an opt-out for apps that want perf tracked but not blocking, but the default is blocking.)
+
+**Acceptance:**
+- `.github/workflows/perf-envelope.yml` exists, runs after the dev deploy, sets `{{base_url_env}}` from the deploy output, and invokes the `--ignored` load test.
+- The job fails (non-zero) when the load test fails (default, no `continue-on-error`).
+- `actionlint` on the workflow is clean.
+"""
