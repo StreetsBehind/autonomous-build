@@ -105,7 +105,7 @@ One agent per feature in `ParsedPlan.features`. Each agent pours its formula, re
 
 **Concurrency:** N agents, capped at the runtime's 16-concurrent limit. For N > 16, the runtime schedules in batches automatically.
 
-After all `pour-feature` agents complete, the orchestrator script also applies `crossDeps` sequentially (one `bd dep add` per cross-feature edge; resolve feature names → pour-root IDs via the union of `PourResult.pourRoot` values). The wiring agent must **verify each edge landed** by re-querying (`bd show <blockedId> --json` / `bd dep show`) rather than trusting the `bd dep add` exit code, and report the **verified-present** count, not the attempted count. An add that "succeeds" but leaves the edge absent (a pourRoot-vs-molecule-epic ID mismatch was the smbuild cause) is retried once against the visible molecule-epic IDs, then recorded as `missing`. Phase 7's dep audit independently reconciles declared vs present edges.
+After all `pour-feature` agents complete, the orchestrator script also applies `crossDeps` sequentially (one `bd dep add` per cross-feature edge; resolve feature names → pour-root IDs via the union of `PourResult.pourRoot` values). This name → pour-root map is the **authoritative** resolution of feature names to bead IDs; the script builds it once (`featureToPourRoot`) and **threads it into Phase 6 (fidelity) and Phase 7 (dep audit)** so those verifiers resolve cross-dep endpoints by the same map. Downstream verifiers must **not** re-resolve by title: a molecule-epic's title is its formula name (`crud-feature`, `integration-http`), never the feature name, so a title search never matches — that was the run-2 smbuild "0/28 applied" false negative (`autonomous-build-3fr.3`): the edges between two *poured* features were wired but reported absent because the verifier re-derived names by title. The wiring agent must **verify each edge landed** by re-querying (`bd show <blockedId> --json` / `bd dep show`) rather than trusting the `bd dep add` exit code, report the **verified-present** count (not the attempted count), and return the resolved verified edges (`verified[]`, each with `blockedId`/`blockerId`) as the input Phase 6/7 reuse. An add that "succeeds" but leaves the edge absent (a pourRoot-vs-molecule-epic ID mismatch) is retried once against the visible molecule-epic IDs, then recorded as `missing`. The report's "Cross-feature deps applied" count is sourced from this `verifiedPresent`, not from a downstream title re-count. Phase 7's dep audit independently reconciles declared vs present edges using the same map.
 
 ---
 
@@ -219,8 +219,8 @@ The load-bearing phase that makes `/decompose` worth more than the sum of compos
 
 **Agent A:** `verify-plan-to-dag` (plan-direction coverage)
 **Tools:** `Read`, `Bash`
-**Inputs:** plan.md, plan.lock.json (if present), full open-bead snapshot (`bd list --status=open --json`)
-**Question:** does every feature in `plan.featureOrder` have at least one open bead implementing it? Does every entry in `plan.crossFeatureDependencies` map to a real `bd dep` edge? **And (anti-rubber-stamp, bfo.9):** does every `concerns[]` entry with `status == "addressed"` whose `evidence` cites a *feature* trace to ≥1 open bead implementing that feature? Evidence citing a tenet/gate/stack-pin/formula is accepted as-is (always present, weaker check); `excluded` concerns are not checked. A feature-cited "addressed" concern with no implementing bead is a lie the DAG exposes — a fidelity gap. (If `planSource != 'lock'`, concern traceability is vacuously `complete`.)
+**Inputs:** plan.md, plan.lock.json (if present), full open-bead snapshot (`bd list --status=open --json`), **and the Phase 3 `featureToPourRoot` name → pour-root map** (the authoritative feature-name → bead-ID resolution — resolve cross-dep endpoints and feature→bead coverage with this, never by title-matching molecule epics, whose titles are formula names).
+**Question:** does every feature in `plan.featureOrder` have at least one open bead implementing it? Does every entry in `plan.crossFeatureDependencies` map to a real `bd dep` edge? (Resolve each cross-dep endpoint name to its bead ID via the `featureToPourRoot` map; a name absent from the map is an unpoured feature → real gap, not a title-search miss — `autonomous-build-3fr.3`.) **And (anti-rubber-stamp, bfo.9):** does every `concerns[]` entry with `status == "addressed"` whose `evidence` cites a *feature* trace to ≥1 open bead implementing that feature? Evidence citing a tenet/gate/stack-pin/formula is accepted as-is (always present, weaker check); `excluded` concerns are not checked. A feature-cited "addressed" concern with no implementing bead is a lie the DAG exposes — a fidelity gap. (If `planSource != 'lock'`, concern traceability is vacuously `complete`.)
 **Output:** `{ coverage: 'complete' | 'incomplete', features: [{name, beads: [<ids>], status: 'covered' | 'gap'}], crossDeps: [{blocked, blocker, edgePresent: <bool>}], concernTrace: { traceable: 'complete' | 'gap', concerns: [{concernId, evidenceKind: 'feature'|'tenet'|'gate'|'stack-pin'|'formula', citedFeature: <name|null>, beads: [<ids>], covered: <bool>}] }, note: <one sentence> }`
 
 **Agent B:** `verify-dag-to-plan` (DAG-direction traceability)
@@ -280,7 +280,7 @@ Topological sanity check on the DAG. Catches cycles, empty ready sets, and impli
 1. `bd dep cycles` — must report no cycles. Any cycle is a hard blocker (T1: escalate).
 2. `bd ready --json` — must return at least one non-epic issue. Empty ready set means the DAG is malformed (everything blocked).
 3. **Implicit conflict scan:** for every pair of beads (B1, B2) where neither depends on the other (transitively), check whether `B1.metadata.filesTouched` and `B2.metadata.filesTouched` intersect. If yes, surface as `{ beadA: B1.id, beadB: B2.id, overlap: [<paths>] }`. These would race in `/build-batch`'s filesTouched conflict filter — not a hard fail, but worth flagging.
-4. **Cross-dep verification:** confirm every entry in `ParsedPlan.crossDeps` has a corresponding `bd dep` edge. Missing edges mean Phase 3 dropped a cross-feature dep (a Phase 3 bug or a plan parse error).
+4. **Cross-dep verification:** confirm every entry in `ParsedPlan.crossDeps` has a corresponding `bd dep` edge. Resolve endpoint names to bead IDs via the Phase 3 `featureToPourRoot` map (passed in), **not** by title — molecule-epic titles are formula names, so a title search never matches and falsely reports every edge missing (`autonomous-build-3fr.3`). A name absent from the map = an unpoured feature (real gap). Phase 3 passes its `verified[]` edge list as a cross-check; surface only edges genuinely absent from the live DB. A genuinely missing poured-to-poured edge means Phase 3 dropped a cross-feature dep (a Phase 3 bug); a missing edge with an unpoured endpoint is a coverage gap, not a wiring bug.
 
 **Output:** `DepAuditResult = { cycles: [<cycle paths>], emptyReady: <bool>, implicitConflicts: [...], crossDepsApplied: [...], missingCrossDeps: [...] }`
 
@@ -319,8 +319,8 @@ Aggregate Phase 3–7 outputs, compute the overall verdict, write `decomposeRepo
 ## Coverage (Phase 6.A — plan-to-dag)
 - <feature name> → <beadId(s)> ✓
 - <feature name> → **GAP** (no bead)
-- Cross-feature deps applied: <count>
-- Cross-feature deps missing: <list>
+- Cross-feature deps applied: <count> (sourced from Phase 3 `crossDepWiring.verifiedPresent` — edges wired AND verified by bead ID, not a title re-count)
+- Cross-feature deps missing: <list from `crossDepWiring.missing` + `skipped`, each with its reason — an unpoured endpoint feature is the usual cause>
 
 ## Traceability (Phase 6.B — dag-to-plan)
 - Beads with plan citation: <count>

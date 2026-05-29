@@ -262,17 +262,28 @@ log(`Pour: ${pourOk.length}/${ParsedPlan.features.length} ok, ${pourFailed.lengt
 // Apply cross-feature deps sequentially (orchestrator does this, not an agent —
 // it's pure resolve-name-to-id + one bd call per edge, and we want it
 // serialized so concurrent bd writes don't race on the jsonl).
+//
+// featureToPourRoot is the AUTHORITATIVE feature-name → pour-root-ID map. It is
+// computed once here and THREADED into Phase 6 (fidelity) and Phase 7 (dep audit).
+// Downstream verifiers must NOT re-derive name→ID by title matching: molecule-epic
+// titles are formula names ("crud-feature", "integration-http"), never feature
+// names, so a title search always misses and reports edges absent even when they
+// were wired (autonomous-build-3fr.3 — this was the run-2 "0/28 applied" false
+// negative). crossDepWiring carries Phase 3's verified result forward so the report
+// counts what Phase 3 actually wired, not what a title-guessing re-derivation found.
+const featureToPourRoot = {};
+for (const r of pourOk) {
+  if (r.pourRoot) featureToPourRoot[r.feature] = r.pourRoot;
+}
+let crossDepWiring = { verifiedPresent: 0, attempted: 0, verified: [], missing: [], skipped: [], errors: [] };
 if (!Context.dryRun && ParsedPlan.crossDeps.length > 0) {
-  const featureToPourRoot = {};
-  for (const r of pourOk) {
-    if (r.pourRoot) featureToPourRoot[r.feature] = r.pourRoot;
-  }
   const crossDepSchema = {
     type: 'object',
-    required: ['attempted', 'verifiedPresent', 'missing', 'skipped', 'errors'],
+    required: ['attempted', 'verifiedPresent', 'verified', 'missing', 'skipped', 'errors'],
     properties: {
       attempted:       { type: 'number' },
       verifiedPresent: { type: 'number' },
+      verified: { type: 'array', items: { type: 'object' } },
       missing:  { type: 'array', items: { type: 'object' } },
       skipped:  { type: 'array', items: { type: 'object' } },
       errors:   { type: 'array', items: { type: 'object' } }
@@ -292,13 +303,21 @@ For each edge { blocked, blocker }:
 1. Resolve blocked → blockedId via the map (or pass through if already a bead ID). If the name has no mapping, record it under "skipped" with reason "unresolved name" and move on.
 2. Resolve blocker → blockerId the same way.
 3. Run \`bd dep add <blockedId> <blockerId>\`. Increment "attempted".
-4. VERIFY the edge is present — do NOT trust the add's exit code. Run \`bd show <blockedId> --json\` and confirm <blockerId> appears in its dependency/blocked-by list (try \`bd dep show <blockedId>\` as a fallback if the JSON shape is unclear). Only if the edge is confirmed present do you count it toward "verifiedPresent". If add succeeded but verification shows the edge absent (the smbuild failure mode — likely a pourRoot-vs-molecule-epic ID mismatch), retry the add once with the molecule-epic IDs you can see in \`bd list --status=open --json\`; if still absent, record it under "missing" with the resolved IDs and what you observed.
+4. VERIFY the edge is present — do NOT trust the add's exit code. Run \`bd show <blockedId> --json\` and confirm <blockerId> appears in its dependency/blocked-by list (try \`bd dep show <blockedId>\` as a fallback if the JSON shape is unclear). Only if the edge is confirmed present do you count it toward "verifiedPresent" AND record it under "verified" as { "blocked": "<name>", "blocker": "<name>", "blockedId": "...", "blockerId": "..." } — this resolved list is the authoritative input Phase 6/7 reuse to avoid re-resolving by title, so always include the IDs you actually wired. If add succeeded but verification shows the edge absent (the smbuild failure mode — likely a pourRoot-vs-molecule-epic ID mismatch), retry the add once with the molecule-epic IDs you can see in \`bd list --status=open --json\`; if still absent, record it under "missing" with the resolved IDs and what you observed.
 5. Capture any command errors under "errors".
 
 Report the VERIFIED-PRESENT count, never the attempted count, as the headline. Return JSON:
-{ "attempted": <n>, "verifiedPresent": <n>, "missing": [{ "edge": {...}, "blockedId": "...", "blockerId": "...", "observed": "..." }], "skipped": [{ "edge": {...}, "reason": "..." }], "errors": [{ "edge": {...}, "msg": "..." }] }
+{ "attempted": <n>, "verifiedPresent": <n>, "verified": [{ "blocked": "...", "blocker": "...", "blockedId": "...", "blockerId": "..." }], "missing": [{ "edge": {...}, "blockedId": "...", "blockerId": "...", "observed": "..." }], "skipped": [{ "edge": {...}, "reason": "..." }], "errors": [{ "edge": {...}, "msg": "..." }] }
 `, { label: 'wire-cross-deps', phase: 'Pour', schema: crossDepSchema, agentType: 'general-purpose' });
-  log(`Cross-deps wired: ${depAgent?.verifiedPresent ?? 0}/${depAgent?.attempted ?? 0} verified present, ${(depAgent?.missing || []).length} missing, ${(depAgent?.errors || []).length} errors`);
+  crossDepWiring = {
+    verifiedPresent: depAgent?.verifiedPresent ?? 0,
+    attempted:       depAgent?.attempted ?? 0,
+    verified:        depAgent?.verified || [],
+    missing:         depAgent?.missing || [],
+    skipped:         depAgent?.skipped || [],
+    errors:          depAgent?.errors || []
+  };
+  log(`Cross-deps wired: ${crossDepWiring.verifiedPresent}/${crossDepWiring.attempted} verified present, ${crossDepWiring.missing.length} missing, ${crossDepWiring.errors.length} errors`);
 }
 
 // ---------------------------------------------------------------------------
@@ -701,12 +720,13 @@ INPUTS:
 - Plan: read ${Context.planPath} (and ${Context.lockPath || 'plan.lock.json'} if planSource=lock).
 - DAG snapshot: \`bd list --status=open --json\` to see current open beads.
 - Cross-deps declared in plan: ${JSON.stringify(ParsedPlan.crossDeps)}
+- Phase 3 feature-name → pour-root-ID map (AUTHORITATIVE — resolve feature names to bead IDs with THIS, never by title; molecule-epic titles are formula names like "crud-feature"/"integration-http", not feature names): ${JSON.stringify(featureToPourRoot)}
 
 YOUR QUESTION: does every feature in plan.featureOrder have at least one open bead implementing it? Does every cross-feature dep in the plan map to a real \`bd dep\` edge?
 
-For each plan feature, find the bead(s) that implement it by matching feature name to bead titles + descriptions. Be conservative — if you can't confidently map a feature to a bead, mark it as a gap.
+For each plan feature, find the bead(s) that implement it: the pour-root in the map above IS that feature's molecule epic, so the feature is covered by that root and its children. A feature absent from the map never poured — mark it a gap. (Only fall back to title/description matching for a feature with no map entry.)
 
-For each cross-dep, run \`bd show <blockedId>\` (resolving names to IDs via Phase 3 pours) and check whether <blockerId> appears in its dependencies.
+For each cross-dep, resolve both endpoint names to bead IDs via the map above. A name absent from the map means that feature never poured — mark edgePresent:false (real coverage gap), do NOT title-search for it. For resolved pairs, run \`bd show <blockedId> --json\` and check whether <blockerId> appears in its dependency/blocked-by list.
 
 CONCERN TRACEABILITY (anti-rubber-stamp): if the plan is a lock (planSource=lock), read its \`concerns[]\` array. For EACH entry with \`status == "addressed"\`, classify its \`evidence\`:
 - If the evidence cites a **feature** (it names or clearly maps to a \`featureOrder[].name\`), this is a falsifiable claim: assert that >=1 open bead implements that feature (reuse the same feature->bead mapping you did above). If a feature-cited "addressed" concern has NO implementing bead, that concern is a LIE the DAG exposes — mark it \`covered: false\` (a gap).
@@ -849,7 +869,7 @@ Steps:
    - Get all open non-epic beads: \`bd list --status=open --json\` filtered.
    - For each pair (B1, B2): if neither depends on the other transitively (\`bd dep\` graph), AND their metadata.filesTouched arrays intersect (treat each entry as a glob; intersect if any pair string-equals OR matches via glob), surface { beadA, beadB, overlap: [<paths>] }.
    - Skip pairs where either bead has no filesTouched (they fall through to the post-merge gate in /build-batch).
-4. Cross-dep verification: for each entry in ${JSON.stringify(ParsedPlan.crossDeps)}, resolve names → IDs (via Phase 3 pours) and check the edge exists. Surface missing edges.
+4. Cross-dep verification: for each entry in ${JSON.stringify(ParsedPlan.crossDeps)}, resolve both endpoint names to bead IDs using this AUTHORITATIVE Phase 3 name→pour-root map: ${JSON.stringify(featureToPourRoot)} — do NOT resolve by title (molecule-epic titles are formula names like "crud-feature"/"integration-http", never feature names, so a title search always misses). A name absent from the map = that feature never poured; mark its edges applied:false. For resolved pairs, confirm the edge via \`bd show <blockedId> --json\`. Phase 3 already wired + verified these edges: ${JSON.stringify(crossDepWiring.verified)} — surface under missingCrossDeps only edges genuinely absent from the live DB, not edges you merely failed to resolve by title.
 
 Return JSON:
 {
@@ -907,7 +927,8 @@ const synthesisPayload = {
   atomize: AtomizeSummary,
   quality: qualityResults,
   fidelity: FidelityResult,
-  depAudit: DepAuditResult
+  depAudit: DepAuditResult,
+  crossDepWiring
 };
 
 // Structured return so the orchestrator can read reportPath back. Without a
@@ -949,8 +970,8 @@ Steps:
 ## Coverage (Phase 6.A — plan-to-dag)
 - <feature name> → <beadId(s)> ✓
 - <feature name> → **GAP** (no bead)
-- Cross-feature deps applied: <count>
-- Cross-feature deps missing: <list>
+- Cross-feature deps applied: <crossDepWiring.verifiedPresent — the edges Phase 3 wired AND verified by bead ID; this is the authoritative count, NOT a title-based re-count>
+- Cross-feature deps missing: <crossDepWiring.missing + crossDepWiring.skipped — each with its reason; an unpoured endpoint feature is the usual cause>
 
 ## Traceability (Phase 6.B — dag-to-plan)
 - Beads with plan citation: <count>
