@@ -17,6 +17,18 @@ The pipeline's canonical tech stack. `/vision` defaults every app to this stack 
 | Lint / format | Rust: `cargo fmt` + `clippy`. TS: `biome`. Python: `ruff`. | |
 | Hosting | Per-app — chosen at deploy time, not vision time. | Default: whatever the app needs; Postgres-compatible host. |
 
+## Production floor (mandatory, not opt-in)
+
+Production-readiness is **not** something a product must-have has to "happen to" pull in. `/decompose` Phase 3.5 injects a mandatory floor based on what the app declares, and gates it (a floor capability with no enforcement formula is NEEDS-FIX):
+
+| App declares… | Mandatory floor capabilities |
+| --- | --- |
+| **Data** (non-empty data model) | `observability` (otel traces/metrics), `audit-log`, `iac-deploy` — the app must be observable, auditable, and deployable |
+| **Auth** (auth in stack, an addressed authn/authz concern, or a must-have implying accounts) | additionally `authz` (access-control enforcement) and `abuse-surface` (input-validation / rate-limit on exposed surfaces) |
+| Neither (stateless no-auth tool) | empty floor |
+
+The floor is realized by enforcement formulas, the same way `concerns[]` and `nfrs[]` are (no `bd create`; a missing formula surfaces `recommendedFormula` and forces NEEDS-FIX). A capability already delivered by a product feature or an addressed concern is not poured twice. This is what stops a real data-backed app from shipping as skeleton+CRUD with no observability, audit, authz, or deploy path.
+
 ## Why this is pinned, not chosen per-app
 
 The human checkpoint in `/vision` is for **product** (problem, users, must-haves, non-goals, success metric), not **tech**. Re-litigating the stack per app burns the human's time on a decision that almost never changes the product outcome — and inconsistent stacks across apps make the formulas, retros, and shared skills more expensive to maintain.

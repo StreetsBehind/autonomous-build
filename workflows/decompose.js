@@ -312,7 +312,7 @@ Report the VERIFIED-PRESENT count, never the attempted count, as the headline. R
 // NEEDS-FIX. No double-pour: a concern/NFR already delivered by a product
 // feature's Phase 3 pour is skipped.
 // ---------------------------------------------------------------------------
-let concernEnforcement = { poured: [], missingFormula: [], skippedCoveredByFeature: [], errors: [], nfrPoured: [], nfrMissingFormula: [] };
+let concernEnforcement = { poured: [], missingFormula: [], skippedCoveredByFeature: [], errors: [], nfrPoured: [], nfrMissingFormula: [], floorPoured: [], floorMissingFormula: [], floorApplies: null };
 if (Context.planSource === 'lock') {
   phase('Concern enforcement');
   const ceSchema = {
@@ -324,7 +324,10 @@ if (Context.planSource === 'lock') {
       skippedCoveredByFeature: { type: 'array', items: { type: 'object' } },
       errors:                  { type: 'array', items: { type: 'object' } },
       nfrPoured:               { type: 'array', items: { type: 'object' } },
-      nfrMissingFormula:       { type: 'array', items: { type: 'object' } }
+      nfrMissingFormula:       { type: 'array', items: { type: 'object' } },
+      floorApplies:            { type: 'object' },                        // { declaresAuth, declaresData }
+      floorPoured:             { type: 'array', items: { type: 'object' } },
+      floorMissingFormula:     { type: 'array', items: { type: 'object' } }
     }
   };
   const ce = await agent(`
@@ -356,6 +359,14 @@ THEN, FOR EACH \`nfrs[]\` entry in the lock (the first-class measurable NFRs —
    - If NO installed formula fits → record under "nfrMissingFormula" ({nfrId: nfr.id, category, statement, target, recommendedFormula: "<one-line description of the formula that should exist>"}) and move on. DO NOT hand-create via \`bd create\`, DO NOT remap to a near-miss formula (T6 + T1).
 7. Pour the chosen formula, binding ONLY its declared vars (validate exactly as Phase 3). Bind \`nfr.target\` into the AC and \`nfr.verify\` into the testPlan so the poured bead is concrete and falsifiable. Reparent under ${ParsedPlan.appEpicId}. Set the description to cite \`nfr.id\` + \`nfr.statement\`. Record under "nfrPoured" ({nfrId: nfr.id, category, formula, pourRoot, acSummary}). On \`bd\` error → "errors" ({concernId: nfr.id, msg}).
 
+FINALLY, the MANDATORY PRODUCTION FLOOR (lbq.8 — production-readiness is not opt-in per-feature). Today only the app skeleton is always poured; auth/authz/observability/audit/IaC enter only if a product must-have happens to map to them, so a real app ships without them. Enforce a floor:
+8. Determine what the app DECLARES from the lock: \`declaresData\` = \`dataModel[]\` is non-empty; \`declaresAuth\` = \`stack.auth\` is present OR a \`concerns[]\` authn/authz entry is \`addressed\` OR any must-have implies user accounts / per-user data.
+9. The floor (each item applies only under its condition):
+   - declaresData → **observability**, **audit-log**, **iac-deploy** (a data-backed app must be observable, auditable, and deployable).
+   - declaresAuth → additionally **authz** (access-control enforcement) and **abuse-surface** (input-validation / rate-limit on any exposed surface).
+   For EACH applicable floor item: if it is ALREADY realized — an \`addressed\` concern poured above, or a product feature whose bead covers it — record nothing (no double-pour). Otherwise pour its enforcement formula (same formula-selection + var-validation rules as above): record under "floorPoured" ({floorItem, formula, pourRoot, acSummary}). If NO installed formula fits → record under "floorMissingFormula" ({floorItem, recommendedFormula}) — DO NOT hand-create (T6). A missing floor formula is a mandatory-floor gap (NEEDS-FIX), not a silent pass.
+   If neither declaresData nor declaresAuth (a genuinely stateless, no-auth tool), the floor is empty — record floorApplies and move on.
+
 Return JSON:
 {
   "poured": [{ "concernId": "...", "formula": "...", "pourRoot": "...", "acSummary": "..." }, ...],
@@ -363,14 +374,20 @@ Return JSON:
   "skippedCoveredByFeature": [{ "concernId": "...", "feature": "..." }, ...],
   "errors": [{ "concernId": "...", "msg": "..." }, ...],
   "nfrPoured": [{ "nfrId": "...", "category": "...", "formula": "...", "pourRoot": "...", "acSummary": "..." }, ...],
-  "nfrMissingFormula": [{ "nfrId": "...", "category": "...", "statement": "...", "target": "...", "recommendedFormula": "..." }, ...]
+  "nfrMissingFormula": [{ "nfrId": "...", "category": "...", "statement": "...", "target": "...", "recommendedFormula": "..." }, ...],
+  "floorApplies": { "declaresAuth": <bool>, "declaresData": <bool> },
+  "floorPoured": [{ "floorItem": "...", "formula": "...", "pourRoot": "...", "acSummary": "..." }, ...],
+  "floorMissingFormula": [{ "floorItem": "...", "recommendedFormula": "..." }, ...]
 }
 `, { label: 'concern-enforcement', phase: 'Concern enforcement', schema: ceSchema, agentType: 'general-purpose' });
   concernEnforcement = ce || concernEnforcement;
-  // normalize the optional NFR arrays so downstream gate logic never NPEs
+  // normalize the optional arrays so downstream gate logic never NPEs
   concernEnforcement.nfrPoured = concernEnforcement.nfrPoured || [];
   concernEnforcement.nfrMissingFormula = concernEnforcement.nfrMissingFormula || [];
-  log(`Concern+NFR enforcement: ${concernEnforcement.poured.length} concern-poured, ${concernEnforcement.nfrPoured.length} nfr-poured, ${concernEnforcement.missingFormula.length + concernEnforcement.nfrMissingFormula.length} missing-formula, ${concernEnforcement.skippedCoveredByFeature.length} covered-by-feature, ${concernEnforcement.errors.length} errors`);
+  concernEnforcement.floorPoured = concernEnforcement.floorPoured || [];
+  concernEnforcement.floorMissingFormula = concernEnforcement.floorMissingFormula || [];
+  log(`Concern+NFR+floor enforcement: ${concernEnforcement.poured.length} concern-poured, ${concernEnforcement.nfrPoured.length} nfr-poured, ${concernEnforcement.floorPoured.length} floor-poured, ${concernEnforcement.missingFormula.length + concernEnforcement.nfrMissingFormula.length + concernEnforcement.floorMissingFormula.length} missing-formula, ${concernEnforcement.skippedCoveredByFeature.length} covered-by-feature, ${concernEnforcement.errors.length} errors`);
+  if (concernEnforcement.floorApplies) log(`Production floor: declaresAuth=${concernEnforcement.floorApplies.declaresAuth}, declaresData=${concernEnforcement.floorApplies.declaresData}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -848,6 +865,7 @@ const qualityOk = !qualityVacuous && !qualityUndercovered;
 const concernEnforcementClean =
   (concernEnforcement.missingFormula || []).length === 0 &&
   (concernEnforcement.nfrMissingFormula || []).length === 0 &&
+  (concernEnforcement.floorMissingFormula || []).length === 0 &&
   (concernEnforcement.errors || []).length === 0;
 const blessed =
   pourFailed.length === 0 &&
@@ -960,12 +978,14 @@ Steps:
 - Successful: <N>
 - Failed: <list with feature + error>
 
-## Concern + NFR enforcement (Phase 3.5)
+## Concern + NFR + production-floor enforcement (Phase 3.5)
 <render from concernEnforcement; omit the whole section if planSource != lock>
+- Production floor: <floorApplies.declaresAuth / declaresData — which floor applies>
 - Concern enforcement beads poured: <concernEnforcement.poured: concernId → formula → pourRoot>
 - NFR enforcement beads poured: <concernEnforcement.nfrPoured: nfrId (category) → formula → pourRoot>
-- Covered by an existing feature (no separate bead): <skippedCoveredByFeature>
-- **MISSING FORMULA (forces NEEDS-FIX):** <missingFormula + nfrMissingFormula — each names the concern/NFR with no enforcement formula and the recommendedFormula that should exist. An unenforced NFR is a target that will never be tested or gated.>
+- Production-floor beads poured: <concernEnforcement.floorPoured: floorItem → formula → pourRoot>
+- Covered by an existing feature/concern (no separate bead): <skippedCoveredByFeature>
+- **MISSING FORMULA (forces NEEDS-FIX):** <missingFormula + nfrMissingFormula + floorMissingFormula — each names the concern/NFR/floor item with no enforcement formula and the recommendedFormula that should exist. An unenforced NFR or a missing production-floor capability (observability/audit/authz/IaC) is work that will never be tested or gated.>
 - Errors: <errors>
 
 ## Dep audit (Phase 7)

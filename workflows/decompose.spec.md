@@ -107,18 +107,19 @@ After all `pour-feature` agents complete, the orchestrator script also applies `
 
 ---
 
-## Phase 3.5 — Concern + NFR enforcement pours (lock only; bfo.10 / lbq.16)
+## Phase 3.5 — Concern + NFR + production-floor enforcement pours (lock only; bfo.10 / lbq.16 / lbq.8)
 
 **Agent:** `concern-enforcement` **Tools:** `Read`, `Bash`
 
-Two sources of non-feature work otherwise evaporate into advisory `tenets.md` prose — never a bead, never scored, never gated:
+Three sources of non-feature work otherwise evaporate into advisory `tenets.md` prose — never a bead, never scored, never gated:
 
 1. **Addressed concerns** (`concerns[]`) whose evidence is *not* a `featureOrder[]` entry (it cites a tenet/gate/stack-pin or a bare target). The product-feature pours don't cover them.
 2. **First-class NFRs** (`nfrs[]`) — measurable requirements (performance, security, privacy, compliance, data-residency, availability) with no home in the 10-concern vocabulary, e.g. "data stays in my region". This is the `lbq.16` field.
+3. **The mandatory production floor** (`lbq.8`) — production-readiness is NOT opt-in per product feature. Determine what the app declares: `declaresData` (non-empty `dataModel[]`), `declaresAuth` (`stack.auth`, an addressed authn/authz concern, or a must-have implying accounts). `declaresData` ⇒ floor `{observability, audit-log, iac-deploy}`; `declaresAuth` ⇒ additionally `{authz, abuse-surface}`. Each applicable floor item not already realized by a concern/feature is poured. A stateless no-auth tool has an empty floor.
 
-For each (skipping any already delivered by a product feature — no double-pour), select an **enforcement formula** matching the concern class / NFR category and pour a dedicated bead whose **AC comes from the target** and **testPlan from `verify`**, reparented under the app epic. **T6/T1:** never hand-create via `bd create` and never remap to a near-miss formula — if no installed formula fits, record it under `missingFormula` / `nfrMissingFormula` with a `recommendedFormula` description. `excluded` concerns are skipped.
+For each (skipping any already delivered by a product feature or an addressed concern — no double-pour), select an **enforcement formula** matching the concern class / NFR category / floor item and pour a dedicated bead whose **AC comes from the target** and **testPlan from `verify`**, reparented under the app epic. **T6/T1:** never hand-create via `bd create` and never remap to a near-miss formula — if no installed formula fits, record it under `missingFormula` / `nfrMissingFormula` / `floorMissingFormula` with a `recommendedFormula` description. `excluded` concerns are skipped.
 
-**Gate:** any `missingFormula` or `nfrMissingFormula` (or enforcement-pour error) means an NFR has a target that will never be tested — this forces **NEEDS-FIX** (`concernEnforcementClean` in the verdict), surfaced in the report's "Concern + NFR enforcement" section. Skipped entirely when `planSource != lock`.
+**Gate:** any `missingFormula` / `nfrMissingFormula` / `floorMissingFormula` (or enforcement-pour error) means a required target or production-floor capability will never be tested — this forces **NEEDS-FIX** (`concernEnforcementClean` in the verdict), surfaced in the report's "Concern + NFR + production-floor enforcement" section. Skipped entirely when `planSource != lock`.
 
 ---
 
