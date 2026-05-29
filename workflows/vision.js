@@ -658,8 +658,11 @@ function reverseTraceOrphans(featureOrder, coverage) {
 
 // musthave <-> non-goal contradiction (gate 8.6). Conservative substring check: a §5 non-goal forbids a
 // phrase (after stripping a leading negation, split on connectors); a must-have that CONTAINS that phrase
-// (>=6 chars) is requiring what the vision forbade. Substring keeps it precise — it errs toward NOT firing
-// (a false block of a coherent plan is the worse failure for a determinism harness; semantic depth is future work).
+// (>=6 chars) is requiring what the vision forbade. The phrase match is negation-aware on BOTH sides: just as
+// the non-goal strips a leading negator, a must-have occurrence that is itself NEGATED (e.g. "...no free-form
+// code generation") AGREES with the non-goal and must not fire — only a non-negated occurrence is a real
+// contradiction (g63). Substring keeps it precise — it errs toward NOT firing (a false block of a coherent
+// plan is the worse failure for a determinism harness; semantic depth is future work).
 function musthaveNongoalConflicts(mustHaves, nonGoals) {
   const mh = isArr(mustHaves) ? mustHaves : [];
   const out = [];
@@ -671,7 +674,17 @@ function musthaveNongoalConflicts(mustHaves, nonGoals) {
     for (const phrase of phrases) {
       for (const m of mh) {
         if (!isObj(m) || !nonEmptyStr(m.text)) continue;
-        if (m.text.toLowerCase().includes(phrase)) {
+        const text = m.text.toLowerCase();
+        // Negation-aware: walk every occurrence of the phrase; a real conflict needs at least one occurrence
+        // that is NOT immediately preceded by a negator (mirrors the leading-negation strip on the non-goal).
+        let idx = text.indexOf(phrase);
+        let conflict = false;
+        while (idx !== -1) {
+          const before = text.slice(0, idx).match(/([a-z']+)[\s:_/–—-]*$/);
+          if (!(before && /^(?:no|not|never|without|don'?t|avoid|exclude[ds]?)$/.test(before[1]))) { conflict = true; break; }
+          idx = text.indexOf(phrase, idx + phrase.length);
+        }
+        if (conflict) {
           const key = `${m.id}|${goal}`;
           if (!seen.has(key)) { seen.add(key); out.push({ mustHaveId: m.id, nonGoal: goal, phrase }); }
           break;
@@ -1501,6 +1514,16 @@ function runSelftest() {
     musthaveNongoalConflicts([{ id: 'M1', text: 'Provide time tracking for members' }], ['No time tracking']).length === 1);
   check('Phase4 musthave-nongoal: no false-fire when no must-have requires the non-goal',
     musthaveNongoalConflicts(p4frozen.mustHaves, p4frozen.nonGoals).length === 0);
+  // g63: a must-have that NEGATES the forbidden phrase agrees with the non-goal -> no conflict...
+  check('Phase4 musthave-nongoal: a negated must-have phrase does NOT false-fire (g63)',
+    musthaveNongoalConflicts(
+      [{ id: 'M1', text: 'Natural-language intake -> closed-grammar composition ... no free-form code generation' }],
+      ['Free-form / arbitrary code generation — closed-grammar only']).length === 0);
+  // ...but a genuine (non-negated) requirement of the same phrase still fires.
+  check('Phase4 musthave-nongoal: a non-negated contradiction still fires (g63)',
+    musthaveNongoalConflicts(
+      [{ id: 'M1', text: 'Generate free-form code at runtime' }],
+      ['Free-form / arbitrary code generation — closed-grammar only']).length === 1);
 
   // validateLock catches a schema breach the skeleton->lock mapping must prevent (a stray app.slug).
   const dirtyLock = JSON.parse(JSON.stringify(asmOk.lock)); dirtyLock.app.slug = 'tasklane';
