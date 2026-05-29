@@ -17,6 +17,31 @@ The pipeline's canonical tech stack. `/vision` defaults every app to this stack 
 | Lint / format | Rust: `cargo fmt` + `clippy`. TS: `biome`. Python: `ruff`. | |
 | Hosting | Per-app — chosen at deploy time, not vision time. | Default: whatever the app needs; Postgres-compatible host. |
 
+## Stack-native formulas (formula selection)
+
+The formula library carries **two kinds** of formula for several capabilities: a *generic* formula (JS/Python/REST-shaped — `app-skeleton`, `crud-feature`, `background-job`, `integration-http`) and a *stack-native variant* tuned to this pinned stack (Cargo workspace, tonic/gRPC, sqlx, Vite/React). The generic formulas exist for stacks that have no native variant; **on this pinned stack they are a fallback, not the default.**
+
+**Selection rule (`/vision` step 6):** for each feature, identify the capability, then pour the **stack-native variant if one covers that capability**. Fall back to a generic formula only when no native variant exists for the capability (currently only `migration`, which is shared — supply a Rust/sqlx-appropriate `up_outline`/`down_outline`).
+
+| Capability | Generic (fallback) | Stack-native — **prefer this** |
+| --- | --- | --- |
+| Repo / workspace skeleton (Rust core) | `app-skeleton` | `app-skeleton-rust-cargo` |
+| Frontend skeleton (product surface) | `app-skeleton` | `app-skeleton-vite-react` |
+| CRUD entity vertical slice | `crud-feature` | `crud-feature-rust` |
+| Non-CRUD gRPC service | — | `grpc-tonic-service` |
+| Closed grammar / composer version | — | `composer-grammar-version` |
+| Observability bootstrap | `app-skeleton` (misuse) | `otel-bootstrap-rust` |
+| Audit chain | `background-job` | `audit-chain-rust` |
+| Tenant-boot chokepoint | `background-job` | `tenant-boot-rust` |
+| OIDC auth client | `integration-http` | `oidc-client-rust` |
+| ReBAC authz model | `integration-http` | `openfga-model` |
+| IaC / cloud baseline | `app-skeleton` (terraform) | `terraform-aws-baseline` |
+| Schema migration | — | `migration` (shared; supply `down_outline`) |
+
+**The off-enum tell (how to catch a wrong pick before `/decompose`):** the generic formulas declare JS/Python-flavored enum vars — `app-skeleton.package_manager ∈ {npm,pnpm,uv,poetry,auto}`, `background-job.trigger_type ∈ {schedule,queue}`, `app-skeleton.language/framework`. If binding a feature to a generic formula forces an **off-enum** value (`package_manager=cargo`, `trigger_type=internal|cron`, `language=rust`), that is proof the generic formula is the wrong choice for this stack — a stack-native variant almost certainly exists; pick it instead. Do **not** remap to a near-miss enum value or invent one (T1: do not guess). This is exactly the run-2 smbuild defect (`autonomous-build-3fr.1`): 7 Rust features were bound to generic formulas and failed to pour off-enum.
+
+When a new stack-native formula lands (or the stack changes), add its row here so `/vision` selects it — same deliberate-edit rule as the stack table below.
+
 ## Production floor (mandatory, not opt-in)
 
 Production-readiness is **not** something a product must-have has to "happen to" pull in. `/decompose` Phase 3.5 injects a mandatory floor based on what the app declares, and gates it (a floor capability with no enforcement formula is NEEDS-FIX):
