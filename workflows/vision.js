@@ -506,7 +506,7 @@ These come from autonomous-build/docs/TENETS.md and apply to every build. One-li
 For the full text, hard-conflict resolutions, and "not tenets" list, see the workflow doc.`;
 
 // Top-level + nested allowed-key sets, mirroring the schema's additionalProperties:false.
-const LOCK_TOP_KEYS = ['schemaVersion', 'app', 'mustHaves', 'successMetric', 'stack', 'dataModel', 'featureOrder', 'coverage', 'concerns', 'crossFeatureDependencies', 'escalationBudget', 'openQuestions', 'incomplete', 'nfrs', 'agentConsults'];
+const LOCK_TOP_KEYS = ['schemaVersion', 'app', 'mustHaves', 'successMetric', 'phases', 'stack', 'dataModel', 'featureOrder', 'coverage', 'concerns', 'crossFeatureDependencies', 'escalationBudget', 'openQuestions', 'incomplete', 'nfrs', 'agentConsults'];
 
 function extraKeys(obj, allowed) {
   return isObj(obj) ? Object.keys(obj).filter((k) => !allowed.includes(k)) : [];
@@ -554,8 +554,61 @@ function reconcileConcerns(phase3, applicability) {
   return { lockConcerns, undecided, contradictions };
 }
 
-// Forward-coverage map: each non-deferred must-have -> the feature(s) delivering it (from featureOrder
-// mustHaveId bindings + addressed-concern coverageLinks) + a falsifiable HOW. Returns the uncovered ids too.
+// ---- Phased builds (epic autonomous-build-0ms) -------------------------------------------------
+// The skeleton AGENT applies the trigger+cut heuristic (judgment: which must-haves belong in a later
+// phase) and tags them — an explicit mustHaves[].phase (int) or the legacy boolean deferred (=> phase 2).
+// Pure JS here derives the phase NUMBER and the phases[] structure mechanically: the agent judges, the
+// workflow assembles (the determinism discipline). A plan whose must-haves are all phase 1 is a SINGLE-phase
+// plan — no phases[], no phase tags — byte-identical to the pre-phases lock (backward-compatible).
+function phaseOf(entry) {
+  if (!isObj(entry)) return 1;
+  if (Number.isInteger(entry.phase) && entry.phase >= 1) return entry.phase;
+  if (entry.deferred === true) return 2;
+  return 1;
+}
+// A feature's phase: explicit phase, else the phase of the must-have it delivers (mustHaveId), else 1
+// (skeleton/infra features with no must-have binding ride in phase 1).
+function featurePhase(feature, mustHaves) {
+  if (isObj(feature) && Number.isInteger(feature.phase) && feature.phase >= 1) return feature.phase;
+  const mhId = isObj(feature) ? feature.mustHaveId : null;
+  if (nonEmptyStr(mhId)) {
+    const m = (isArr(mustHaves) ? mustHaves : []).find((x) => isObj(x) && x.id === mhId);
+    if (m) return phaseOf(m);
+  }
+  return 1;
+}
+// Distinct phase numbers across must-haves + features, ascending. <=1 distinct phase => single-phase (null).
+// Phase 1 is the walking skeleton (active, non-provisional); every later phase is planned + provisional
+// (a sketch /replan firms up when reached). name/goal use the agent's `phases` hint when it gave one, else
+// are synthesized (phase 1 from the success metric; later phases from their assigned must-have texts).
+function derivePhases(mustHaves, featureOrder, successMetric, agentPhases) {
+  const mh = isArr(mustHaves) ? mustHaves : [];
+  const fo = isArr(featureOrder) ? featureOrder : [];
+  const nums = new Set();
+  for (const m of mh) nums.add(phaseOf(m));
+  for (const f of fo) nums.add(featurePhase(f, mh));
+  const ids = Array.from(nums).filter((n) => Number.isInteger(n) && n >= 1).sort((a, b) => a - b);
+  if (ids.length <= 1) return null; // single-phase plan: emit no phases[]
+  const meta = {};
+  (isArr(agentPhases) ? agentPhases : []).forEach((p) => { if (isObj(p) && Number.isInteger(p.id)) meta[p.id] = p; });
+  const sm = isObj(successMetric) ? successMetric : {};
+  const smText = nonEmptyStr(sm.statement) ? sm.statement : (isArr(sm.steps) ? sm.steps.filter(nonEmptyStr).join(' → ') : '');
+  return ids.map((id) => {
+    const m = meta[id] || {};
+    const mhTexts = mh.filter((x) => phaseOf(x) === id && nonEmptyStr(x.text)).map((x) => x.text);
+    const name = nonEmptyStr(m.name) ? m.name : (id === 1 ? 'Walking skeleton' : `Phase ${id}`);
+    const goal = nonEmptyStr(m.goal) ? m.goal
+      : (id === 1
+        ? (smText ? `Walking skeleton: make the success metric run end-to-end (${smText}).` : 'Walking skeleton: the minimal end-to-end flow.')
+        : (mhTexts.length ? `Deliver: ${mhTexts.join('; ')}.` : `Phase ${id}.`));
+    return { id, name, goal, status: id === 1 ? 'active' : 'planned', provisional: id !== 1 };
+  });
+}
+
+// Forward-coverage map: each must-have -> the feature(s) delivering it (from featureOrder mustHaveId
+// bindings + addressed-concern coverageLinks) + a falsifiable HOW. Returns the uncovered ids too. A
+// future-phase (deferred) must-have with no feature yet is a legitimate deferral (covered-in-phase-N,
+// epic 0ms), NOT an uncovered gap — only a PHASE-1 must-have with no feature counts as uncovered.
 function buildCoverage(mustHaves, featureOrder, phase3) {
   const mh = isArr(mustHaves) ? mustHaves : [];
   const fo = isArr(featureOrder) ? featureOrder : [];
@@ -570,10 +623,9 @@ function buildCoverage(mustHaves, featureOrder, phase3) {
   const uncovered = [];
   for (const m of mh) {
     if (!isObj(m) || !nonEmptyStr(m.id)) continue;
-    if (m.deferred === true) continue;
     const fromFeatures = fo.filter((f) => isObj(f) && f.mustHaveId === m.id && nonEmptyStr(f.name)).map((f) => f.name);
     const features = Array.from(new Set([...fromFeatures, ...(linkByMh[m.id] || [])]));
-    if (!features.length) { uncovered.push(m.id); continue; }
+    if (!features.length) { if (phaseOf(m) === 1) uncovered.push(m.id); continue; }
     const hows = features.map((name) => {
       const f = fo.find((x) => isObj(x) && x.name === name);
       const formulas = (f && isArr(f.formulas)) ? f.formulas.filter(nonEmptyStr) : [];
@@ -672,6 +724,8 @@ function runGatesV4(g) {
 // gate openQuestions. This is the mechanical skeleton->lock mapping: drop app.slug, mustHaves[].deferred,
 // successMetric.statement, and featureOrder[].mustHaveId (none are lock keys); decompose successMetric into
 // {id,text} steps; map stack to enum keys. incomplete falls out of the blocking openQuestions (schema def).
+// Phased builds (epic 0ms): when the skeleton splits work across phases, derive phases[] and tag every
+// mustHaves[]/featureOrder[] entry with its phase; a single-phase plan emits neither (backward-compatible).
 function assembleLock(a) {
   const f = a.frozen;
   const sm = isObj(f.successMetric) ? f.successMetric : {};
@@ -679,14 +733,18 @@ function assembleLock(a) {
   const successSteps = steps.length
     ? steps.map((text, i) => ({ id: `S${i + 1}`, text }))
     : [{ id: 'S1', text: nonEmptyStr(sm.statement) ? sm.statement : 'Success metric.' }];
-  const featureOrder = (isArr(f.featureOrder) ? f.featureOrder : [])
-    .filter((x) => isObj(x) && nonEmptyStr(x.name) && isArr(x.formulas) && x.formulas.filter(nonEmptyStr).length >= 1)
-    .map((x) => {
-      const out = { name: x.name, formulas: x.formulas.filter(nonEmptyStr) };
-      if (isObj(x.vars) && Object.keys(x.vars).length) out.vars = x.vars;
-      if (nonEmptyStr(x.notes)) out.notes = x.notes;
-      return out;
-    });
+  const mhList = (isArr(f.mustHaves) ? f.mustHaves : []).filter((m) => isObj(m) && nonEmptyStr(m.id) && nonEmptyStr(m.text));
+  const rawFeatures = (isArr(f.featureOrder) ? f.featureOrder : [])
+    .filter((x) => isObj(x) && nonEmptyStr(x.name) && isArr(x.formulas) && x.formulas.filter(nonEmptyStr).length >= 1);
+  const phases = derivePhases(mhList, rawFeatures, sm, f.phases);
+  const multiPhase = isArr(phases) && phases.length > 1;
+  const featureOrder = rawFeatures.map((x) => {
+    const out = { name: x.name, formulas: x.formulas.filter(nonEmptyStr) };
+    if (isObj(x.vars) && Object.keys(x.vars).length) out.vars = x.vars;
+    if (nonEmptyStr(x.notes)) out.notes = x.notes;
+    if (multiPhase) out.phase = featurePhase(x, mhList);
+    return out;
+  });
   const dataModel = (isArr(f.dataModel) ? f.dataModel : [])
     .filter((e) => isObj(e) && nonEmptyStr(e.entity))
     .map((e) => {
@@ -707,7 +765,7 @@ function assembleLock(a) {
   const lock = {
     schemaVersion: 2,
     app,
-    mustHaves: (isArr(f.mustHaves) ? f.mustHaves : []).filter((m) => isObj(m) && nonEmptyStr(m.id) && nonEmptyStr(m.text)).map((m) => ({ id: m.id, text: m.text })),
+    mustHaves: mhList.map((m) => { const o = { id: m.id, text: m.text }; if (multiPhase) o.phase = phaseOf(m); return o; }),
     successMetric: { steps: successSteps },
     stack: mapStack(f.stack),
     dataModel,
@@ -719,6 +777,7 @@ function assembleLock(a) {
     openQuestions,
     incomplete: openQuestions.some((q) => q && q.blockingCompose === true)
   };
+  if (multiPhase) lock.phases = phases;
   if (agentConsults.length) lock.agentConsults = agentConsults;
   return lock;
 }
@@ -740,7 +799,10 @@ function validateLock(pl, concernIds = CONCERN_IDS) {
   if (!isArr(pl.mustHaves)) errors.push('mustHaves must be an array');
   else pl.mustHaves.forEach((m, i) => {
     if (!isObj(m) || !nonEmptyStr(m.id) || !nonEmptyStr(m.text)) errors.push(`mustHaves[${i}] needs {id,text}`);
-    else for (const k of extraKeys(m, ['id', 'text'])) errors.push(`mustHaves[${i}].${k} not allowed`);
+    else {
+      if ('phase' in m && !(Number.isInteger(m.phase) && m.phase >= 1)) errors.push(`mustHaves[${i}].phase must be an integer >= 1`);
+      for (const k of extraKeys(m, ['id', 'text', 'phase'])) errors.push(`mustHaves[${i}].${k} not allowed`);
+    }
   });
 
   if (!isObj(pl.successMetric) || !isArr(pl.successMetric.steps)) errors.push('successMetric.steps must be an array');
@@ -765,8 +827,25 @@ function validateLock(pl, concernIds = CONCERN_IDS) {
   if (!isArr(pl.featureOrder)) errors.push('featureOrder must be an array');
   else pl.featureOrder.forEach((f, i) => {
     if (!isObj(f) || !nonEmptyStr(f.name) || !isArr(f.formulas) || f.formulas.length < 1) errors.push(`featureOrder[${i}] needs {name,formulas>=1}`);
-    else for (const k of extraKeys(f, ['name', 'formulas', 'vars', 'notes'])) errors.push(`featureOrder[${i}].${k} not allowed`);
+    else {
+      if ('phase' in f && !(Number.isInteger(f.phase) && f.phase >= 1)) errors.push(`featureOrder[${i}].phase must be an integer >= 1`);
+      for (const k of extraKeys(f, ['name', 'formulas', 'vars', 'notes', 'phase'])) errors.push(`featureOrder[${i}].${k} not allowed`);
+    }
   });
+
+  // phases[] (optional; epic 0ms): well-formed when present. A single-phase plan omits it entirely.
+  if ('phases' in pl) {
+    if (!isArr(pl.phases)) errors.push('phases must be an array');
+    else pl.phases.forEach((p, i) => {
+      if (!isObj(p)) { errors.push(`phases[${i}] not an object`); return; }
+      if (!(Number.isInteger(p.id) && p.id >= 1)) errors.push(`phases[${i}].id must be an integer >= 1`);
+      if (!nonEmptyStr(p.name)) errors.push(`phases[${i}].name missing`);
+      if (!nonEmptyStr(p.goal)) errors.push(`phases[${i}].goal missing`);
+      if (!['planned', 'active', 'built'].includes(p.status)) errors.push(`phases[${i}].status must be planned|active|built`);
+      if (typeof p.provisional !== 'boolean') errors.push(`phases[${i}].provisional must be a boolean`);
+      for (const k of extraKeys(p, ['id', 'name', 'goal', 'status', 'provisional'])) errors.push(`phases[${i}].${k} not allowed`);
+    });
+  }
 
   if (!isArr(pl.coverage)) errors.push('coverage must be an array');
   else pl.coverage.forEach((c, i) => {
@@ -809,7 +888,13 @@ function validateLock(pl, concernIds = CONCERN_IDS) {
     }
     if (isArr(pl.mustHaves) && isArr(pl.coverage)) {
       const covered = new Set(pl.coverage.filter((c) => isArr(c.features) && c.features.length >= 1).map((c) => c.mustHaveId));
-      for (const m of pl.mustHaves) if (m && !covered.has(m.id)) errors.push(`complete plan leaves must-have "${m.id}" uncovered`);
+      // A future-phase (phase >= 2) must-have is a deliberate deferral (covered-in-phase-N, epic 0ms),
+      // exempt from the phase-1 forward-coverage requirement; a phase-1 must-have must still be covered.
+      for (const m of pl.mustHaves) {
+        if (!m) continue;
+        const ph = Number.isInteger(m.phase) ? m.phase : 1;
+        if (ph === 1 && !covered.has(m.id)) errors.push(`complete plan leaves must-have "${m.id}" uncovered`);
+      }
     }
   }
   return { ok: errors.length === 0, errors };
@@ -870,8 +955,14 @@ function renderPlanMd(lock) {
     L.push(`> ⚠️ **INCOMPLETE** — ${n} blocking open question(s). \`/decompose\` will refuse this plan until they are resolved in vision.md and \`/vision\` is re-run.`, '');
   }
   if (isObj(lock.app) && nonEmptyStr(lock.app.description)) L.push(lock.app.description, '');
+  if (isArr(lock.phases) && lock.phases.length) {
+    L.push('## Phases', '');
+    L.push('> Proposed phase split (epic 0ms) — review at the vision gate. Phase 1 is fully decided and decompose-ready; later phases are provisional sketches that `/replan` firms up when reached.', '');
+    lock.phases.forEach((p) => L.push(`${p.id}. **${p.name}** — _${p.status}${p.provisional ? ', provisional' : ''}_ — ${p.goal}`));
+    L.push('');
+  }
   L.push('## Must-haves', '');
-  (lock.mustHaves || []).forEach((m) => L.push(`- **${m.id}**: ${m.text}`));
+  (lock.mustHaves || []).forEach((m) => L.push(`- **${m.id}**${Number.isInteger(m.phase) ? ` _(phase ${m.phase})_` : ''}: ${m.text}`));
   L.push('', '## Success metric', '');
   (lock.successMetric.steps || []).forEach((s) => L.push(`- **${s.id}**: ${s.text}`));
   L.push('', '## Stack', '');
@@ -879,7 +970,7 @@ function renderPlanMd(lock) {
   L.push('', '## Data model', '');
   (lock.dataModel || []).forEach((e) => L.push(`- **${e.entity}** — fields: ${(e.fields || []).join(', ') || '(none)'}${(e.relationships && e.relationships.length) ? `; relationships: ${e.relationships.join(', ')}` : ''}`));
   L.push('', '## Feature order', '');
-  (lock.featureOrder || []).forEach((f, i) => L.push(`${i + 1}. **${f.name}** — formulas: ${(f.formulas || []).join(', ')}`));
+  (lock.featureOrder || []).forEach((f, i) => L.push(`${i + 1}. **${f.name}**${Number.isInteger(f.phase) ? ` _(phase ${f.phase})_` : ''} — formulas: ${(f.formulas || []).join(', ')}`));
   L.push('', '## Coverage (must-have → feature)', '');
   (lock.coverage || []).forEach((c) => L.push(`- **${c.mustHaveId}** → ${(c.features || []).join(', ')}: ${c.how}`));
   L.push('', '## Concerns', '');
@@ -950,13 +1041,14 @@ ${DEFAULT_STACK}
 
 PRODUCE (return ONLY the structured object; its schema is enforced):
 1. app: { name, slug, summary } — name/summary from §1 + §10; slug = kebab-case of the name.
-2. mustHaves: echo the ids + texts above VERBATIM (set deferred:true only if the vision itself defers a must-have).
+2. mustHaves: echo the ids + texts above VERBATIM. PHASING (epic 0ms) — default to a SINGLE phase. Propose a multi-phase split ONLY when (a) the must-have set is too big to be one reviewable build, OR (b) a subset is not needed for the core end-to-end success-metric flow ("could ship without it"). When you split, tag each must-have with \`phase\` (integer, 1-based): phase 1 = the WALKING SKELETON — the minimal must-haves that make successMetric run end-to-end; later phases = the remaining must-haves grouped by dependency layer + subsystem cohesion, with any risky / off-stack feature isolated into its OWN phase. Cross-phase deps point backward only (phase N+1 may rely on N, never the reverse). NEVER drop a later-phase must-have — tag it, never omit it (this is the vanishing-must-have fix). (\`deferred:true\` is the legacy spelling of phase 2.)
 3. successMetric: { statement: <the success-metric text>, steps: [<one observable action per step, in order>] }.
 4. stack: one entry per layer from the pinned table above, each { choice, why } where "why" cites DEFAULT_STACK.
 5. dataModel: [{ entity, fields:[...], relationships:[...] }] — the entities the §3 must-haves imply. Do NOT invent entities no must-have needs.
-6. featureOrder: [{ name, formulas:[...], vars:{...}, mustHaveId }] — build order, deps respected (auth before per-user data). Pick the STACK-NATIVE formula variant per the map above; a generic formula (app-skeleton / crud-feature / background-job / integration-http) is a FALLBACK only when no native variant covers the capability. Honor the off-enum tell. Run \`bd formula list\` / \`bd formula show <name>\` to bind only declared var names and enum-valid values. If a must-have has NO matching formula, add { token:'no-matching-formula', note } to blocks instead of forcing a near-miss.
-7. nonGoals: the non-goals (§5) array verbatim.
-8. signals: report ONLY observable facts about the vision as booleans (the workflow derives concern applicability from these in PURE JS — be accurate, not generous):
+6. featureOrder: [{ name, formulas:[...], vars:{...}, mustHaveId, phase }] — build order, deps respected (auth before per-user data). Pick the STACK-NATIVE formula variant per the map above; a generic formula (app-skeleton / crud-feature / background-job / integration-http) is a FALLBACK only when no native variant covers the capability. Honor the off-enum tell. Run \`bd formula list\` / \`bd formula show <name>\` to bind only declared var names and enum-valid values. If a must-have has NO matching formula, add { token:'no-matching-formula', note } to blocks instead of forcing a near-miss. When you split phases (item 2), tag each feature's \`phase\` to match the must-have it delivers (a skeleton/infra feature with no must-have binding rides in phase 1); the workflow defaults an untagged feature to phase 1.
+7. phases: ONLY when you proposed a multi-phase split — [{ id, name, goal }], one entry per phase number you used, in order (phase 1 = the walking skeleton). Give a short name + one-line goal; the workflow sets status/provisional mechanically (phase 1 active+decided, later phases planned+provisional). Omit this field entirely for a single-phase plan.
+8. nonGoals: the non-goals (§5) array verbatim.
+9. signals: report ONLY observable facts about the vision as booleans (the workflow derives concern applicability from these in PURE JS — be accurate, not generous):
    - impliesAccounts: a must-have implies user accounts / per-user data / login.
    - multipleHumanRoles: §2 lists more than one human role.
    - multiplePrincipals: more than one distinct principal (human or service) acts on data.
@@ -1078,13 +1170,14 @@ const SKELETON_SCHEMA = {
       required: ['app', 'mustHaves', 'successMetric', 'stack', 'dataModel', 'featureOrder', 'nonGoals'],
       properties: {
         app: { type: 'object', required: ['name', 'slug'], properties: { name: { type: 'string' }, slug: { type: 'string' }, summary: { type: 'string' } } },
-        mustHaves: { type: 'array', items: { type: 'object', required: ['id', 'text'], properties: { id: { type: 'string' }, text: { type: 'string' }, deferred: { type: 'boolean' } } } },
+        mustHaves: { type: 'array', items: { type: 'object', required: ['id', 'text'], properties: { id: { type: 'string' }, text: { type: 'string' }, deferred: { type: 'boolean' }, phase: { type: 'integer' } } } },
         successMetric: { type: 'object', required: ['statement', 'steps'], properties: { statement: { type: 'string' }, steps: { type: 'array', items: { type: 'string' } } } },
         stack: { type: 'object' },
         dataModel: { type: 'array', items: { type: 'object', required: ['entity'], properties: { entity: { type: 'string' }, fields: { type: 'array' }, relationships: { type: 'array' } } } },
-        featureOrder: { type: 'array', items: { type: 'object', required: ['name', 'formulas'], properties: { name: { type: 'string' }, formulas: { type: 'array', items: { type: 'string' } }, vars: { type: 'object' }, mustHaveId: { type: 'string' } } } },
+        featureOrder: { type: 'array', items: { type: 'object', required: ['name', 'formulas'], properties: { name: { type: 'string' }, formulas: { type: 'array', items: { type: 'string' } }, vars: { type: 'object' }, mustHaveId: { type: 'string' }, phase: { type: 'integer' } } } },
         nonGoals: { type: 'array', items: { type: 'string' } },
-        agentConsults: { type: 'array' }
+        agentConsults: { type: 'array' },
+        phases: { type: 'array', items: { type: 'object', required: ['id'], properties: { id: { type: 'integer' }, name: { type: 'string' }, goal: { type: 'string' } } } }
       }
     },
     signals: {
@@ -1376,6 +1469,71 @@ function runSelftest() {
   check('Phase4 agentConsults: lock-shaped consult passes through, malformed one dropped, lock still valid',
     asmConsult.ok && isArr(asmConsult.lock.agentConsults) && asmConsult.lock.agentConsults.length === 1 && asmConsult.lock.agentConsults[0].reversalCost === 'low — swap the trigger');
 
+  // ---- Phased builds (epic autonomous-build-0ms): phase split + retained deferred must-haves ----
+  // Single-phase baseline: the p4 fixture has no deferred must-have -> NO phases[], no phase tags (backward-compatible).
+  check('Phased: a single-phase plan emits NO phases[] and no phase tags (backward-compatible)',
+    !('phases' in asmOk.lock) && asmOk.lock.mustHaves.every((m) => !('phase' in m)) && asmOk.lock.featureOrder.every((f) => !('phase' in f)));
+
+  // Multi-phase: the skeleton agent defers M2 (its judgment via deferred:true); pure JS derives phases[] + phase tags.
+  const phasedFrozen = deepFreeze({
+    ...JSON.parse(JSON.stringify(p4frozen)),
+    mustHaves: [{ id: 'M1', text: 'Admins invite members' }, { id: 'M2', text: 'Members create and assign tasks', deferred: true }],
+    featureOrder: [
+      { name: 'Platform', formulas: ['app-skeleton-rust-cargo'] },
+      { name: 'Auth', formulas: ['oidc-client-rust'], vars: { provider: 'zitadel' }, mustHaveId: 'M1' },
+      { name: 'Tasks', formulas: ['crud-feature-rust'], mustHaveId: 'M2' }
+    ]
+  });
+  const asmPhased = reconcileAndAssemble({ frozen: phasedFrozen, applicability: p4appl, concerns: decidedConcerns, blocks: [], sections: {} });
+  check('Phased VERIFY: a multi-phase plan yields phases[] (phase 1 active+decided, phase 2 planned+provisional)',
+    isArr(asmPhased.lock.phases) && asmPhased.lock.phases.length === 2
+    && asmPhased.lock.phases[0].id === 1 && asmPhased.lock.phases[0].status === 'active' && asmPhased.lock.phases[0].provisional === false && nonEmptyStr(asmPhased.lock.phases[0].goal)
+    && asmPhased.lock.phases[1].id === 2 && asmPhased.lock.phases[1].status === 'planned' && asmPhased.lock.phases[1].provisional === true);
+  check('Phased VERIFY: the deferred must-have survives into the lock with a phase tag (no vanishing)',
+    asmPhased.lock.mustHaves.some((m) => m.id === 'M2' && m.phase === 2) && asmPhased.lock.mustHaves.some((m) => m.id === 'M1' && m.phase === 1));
+  check('Phased: features inherit the phase of the must-have they deliver (Tasks->2, Auth->1, infra Platform->1)',
+    asmPhased.lock.featureOrder.find((f) => f.name === 'Tasks').phase === 2 && asmPhased.lock.featureOrder.find((f) => f.name === 'Auth').phase === 1 && asmPhased.lock.featureOrder.find((f) => f.name === 'Platform').phase === 1);
+  check('Phased: the assembled multi-phase lock is schema-valid + complete (deferred M2 covered-in-phase, not a gap)',
+    asmPhased.ok && asmPhased.validationErrors.length === 0 && asmPhased.incomplete === false);
+  check('Phased: plan.md renders the phase split at the human gate',
+    asmPhased.planMd.includes('## Phases') && /Walking skeleton/.test(asmPhased.planMd) && /phase 2/.test(asmPhased.planMd));
+
+  // The forward-coverage gate is NOT weakened: a PHASE-1 must-have with no feature still blocks.
+  const phasedGap = deepFreeze({ ...JSON.parse(JSON.stringify(phasedFrozen)), featureOrder: phasedFrozen.featureOrder.filter((f) => f.mustHaveId !== 'M1') });
+  const asmGap = reconcileAndAssemble({ frozen: phasedGap, applicability: p4appl, concerns: decidedConcerns.filter((c) => c.concernId !== 'authn'), blocks: [], sections: {} });
+  check('Phased: a PHASE-1 must-have with no feature still blocks forward-coverage (gate not weakened)',
+    asmGap.incomplete === true && asmGap.openQuestions.some((q) => GATE_TOKENS['forward-coverage'].test(q.context)));
+
+  // A deferred (phase-2) must-have with NO feature yet is a legitimate deferral (covered-in-phase-N), NOT a block.
+  const phasedDeferNoFeat = deepFreeze({
+    ...JSON.parse(JSON.stringify(p4frozen)),
+    mustHaves: [{ id: 'M1', text: 'Admins invite members' }, { id: 'M2', text: 'Members create and assign tasks', deferred: true }],
+    featureOrder: [
+      { name: 'Platform', formulas: ['app-skeleton-rust-cargo'] },
+      { name: 'Auth', formulas: ['oidc-client-rust'], vars: { provider: 'zitadel' }, mustHaveId: 'M1' }
+    ]
+  });
+  const asmDeferNoFeat = reconcileAndAssemble({ frozen: phasedDeferNoFeat, applicability: p4appl, concerns: decidedConcerns, blocks: [], sections: {} });
+  check('Phased: a deferred phase-2 must-have with no feature yet is a legitimate deferral, not a forward-coverage block',
+    asmDeferNoFeat.ok && asmDeferNoFeat.incomplete === false
+    && asmDeferNoFeat.lock.mustHaves.some((m) => m.id === 'M2' && m.phase === 2)
+    && !asmDeferNoFeat.openQuestions.some((q) => GATE_TOKENS['forward-coverage'].test(q.context)));
+
+  // validateLock guards the new fields directly.
+  const badPhaseTag = JSON.parse(JSON.stringify(asmPhased.lock)); badPhaseTag.mustHaves[0].phase = 0;
+  check('validateLock rejects a must-have phase < 1', validateLock(badPhaseTag).ok === false);
+  const badPhaseStatus = JSON.parse(JSON.stringify(asmPhased.lock)); badPhaseStatus.phases[1].status = 'bogus';
+  check('validateLock rejects a phases[].status outside planned|active|built',
+    validateLock(badPhaseStatus).ok === false && validateLock(badPhaseStatus).errors.some((e) => /status must be/.test(e)));
+  const badPhaseKey = JSON.parse(JSON.stringify(asmPhased.lock)); badPhaseKey.phases[0].owner = 'x';
+  check('validateLock rejects an unknown phases[] key (additionalProperties)', validateLock(badPhaseKey).ok === false);
+
+  // derivePhases / phaseOf unit edges: explicit phase int wins over deferred; all-phase-1 => single-phase (null).
+  check('phaseOf: explicit phase int wins; deferred=>2; default=>1',
+    phaseOf({ phase: 3 }) === 3 && phaseOf({ deferred: true }) === 2 && phaseOf({}) === 1);
+  check('derivePhases: an all-phase-1 must-have set is single-phase (returns null)',
+    derivePhases([{ id: 'M1', text: 'a' }, { id: 'M2', text: 'b' }], [], {}) === null);
+
   const passed = results.filter((r) => r.pass).length;
   return { results, passed, total: results.length, ok: passed === results.length };
 }
@@ -1501,6 +1659,7 @@ if (typeof agent === 'function') {
     normalizeSkeleton, detectOffEnumPicks, runSelftest,
     concernBlock, isDecided, concernInputs, normalizeConcernResult,
     standardExclusion, reconcileConcerns, buildCoverage, reverseTraceOrphans,
+    phaseOf, featurePhase, derivePhases,
     musthaveNongoalConflicts, parseEscalationBudget, mapStack, runGatesV4,
     assembleLock, validateLock, renderTenets, renderPlanMd, reconcileAndAssemble, siblingPath,
     intakePrompt, skeletonPrompt, concernPrompt, assemblePrompt, parseArgs,
