@@ -72,6 +72,22 @@ Turn a `vision.md` into a `plan.md` the rest of the pipeline can consume.
 
    Write `concerns[]` into `plan.lock.json` (one entry per concern: `{concernId, status, evidence}` when addressed, `{concernId, status, reason}` when excluded). Add a `## Concerns` table to `plan.md` (see structure below). (The decidedness + required-excluded contradiction *gate* is step 8.6.)
 
+8.6. **Concern decidedness gate (the teeth).** This turns the concerns table from documentation into enforcement — the concern analog of step 6.6. Two assertions, both routing through the same `openQuestions` → `incomplete: true` plumbing the must-have gate uses (so `/decompose` Phase 1 refuses with the reason; `decompose.spec.md` step 4 — no new downstream code):
+
+   - **Decidedness.** Every concern whose derived applicability is `required` or `optional` (i.e. *applicable*) must have a decided `status` in `concerns[]`. An applicable concern left undecided (absent, or present with neither valid `evidence` nor `reason`) appends a blocking `openQuestions[]` entry:
+
+     ```jsonc
+     { "question": "Concern <concernId> is applicable (<required|optional>) but left undecided — address it (with evidence) or exclude it (with reason).", "blockingCompose": true, "context": "Concern decidedness gate (docs/PLAN_CONCERNS.md): silence is the failure mode this prevents." }
+     ```
+
+   - **Required + excluded contradiction.** A concern whose derived applicability is `required` but whose `status` is `excluded` is a contradiction — the plan excluded something the product needs, or the derivation misread the product. `/vision` does **not** resolve it; it appends a blocking `openQuestions[]` entry for the human:
+
+     ```jsonc
+     { "question": "Concern <concernId> is REQUIRED by the vision (<which §3/§6/§8 signal>) but the plan marks it excluded (\"<reason>\") — correct the vision or confirm the exclusion.", "blockingCompose": true, "context": "Required+excluded contradiction (docs/PLAN_CONCERNS.md decided-state rule)." }
+     ```
+
+   Either case flips `incomplete: true`. Do **not** paper over an undecided or contradicted concern — surface the blocking question and let the human resolve it. Report PASS/offenders in the closing summary (see "Closing summary").
+
 9. **Derive the tenets.** Tenets are the principles the loop falls back on for build-time judgment calls — what to do when the bead spec, formula, gate, and lock don't decide for it. Produce `tenets.md` in the app repo from [`autonomous-build/templates/tenets.md`](../../templates/tenets.md):
 
    - The "Inherited workflow tenets" section is copied verbatim from the template — it summarizes T1–T10 from [`autonomous-build/docs/TENETS.md`](../../docs/TENETS.md). Do not paraphrase; the bullets are deliberately load-bearing.
