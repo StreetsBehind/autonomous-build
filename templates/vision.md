@@ -14,6 +14,8 @@ Who uses this? If multiple roles, list each. For each: what do they want to acco
 
 The features without which this app does not work. Be ruthless — anything optional goes in §4.
 
+> `/vision` assigns each must-have a stable ID (`M1`, `M2`, …) and maps it to the feature(s) that deliver it in a **coverage map**. A must-have that maps to no feature blocks the build. So write **one discrete capability per bullet** — if a bullet bundles two independent things, split it, or the coverage map can't tell which feature owns which half.
+
 - [ ] ...
 - [ ] ...
 
@@ -49,6 +51,8 @@ Things this app explicitly will NOT do. This is the most valuable section — it
 How will you know the app is working? One concrete observable, not a vibe.
 
 > e.g. "I can sign up, create a habit, log it for 3 days, and see a streak count of 3."
+>
+> `/vision` decomposes this into observable steps (`S1`, `S2`, …) — the example above becomes S1 sign up, S2 create a habit, S3 log it 3 days, S4 see a streak of 3. Phrase it as a sequence of checkable actions, not a single fuzzy outcome, so each step can be traced to a feature.
 
 ## 9. Escalation budget
 

@@ -15,7 +15,10 @@ Turn a `vision.md` into a `plan.md` the rest of the pipeline can consume.
 
 ## Process
 
-1. **Read `vision.md` end to end.** Do not skim. Quote back to the user the *non-goals*, *constraints*, and *success metric* so they can correct you before you commit to choices.
+1. **Read `vision.md` end to end.** Do not skim. Then:
+   - **Assign a stable ID to each §3 must-have** — `M1`, `M2`, … in document order. These IDs are load-bearing: they become `mustHaves[]` in the lock and the left column of the coverage map, and the forward-coverage gate (step 6.5) checks every one is delivered. One ID per discrete must-have; if a §3 bullet bundles two independent capabilities, split it into two IDs.
+   - **Decompose the §8 success metric into observable steps** — `S1`, `S2`, … one per observable action/assertion in the metric (e.g. "I can sign up, create a habit, log it 3 days, see a streak of 3" → S1 sign up, S2 create habit, S3 log 3 days, S4 streak shows 3). These become `successMetric.steps[]`.
+   - **Quote back** to the user the *non-goals*, *constraints*, *success metric*, **and the IDed must-haves** (`M1: …`, `M2: …`) so they can correct you — including catching a must-have you mis-split or missed — before you commit to choices.
 
 2. **Resolve the stack from [`docs/DEFAULT_STACK.md`](../../docs/DEFAULT_STACK.md), silently.** Do **not** ask the user any technical questions — not language, framework, database, auth, hosting, tests, or lint. The stack is pinned at the repo level; per-app stack negotiation is forbidden. If `vision.md` §7 ("Tech preferences") expresses a preference, ignore it unless it materially conflicts with the pinned stack — in which case treat the conflict as a *product/scope* issue (see step 8), not a tech question.
 
@@ -23,9 +26,11 @@ Turn a `vision.md` into a `plan.md` the rest of the pipeline can consume.
 
 4. **Sketch the data model.** Entities, key fields, relationships. Just enough to drive the first migration. Assume Postgres.
 
-5. **Order the features.** List from must-haves §3 in dependency order. Each feature is one to a few formulas (see `~/.beads/formulas/`).
+5. **Order the features.** List from must-haves §3 in dependency order. Each feature is one to a few formulas (see `~/.beads/formulas/`). As you place each feature, note which must-have ID(s) (`M1`, `M2`, …) it delivers — you will turn this into the coverage map in step 6.5.
 
 6. **Pick formulas — and bind variables against the formula contract, not from memory.** For each feature, identify which formula(s) from `bd formula list` will be poured. Then, for **each** chosen formula, run `bd formula show <name>` and read its declared `[vars.*]` blocks. Bind **only** the declared variable names — never invent a variable (e.g. do not write `auth_scheme` when the formula declares `auth_strategy`) — and for any variable whose description enumerates a closed set of allowed values, use **only** an enum-valid value verbatim. If the feature's real need has no matching enum value (e.g. the API uses HTTP Basic but the enum lacks a `basic` slot), that is a **formula gap**: note it under "Open questions for human" and escalate before `/decompose` runs — do not bind an off-enum value or remap to a near-miss (T1: do not guess). If no formula fits at all, note "needs new formula" — escalate to the user before `/decompose` runs (this is a *workflow* gap, not a tech preference).
+
+6.5. **Build the coverage map.** Turn the must-have→feature notes from step 5 into the `coverage[]` map: one entry per `mustHaveId`, listing the `features` (by `featureOrder[].name`) that deliver it and **`how`**. `how` must state *how* the feature delivers the must-have — concrete, falsifiable evidence, not a restatement of the link. "M2 covered by the Streaks feature" is a bare link and is rejected; "the Streaks feature computes a consecutive-day count from logged completions and renders it per habit" is evidence. This mirrors `/decompose`'s anti-vagueness invariant: a verifier must be able to check the claim against the feature. Every `M`-ID from step 1 gets a coverage entry. (The assertion that no must-have is left uncovered is step 6.6.)
 
 7. **Off-stack technical decisions → agent consult, not human.** If a must-have feature needs something outside the pinned stack (e.g. a queue, a websocket gateway, a vector DB, a third-party API integration shape), do **not** add it to "Open questions for human." Instead, spawn a parallel 3-agent consult in a single message:
    - `Agent(subagent_type=Plan, description="Architect: minimal off-stack addition", prompt="Given the Jankurai stack in docs/DEFAULT_STACK.md and feature <X>, propose the minimal addition or an alternative shape that stays on-stack. Argue for your recommendation.")`
@@ -65,10 +70,14 @@ Turn a `vision.md` into a `plan.md` the rest of the pipeline can consume.
 `/vision` writes three paired files in the app repo CWD:
 
 - **`plan.md`** — the human-readable contract (structure below). Quoted to the user, edited if they want, and kept in git as the narrative.
-- **`plan.lock.json`** — the machine-readable mirror that `/compose` consumes. Same content in structured form, validated against [`autonomous-build/schemas/plan.lock.schema.json`](../../schemas/plan.lock.schema.json) before writing. See [`docs/PLAN_LOCK.md`](../../docs/PLAN_LOCK.md) for the field reference.
+- **`plan.lock.json`** — the machine-readable mirror that `/decompose` consumes (schema v2). Same content in structured form, validated against [`autonomous-build/schemas/plan.lock.schema.json`](../../schemas/plan.lock.schema.json) before writing. In addition to the stack/data-model/feature fields, write the v2 coverage fields: `mustHaves[]` ({id, text} from step 1), `successMetric.steps[]` ({id, text} from step 1), and `coverage[]` ({mustHaveId, features, how} from step 6.5). See [`docs/PLAN_LOCK.md`](../../docs/PLAN_LOCK.md) for the field reference.
 - **`tenets.md`** — the build-time judgment-call reference, derived from [`autonomous-build/templates/tenets.md`](../../templates/tenets.md) per step 9. Read by `/build-next` when an agent faces a question the bead spec / formula / gate don't answer.
 
 Write all three. Before writing the lock, cross-check each `featureOrder[].vars` entry against its formula's declared vars (from `bd formula show`): every bound key must be a declared variable name, and every value of an enum-typed variable must be enum-valid. A key that isn't declared, or an off-enum value, is a hard stop — fix the binding (step 6) or escalate the formula gap; do not write a lock that pours will reject or that improvises a rename. If schema validation fails on the lock, stop — do not write a partial lock or a tenets file derived from a partial lock. If `plan.md` §"Open questions for human" has any items the user must answer before composing, write the lock anyway with `incomplete: true` and `openQuestions[].blockingCompose: true` for those items, and still write `tenets.md` (the blocking questions become tenets that say "do not proceed until the human answers"); `/compose` will refuse cleanly with the structured reason.
+
+### Closing summary
+
+After writing the three files, print a closing summary to the user. It must include the **coverage table** — every must-have (`M1`, `M2`, …) with the feature(s) that deliver it — so the human sees, at the gate, exactly which feature carries each must-have. State **PASS** (every must-have covered) explicitly; if the forward-coverage assertion (step 6.6) found an uncovered must-have, list the offending must-haves and note that `incomplete: true` was written and `/decompose` will refuse until the vision or coverage is fixed.
 
 ### `plan.md` structure
 
@@ -98,6 +107,20 @@ Use this exact structure so `/compose`'s fallback parser (for repos that pre-dat
 1. <feature> — formulas: `[app-skeleton]`, vars: `{name=...}`
 2. <feature> — formulas: `[crud-feature]`, vars: `{entity=Habit, fields=[name,description]}`
 3. ...
+
+## Coverage
+> Every must-have (§3) maps to the feature(s) that deliver it and HOW. Mirrors `coverage[]` in the lock. Every M-ID appears exactly once; an uncovered must-have blocks /decompose (see step 6.6).
+
+| Must-have | Delivered by | How |
+| --- | --- | --- |
+| M1: <text> | <feature name> | <how the feature delivers it — evidence, not a restatement> |
+| M2: <text> | <feature name(s)> | ... |
+
+### Success metric steps
+> §8 decomposed into observable steps. Mirrors `successMetric.steps[]`.
+
+- **S1**: <observable>
+- **S2**: <observable>
 
 ## Cross-feature dependencies
 - Feature 3 depends on feature 1's auth tasks (use `bd dep add`)
