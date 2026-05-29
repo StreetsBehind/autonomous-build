@@ -87,6 +87,7 @@ One agent per feature in `ParsedPlan.features`. Each agent pours its formula, re
 **Inputs per agent:** `{ feature: { name, formulas, vars }, appEpicId, dryRun }`
 **Steps per agent:**
 1. For each formula in `feature.formulas`:
+   0. **Validate `feature.vars` against the formula contract before pouring.** Read `~/.beads/formulas/<formula>.formula.toml`, collect declared `[vars.*]` names and any enumerated allowed value sets. If a `feature.vars` key is not a declared variable, or a value falls outside a declared enum, return `{ status: 'failed', error }` — **do not** rename the key to a near-miss var or coerce the value into the enum (T1: do not guess). This is the guard that stops the smbuild failure mode where two pour agents silently renamed `auth_scheme`→`auth_strategy` and poured off-enum values.
    a. If `dryRun`: `bd mol pour <formula> --var ... --dry-run`, return planned issues without mutating.
    b. Otherwise: `bd mol pour <formula> --var ... 2>&1`. Parse `Root issue: (\S+)` from stdout to get `pourRoot`.
    c. `bd dep add <pourRoot> <appEpicId> --type parent-child` (reparent under app epic — `bd mol pour` has no `--parent` flag, verified 2026-05-28).

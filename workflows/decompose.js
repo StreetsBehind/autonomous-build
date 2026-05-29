@@ -221,6 +221,11 @@ Feature spec: ${JSON.stringify(feature)}
 
 For each formula in feature.formulas (usually 1, sometimes more), do:
 
+0. VALIDATE feature.vars against the formula contract BEFORE pouring. Read the formula TOML at \`~/.beads/formulas/<formula>.formula.toml\` and collect its declared \`[vars.*]\` names; for any var whose description enumerates a closed set of allowed values (e.g. "'api-key' | 'basic' | ... | 'none'"), collect that allowed set. Then, for every key in feature.vars:
+   - If the key is NOT a declared variable of this formula → return status="failed" with error "undeclared variable '<key>' for formula <formula> (declared: <list>)".
+   - If the value is outside the variable's enumerated allowed set → return status="failed" with error "off-enum value '<value>' for variable '<key>' in formula <formula> (allowed: <list>)".
+   Do NOT rename the key to a near-miss declared var, do NOT remap or coerce the value into the enum, do NOT pour with a substituted guess. Improvising a binding violates T1 (do not guess) — fail honestly and let /vision fix the plan. This validation is exactly what should have caught the smbuild auth_scheme→auth_strategy mismatch instead of two agents silently renaming it.
+
 1. If Context.dryRun: \`bd mol pour <formula> --dry-run --var k=v ...\`. Capture the planned issues; do NOT mutate. Return one PourResult per formula with status="ok" and children populated from the dry-run output (id may be "<dry-run-1>", etc.).
 2. Otherwise:
    a. \`bd mol pour <formula> --var k=v ... 2>&1\`. Parse \`Root issue: (\\S+)\` from stdout → pourRoot.
