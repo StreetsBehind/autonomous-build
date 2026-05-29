@@ -1,12 +1,13 @@
 export const meta = {
   name: 'vision-eval',
-  description: 'Scale harness that grades /vision output against the hand-authored oracle corpus in tests/vision-eval/. Runs each fixture vision.md through /vision K times, then scores the plan.lock.json with three pure-JS (no-LLM) layers — L1 contract validation, L2 expectation assertions vs the manifest, L3 K-run stability — and emits a per-fixture result table. Implements autonomous-build-4vj.2.',
-  whenToUse: 'When you want a numbers-on-a-dashboard answer to "is /vision deterministic / in line with the oracle?". Cheap grading, but the inputs are heavy: a full run is fixtures*k /vision passes (10*5=50 by default). Use --k 1 / --only for a cheap smoke, --selftest to CI the harness logic with no agents.',
+  description: 'Scale harness that grades /vision output against the hand-authored oracle corpus in tests/vision-eval/. Runs each fixture vision.md through /vision K times, then scores the plan.lock.json with mechanical pure-JS layers — L1 contract validation, L2 expectation assertions vs the manifest, L3 K-run stability — plus an opt-in L4 LLM evidence-quality judge (--judge → vaguenessRate). Emits a per-fixture table + a ratcheted scorecard. Implements autonomous-build-4vj.2 (L1-L3), 4vj.4 (scorecard ratchet), 4vj.3 (L4 judge).',
+  whenToUse: 'When you want a numbers-on-a-dashboard answer to "is /vision deterministic / in line with the oracle?". Cheap grading, but the inputs are heavy: a full run is fixtures*k /vision passes (10*5=50 by default), and --judge adds an adversarial panel per addressed concern. Use --k 1 / --only for a cheap smoke, --judge (periodic) for the vagueness rate, --selftest to CI the harness logic with no agents.',
   phases: [
     { title: 'Enumerate',          detail: 'List fixture slugs under the corpus root (1 agent)' },
     { title: 'Run + grade',        detail: 'Per fixture: read manifest, run /vision K times headless, grade L1/L2/L3 in pure JS' },
     { title: 'Report',             detail: 'Assemble + log the per-fixture result table' },
-    { title: 'Scorecard + ratchet', detail: 'Build scorecard, diff vs blessed baseline, write artifact, fail on regression' }
+    { title: 'Evidence judge',     detail: 'L4 (opt-in --judge): adversarial panel per addressed-concern evidence → vagueness rate' },
+    { title: 'Scorecard + ratchet', detail: 'Build scorecard (incl. vaguenessRate), diff vs blessed baseline, write artifact, fail on regression' }
   ]
 };
 
@@ -28,7 +29,8 @@ function parseArgs(s) {
   const out = {
     fixturesDir: 'tests/vision-eval/fixtures', k: 5, only: null, selftest: false,
     baselinePath: 'agent/baselines/vision-eval.json', updateBaseline: false, noGate: false,
-    tolPass: DEFAULT_TOLS.pass, tolStability: DEFAULT_TOLS.stability
+    tolPass: DEFAULT_TOLS.pass, tolStability: DEFAULT_TOLS.stability,
+    judge: false, judgePanel: 3, judgeSample: 0
   };
   const tokens = (typeof s === 'string') ? s.trim().split(/\s+/).filter(Boolean) : (Array.isArray(s) ? s : []);
   for (let i = 0; i < tokens.length; i++) {
@@ -40,6 +42,12 @@ function parseArgs(s) {
     else if (tokens[i] === '--no-gate') { out.noGate = true; }
     else if (tokens[i] === '--tol-pass' && tokens[i + 1]) { const n = parseFloat(tokens[++i]); if (Number.isFinite(n) && n >= 0) out.tolPass = n; }
     else if (tokens[i] === '--tol-stability' && tokens[i + 1]) { const n = parseFloat(tokens[++i]); if (Number.isFinite(n) && n >= 0) out.tolStability = n; }
+    // L4 evidence-quality judge (autonomous-build-4vj.3). Opt-in + periodic per the cost
+    // model: the panel is fixtures*addressedConcerns*panelSize heavy agents on top of the
+    // run cost, so default OFF; vaguenessRate stays null (ungated) unless --judge is set.
+    else if (tokens[i] === '--judge') { out.judge = true; }
+    else if (tokens[i] === '--judge-panel' && tokens[i + 1]) { const n = parseInt(tokens[++i], 10); if (Number.isFinite(n) && n >= 1) out.judgePanel = n; }
+    else if (tokens[i] === '--judge-sample' && tokens[i + 1]) { const n = parseInt(tokens[++i], 10); if (Number.isFinite(n) && n >= 0) out.judgeSample = n; }
     else if (tokens[i] === '--selftest') { out.selftest = true; }
   }
   return out;
@@ -292,6 +300,75 @@ function computeStability(planLocks, concernIds = CONCERN_IDS) {
   return out;
 }
 
+// ===========================================================================
+// L4 — evidence-quality judge (autonomous-build-4vj.3). The ONE thing L1–L3
+// cannot mechanically check: is an `addressed` concern's evidence FALSIFIABLE
+// (cites a feature/formula/tenet/gate/stack-pin) or rubber-stamped vagueness?
+// Collection + majority + tally are PURE JS (selftestable); only the per-item
+// verdict is an LLM judge (injected, so the pipeline is unit-testable with a
+// synthetic judge). Output feeds the scorecard's reserved `vaguenessRate`.
+// ===========================================================================
+
+// Collect every addressed-concern evidence string across K parsed runs.
+// Returns [{ runIdx, concernId, evidence }] — one entry per addressed concern per run.
+function collectAddressedEvidence(planLocks) {
+  const items = [];
+  (planLocks || []).filter(isObj).forEach((pl, runIdx) => {
+    (isArr(pl.concerns) ? pl.concerns : []).forEach(c => {
+      if (c && c.status === 'addressed' && nonEmptyStr(c.evidence)) {
+        items.push({ runIdx, concernId: c.concernId || '(unknown)', evidence: c.evidence });
+      }
+    });
+  });
+  return items;
+}
+
+// Dedupe identical evidence so the panel never judges the same string K times
+// (cost). Key = slug::concernId::evidence; carries a `count` of how many runs
+// produced it. Items without a slug dedupe on concernId::evidence alone.
+function dedupeEvidence(items) {
+  const by = new Map();
+  for (const it of (items || []).filter(isObj)) {
+    const key = `${it.slug || ''}::${it.concernId || ''}::${it.evidence || ''}`;
+    if (by.has(key)) { by.get(key).count++; }
+    else { by.set(key, Object.assign({ count: 1 }, it)); }
+  }
+  return [...by.values()];
+}
+
+// Majority vote across a judge panel. Each verdict: { falsifiable: bool }.
+// Evidence is VAGUE (fails the bar) unless a STRICT majority of judges call it
+// falsifiable — an even split breaks toward vague (an unclear pass is not a pass).
+function judgePanelMajority(verdicts) {
+  const v = (verdicts || []).filter(isObj);
+  if (!v.length) return { falsifiable: false, vague: true, votes: { falsifiable: 0, vague: 0, n: 0 } };
+  const fals = v.filter(x => x.falsifiable === true).length;
+  const vague = v.length - fals;
+  const isFalsifiable = fals > vague; // strict majority; tie -> vague
+  return { falsifiable: isFalsifiable, vague: !isFalsifiable, votes: { falsifiable: fals, vague, n: v.length } };
+}
+
+// Tally a vagueness rate from per-item panel results.
+// judged item: { concernId, evidence, panel: { falsifiable, vague } }.
+// vaguenessRate = fraction of addressed-evidence items whose panel says VAGUE.
+function tallyVagueness(judged) {
+  const items = (judged || []).filter(isObj);
+  const total = items.length;
+  const vague = items.filter(it => it.panel && it.panel.vague === true).length;
+  const perConcern = {};
+  for (const it of items) {
+    const id = it.concernId || '(unknown)';
+    if (!perConcern[id]) perConcern[id] = { total: 0, vague: 0 };
+    perConcern[id].total++;
+    if (it.panel && it.panel.vague === true) perConcern[id].vague++;
+  }
+  return {
+    total, vague,
+    vaguenessRate: total ? Math.round((vague / total) * 1000) / 1000 : null,
+    perConcern
+  };
+}
+
 // Roll a fixture's K runs into one printable row.
 function gradeFixture(slug, manifest, planLockTexts, concernIds = CONCERN_IDS) {
   const parsed = (planLockTexts || []).map(extractJson);
@@ -346,7 +423,10 @@ function renderTable(rows, scope) {
 // ===========================================================================
 
 // Roll the per-fixture rows into a scorecard (per-fixture + aggregate metrics).
-function buildScorecard(rows, scope) {
+// `vaguenessRate` is the L4 judge result (autonomous-build-4vj.3) — null when the
+// judge did not run (--judge off), which keeps the ratchet's vaguenessRate check a
+// quiet skip. Back-compatible: existing 2-arg callers get null, exactly as before.
+function buildScorecard(rows, scope, vaguenessRate = null) {
   const clean = (rows || []).filter(isObj);
   const fixtures = {};
   let l1PassSum = 0, l2PassSum = 0, runSum = 0;
@@ -373,10 +453,40 @@ function buildScorecard(rows, scope) {
       l2PassRate: runSum ? Math.round((l2PassSum / runSum) * 1000) / 1000 : null,
       meanCoverageStabilityPct: mean(covs),
       verdictStabilityPct: verdicts.length ? Math.round((verdicts.filter(Boolean).length / verdicts.length) * 1000) / 10 : null,
-      vaguenessRate: null // L4 (autonomous-build-4vj.3) populates this; gated here once present.
+      vaguenessRate: (typeof vaguenessRate === 'number') ? vaguenessRate : null // L4 (autonomous-build-4vj.3); null when --judge off → ratchet skips it.
     },
     fixtures
   };
+}
+
+// ===========================================================================
+// L4 judge prompt. Self-contained: embeds the docs/PLAN_CONCERNS.md "Evidence —
+// what counts" bar INLINE (the judge agent runs headless and must not depend on
+// reading the repo). SYNC: keep EVIDENCE_BAR in step with docs/PLAN_CONCERNS.md
+// §"Evidence — what counts" (same documented-sync rule as CONCERN_IDS/GATE_TOKENS).
+// ===========================================================================
+const EVIDENCE_BAR = `An "addressed" concern's evidence must point at something a verifier can check EXISTS. Falsifiable evidence is ONE of:
+  1. a featureOrder[] entry (by name) that delivers the concern,
+  2. a formula that encodes it (e.g. oidc-client-rust, otel-bootstrap-rust),
+  3. a tenet, by number (e.g. "T7: no swallowed exceptions"),
+  4. the quality gate (hooks/post-build-gate.{sh,ps1}),
+  5. a DEFAULT_STACK.md pin.
+A BARE ASSERTION ("handled", "we handle auth", "we take security seriously", "standard practices", "users log in", "permissions enforced", "we use env vars") is NOT evidence — it is unfalsifiable and FAILS the bar. Naming a concrete mechanism cited to one of the five anchors above passes; a vibe does not.`;
+
+function evidenceJudgePrompt(item, judgeIdx) {
+  return `
+You are evidence judge #${judgeIdx} on an adversarial panel for the /vision plan-quality eval. Judge ONE concern's "addressed" evidence: is it FALSIFIABLE, or rubber-stamped vagueness? Be skeptical — default to NOT falsifiable when it is a bare claim with no checkable anchor.
+
+THE BAR (verbatim from docs/PLAN_CONCERNS.md "Evidence — what counts"):
+${EVIDENCE_BAR}
+
+THE EVIDENCE UNDER JUDGEMENT:
+- concernId: ${JSON.stringify(item.concernId)}
+- evidence:  ${JSON.stringify(item.evidence)}
+
+Decide: does this evidence cite at least one of the five falsifiable anchors (a named feature, a named formula, a numbered tenet, the gate, or a DEFAULT_STACK pin) concretely enough that a verifier could check it exists? A bare assertion fails.
+Return JSON ONLY: { "falsifiable": true|false, "reason": "<one sentence: which anchor it cites, or why it is a bare assertion>" }.
+`.trim();
 }
 
 // Compare a fresh scorecard to a blessed baseline. Regression-only:
@@ -534,6 +644,71 @@ function runSelftest() {
   ], 'k=5'); // l2PassRate 0.8 vs 0.9, dip 0.1 < tol 0.15
   check('ratchet tolerates a sub-tolerance dip', compareToBaseline(scDip, blessedBase).status === 'pass');
 
+  // 14-21. L4 evidence-quality judge (autonomous-build-4vj.3). The LLM verdict is
+  // injected, so the collection/majority/tally machinery is fully unit-testable.
+  // collectAddressedEvidence pulls addressed evidence and skips excluded concerns.
+  const evLock = JSON.parse(JSON.stringify(goodLock)); // 9 addressed + 1 excluded (perf-envelope)
+  const collected = collectAddressedEvidence([evLock]);
+  check('L4 collectAddressedEvidence pulls addressed concerns only (skips excluded)',
+    collected.length === 9 && collected.every(e => e.concernId !== 'perf-envelope'));
+
+  // dedupeEvidence collapses identical (slug,concernId,evidence) tuples across K runs.
+  const dupSrc = [
+    { slug: '01', concernId: 'authn', evidence: 'feature Login via oidc-client-rust' },
+    { slug: '01', concernId: 'authn', evidence: 'feature Login via oidc-client-rust' },
+    { slug: '01', concernId: 'authz', evidence: 'we handle auth' }
+  ];
+  const deduped = dedupeEvidence(dupSrc);
+  check('L4 dedupeEvidence collapses identical evidence across runs (with count)',
+    deduped.length === 2 && deduped.find(d => d.concernId === 'authn').count === 2);
+
+  // judgePanelMajority: strict majority falsifiable -> falsifiable; tie or minority -> vague.
+  check('L4 panel majority falsifiable -> not vague',
+    judgePanelMajority([{ falsifiable: true }, { falsifiable: true }, { falsifiable: false }]).vague === false);
+  check('L4 panel majority vague -> vague',
+    judgePanelMajority([{ falsifiable: false }, { falsifiable: false }, { falsifiable: true }]).vague === true);
+  check('L4 panel even split breaks toward vague',
+    judgePanelMajority([{ falsifiable: true }, { falsifiable: false }]).vague === true);
+
+  // ACCEPTANCE (4vj.3): a deliberately vague evidence string ("we handle auth") is
+  // flagged by the panel. We drive the REAL pipeline (judgePanelMajority + tallyVagueness)
+  // with a synthetic judge faithfully applying the bar, proving the machinery flags it.
+  const syntheticJudge = (item) => {
+    // a falsifiable anchor: a known formula name, a Txx tenet, "feature ", the gate, the stack pin.
+    const e = String(item.evidence || '');
+    const falsifiable = /-(rust|model)\b|oidc-client|otel-bootstrap|openfga|\bT\d+\b|\bfeature\b|post-build-gate|DEFAULT_STACK|p\d{2}\s*<|entities? in Data model/i.test(e);
+    return { falsifiable, reason: falsifiable ? 'cites an anchor' : 'bare assertion' };
+  };
+  const judgeItems = [
+    { concernId: 'authn', evidence: "feature 'Account login' via oidc-client-rust" },
+    { concernId: 'observability', evidence: "feature 'Telemetry' via otel-bootstrap-rust" },
+    { concernId: 'authz', evidence: 'we handle auth' } // <- deliberately vague
+  ];
+  const judgedItems = judgeItems.map(it => ({
+    ...it,
+    panel: judgePanelMajority(Array.from({ length: 3 }, () => syntheticJudge(it)))
+  }));
+  const tally = tallyVagueness(judgedItems);
+  check('L4 ACCEPTANCE: panel flags the deliberately vague "we handle auth" string',
+    judgedItems.find(j => j.concernId === 'authz').panel.vague === true &&
+    judgedItems.find(j => j.concernId === 'authn').panel.vague === false);
+  check('L4 tallyVagueness computes the rate (1 of 3 vague -> 0.333) + perConcern',
+    tally.total === 3 && tally.vague === 1 && tally.vaguenessRate === 0.333 &&
+    tally.perConcern.authz.vague === 1 && tally.perConcern.authn.vague === 0);
+  check('L4 all-falsifiable evidence -> vaguenessRate 0',
+    tallyVagueness([{ concernId: 'authn', evidence: 'x', panel: judgePanelMajority([{ falsifiable: true }]) }]).vaguenessRate === 0);
+
+  // 22-24. scorecard carries vaguenessRate; the ratchet gates it as an "above" metric.
+  check('scorecard back-compat: 2-arg buildScorecard leaves vaguenessRate null',
+    buildScorecard(rowsA, 'k=5').aggregate.vaguenessRate === null);
+  check('scorecard records an injected vaguenessRate',
+    buildScorecard(rowsA, 'k=5', 0.25).aggregate.vaguenessRate === 0.25);
+  const vagueBase = Object.assign({}, buildScorecard(rowsA, 'k=5', 0.1), { blessed: true });
+  check('ratchet BLOCKs a vaguenessRate rise beyond tolerance',
+    compareToBaseline(buildScorecard(rowsA, 'k=5', 0.3), vagueBase).status === 'block');
+  check('ratchet tolerates a sub-tolerance vaguenessRate rise',
+    compareToBaseline(buildScorecard(rowsA, 'k=5', 0.15), vagueBase).status === 'pass');
+
   const passed = results.filter(r => r.pass).length;
   return { passed, total: results.length, ok: passed === results.length, results };
 }
@@ -622,9 +797,17 @@ Read ${A.fixturesDir}/${slug}/expect.json and return it verbatim as {"manifest":
       const runThunks = Array.from({ length: A.k }, (_, k) => () =>
         agent(runVisionPrompt(A.fixturesDir, slug, k + 1), { label: `vision:${slug}#${k + 1}`, phase: 'Run + grade' })
       );
-      return parallel(runThunks).then(texts =>
-        gradeFixture(slug, prev.manifest, texts.filter(t => t != null), CONCERN_IDS)
-      );
+      return parallel(runThunks).then(texts => {
+        const clean = texts.filter(t => t != null);
+        const row = gradeFixture(slug, prev.manifest, clean, CONCERN_IDS);
+        // L4 prep (pure JS, cheap): stash this fixture's addressed-concern evidence so
+        // the Evidence-judge phase can fan a panel over it. Only when --judge is on.
+        if (A.judge) {
+          const parsed = clean.map(extractJson).filter(isObj);
+          row.addressedEvidence = collectAddressedEvidence(parsed).map(e => Object.assign({ slug }, e));
+        }
+        return row;
+      });
     }
   );
 
@@ -637,6 +820,43 @@ Read ${A.fixturesDir}/${slug}/expect.json and return it verbatim as {"manifest":
   const runTotal = clean.reduce((a, r) => a + r.k, 0);
   log(`vision-eval summary: L1 ${l1Total}/${runTotal} runs valid · L2 ${l2Total}/${runTotal} runs match oracle · scope: ${scope}`);
 
+  // ---- Phase 3.5: L4 evidence-quality judge (autonomous-build-4vj.3, opt-in) ----
+  // The one thing L1–L3 cannot check: is each addressed concern's evidence falsifiable
+  // or rubber-stamped vagueness? Adversarial panel (default 3) per evidence item, majority
+  // vote, then a vagueness rate. Cost-disciplined: dedupe identical strings; --judge-sample
+  // caps the item count (periodic / small-sample per the cost model). Off by default.
+  let vaguenessRate = null;
+  if (A.judge) {
+    phase('Evidence judge');
+    let evItems = dedupeEvidence(clean.flatMap(r => r.addressedEvidence || []));
+    const totalItems = evItems.length;
+    let sampled = false;
+    if (A.judgeSample > 0 && evItems.length > A.judgeSample) {
+      // deterministic sample (no Math.random — forbidden): stable-sort by key, take first N.
+      evItems = evItems
+        .slice()
+        .sort((a, b) => `${a.slug}:${a.concernId}:${a.evidence}`.localeCompare(`${b.slug}:${b.concernId}:${b.evidence}`))
+        .slice(0, A.judgeSample);
+      sampled = true;
+    }
+    if (!evItems.length) {
+      log('L4 evidence judge: no addressed-concern evidence to judge (all runs blocked or excluded).');
+    } else {
+      const judgeSchema = { type: 'object', required: ['falsifiable'], properties: { falsifiable: { type: 'boolean' }, reason: { type: 'string' } } };
+      const judged = await parallel(evItems.map((item) => () =>
+        parallel(Array.from({ length: A.judgePanel }, (_, j) => () =>
+          agent(evidenceJudgePrompt(item, j + 1), { label: `judge:${item.slug}:${item.concernId}#${j + 1}`, phase: 'Evidence judge', schema: judgeSchema })
+        )).then(verdicts => Object.assign({}, item, { panel: judgePanelMajority(verdicts.filter(Boolean)) }))
+      ));
+      const tally = tallyVagueness(judged.filter(Boolean));
+      vaguenessRate = tally.vaguenessRate;
+      log(`L4 evidence judge: ${tally.vague}/${tally.total} addressed-evidence items judged VAGUE → vaguenessRate=${vaguenessRate}` +
+        `${sampled ? ` (sampled ${evItems.length} of ${totalItems} — periodic/small-sample)` : ''} · panel=${A.judgePanel}`);
+      const offenders = Object.entries(tally.perConcern).filter(([, v]) => v.vague > 0).map(([id, v]) => `${id} ${v.vague}/${v.total}`);
+      if (offenders.length) log(`  vague-by-concern: ${offenders.join(', ')}`);
+    }
+  }
+
   // ---- Phase 4: scorecard + baseline ratchet ----
   phase('Scorecard + ratchet');
   const baseRead = await agent(`
@@ -647,7 +867,7 @@ Do not create or modify the file.
 `.trim(), { label: 'read-baseline', phase: 'Scorecard + ratchet', schema: { type: 'object', required: ['found'], properties: { found: { type: 'boolean' }, baseline: { type: 'object' } } } });
 
   const baseline = (baseRead && baseRead.found) ? baseRead.baseline : null;
-  const scorecard = buildScorecard(clean, scope);
+  const scorecard = buildScorecard(clean, scope, vaguenessRate);
   const cmp = compareToBaseline(scorecard, baseline, { pass: A.tolPass, stability: A.tolStability });
 
   // Persist: --update-baseline blesses the fresh scorecard AS the baseline (commit it
@@ -671,14 +891,16 @@ Then confirm the path you wrote.
   log(A.updateBaseline
     ? `baseline blessed + written to ${A.baselinePath} — review the numbers and commit it in a DEDICATED commit.`
     : `scorecard written to ${writePath} (not blessed). ${cmp.status === 'skip' ? 'No blessed baseline yet → ratchet is report-only.' : ''}`);
-  log('NOTE: L4 evidence-judge (vaguenessRate) is autonomous-build-4vj.3; L5 propagation is 4vj.5.');
+  log(A.judge
+    ? `L4 evidence-judge ran: vaguenessRate=${vaguenessRate} (gated as an "above" metric once a blessed baseline carries one). L5 propagation is 4vj.5.`
+    : 'NOTE: L4 evidence-judge (vaguenessRate) is OFF — pass --judge to populate it (periodic; heavy). L5 propagation is 4vj.5.');
 
   // The gate: a regression fails the run (the "exit non-zero" CI hook). Skip when
   // blessing a new baseline or when --no-gate is set.
   if (cmp.status === 'block' && !A.noGate && !A.updateBaseline) {
     throw new Error(`vision-eval REGRESSION vs baseline: ${cmp.regressions.map(r => `${r.metric} ${r.current}<${r.baseline}-${r.tol}`).join('; ')}`);
   }
-  return { rows: clean, scope, scorecard, ratchet: cmp };
+  return { rows: clean, scope, scorecard, ratchet: cmp, vaguenessRate };
 }
 
 // Entry point — guarded so `node`/`import` (for the selftest harness checks) never
@@ -698,6 +920,7 @@ if (typeof agent === 'function') {
   globalThis.__visionEval = {
     extractJson, validatePlanLock, gradeAgainstManifest, computeStability,
     gradeFixture, renderTable, buildScorecard, compareToBaseline, runSelftest,
-    CONCERN_IDS, GATE_TOKENS, DEFAULT_TOLS
+    collectAddressedEvidence, dedupeEvidence, judgePanelMajority, tallyVagueness, evidenceJudgePrompt,
+    CONCERN_IDS, GATE_TOKENS, DEFAULT_TOLS, EVIDENCE_BAR
   };
 }

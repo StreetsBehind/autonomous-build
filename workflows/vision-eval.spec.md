@@ -5,7 +5,7 @@ description: Scale harness that grades /vision output against a hand-authored or
 
 # vision-eval
 
-The plan-determinism measurement stage, implemented as a **dynamic workflow** (see https://code.claude.com/docs/en/workflows). It grades the `/vision` stage against the oracle corpus in `tests/vision-eval/` (epic `autonomous-build-4vj`; corpus + manifests are `4vj.1`, already landed). This spec covers `4vj.2` (the **L1–L3 mechanical layers** + result table) and `4vj.4` (the **scorecard + blessed-baseline regression ratchet**). L4 (evidence-quality judge fan-out, `4vj.3` — populates `vaguenessRate`) and L5 (downstream propagation, `4vj.5`) are separate, later beads and are **out of scope here** — but the scorecard already reserves `vaguenessRate` so L4 wires in without a schema bump.
+The plan-determinism measurement stage, implemented as a **dynamic workflow** (see https://code.claude.com/docs/en/workflows). It grades the `/vision` stage against the oracle corpus in `tests/vision-eval/` (epic `autonomous-build-4vj`; corpus + manifests are `4vj.1`, already landed). This spec covers `4vj.2` (the **L1–L3 mechanical layers** + result table), `4vj.4` (the **scorecard + blessed-baseline regression ratchet**), and `4vj.3` (the **L4 evidence-quality judge fan-out** — the opt-in LLM layer that populates `vaguenessRate`). L5 (downstream propagation, `4vj.5`) is a separate, later bead and is **out of scope here**. L4 wired into the `vaguenessRate` slot the scorecard already reserved — no schema bump.
 
 ## How this spec runs
 
@@ -29,6 +29,9 @@ The eval grades the **contract** (`plan.lock.json`: `concerns[]`, `coverage[]`, 
 | `--only <slug[,slug...]>` | all | Restrict to named fixtures (e.g. a cheap `--only 01-multitenant-saas-web --k 1` smoke). |
 | `--baseline <path>` | `agent/baselines/vision-eval.json` | The blessed-baseline file the ratchet diffs against and (with `--update-baseline`) rewrites. |
 | `--update-baseline` | false | Bless the fresh scorecard AS the baseline: write it to `--baseline` with `blessed:true` and **do not gate**. The deliberate baseline-bump path; commit the result in a dedicated commit. |
+| `--judge` | false | Run **L4** (`4vj.3`): the adversarial evidence-quality judge panel → populates `vaguenessRate`. Off by default — it adds `addressed-concerns × panelSize` heavy agents on top of the run cost, so it is the **periodic** layer, not per-commit. With it off, `vaguenessRate` stays `null` (a quiet ratchet skip). |
+| `--judge-panel <int>` | `3` | Judges per evidence item (the "2–3 agents, majority" panel). Majority vote; an even split breaks toward *vague* (an unclear pass is not a pass). |
+| `--judge-sample <int>` | `0` (all) | Cap the number of (deduped) evidence items judged — the small-sample lever for the periodic L4 run. `0` judges every deduped item; identical evidence strings across K runs are deduped first regardless. |
 | `--no-gate` | false | Compute + report the ratchet delta but never fail the run (report-only). |
 | `--tol-pass <float>` | `0.15` | Max allowed drop (fraction) in L1/L2 pass-rate below baseline before it's a regression. |
 | `--tol-stability <float>` | `10` | Max allowed drop (pct points) in coverage-/verdict-stability below baseline before it's a regression. |
@@ -40,6 +43,7 @@ The mechanical layers L1–L3 are cheap (pure JS). The **cost is the inputs**: e
 
 - **Per-commit CI:** `--k 1` over the full corpus (L1 + L2 + verdict; no stability) — 10 agents.
 - **Nightly / pre-release:** `--k 5` (adds L3 stability) — 50 agents.
+- **Periodic (L4 vagueness):** add `--judge` — an extra `deduped-addressed-evidence × --judge-panel` agents (≈ 9 concerns × fixtures × 3, minus dedupe). Use `--judge-sample N` to bound it. This is the LLM layer; run it on a cadence, not every commit.
 
 Do not silently cap the corpus. If a run is restricted (`--only`, low `--k`), the result table states it so a green table is never mistaken for full coverage.
 
@@ -72,6 +76,20 @@ One agent lists the fixture slugs under `--fixtures-dir` (each dir containing bo
 
 Assemble a **per-fixture result table** and `log()` it: fixture, parsed/K, L1 pass/K, L2 pass/K, L2 per-concern + per-gate offenders, coverage-stability %, verdict-stability, entity/feature ranges, and a header line stating corpus scope (`--only`, `--k`) so a restricted run is never read as full coverage.
 
+### Phase 3.5 — L4 evidence-quality judge (`4vj.3`, opt-in via `--judge`)
+
+The one thing L1–L3 cannot mechanically check: is an `addressed` concern's evidence **falsifiable** (cites a feature/formula/tenet/gate/stack-pin) or rubber-stamped vagueness? This is the direct measure of the failure mode the whole coverage design fears, so it is an **LLM** layer — but built so the machinery around the LLM is pure-JS and unit-testable.
+
+Runs only when `--judge` is passed (it is the **periodic** layer per the cost model, not per-commit). Steps:
+
+1. **Collect (pure JS, in Stage B):** when `--judge` is on, each fixture's Stage B also runs `collectAddressedEvidence(parsedRuns)` → every `{slug, concernId, evidence}` where `status === 'addressed'`. Excluded concerns carry a `reason`, not evidence, and are not judged.
+2. **Dedupe (pure JS):** `dedupeEvidence` collapses identical `slug::concernId::evidence` tuples (carrying a `count`) so the panel never re-judges the same string across K runs. `--judge-sample N` then caps the deduped set deterministically (stable key-sort, take first N — no `Math.random`, which the runtime forbids).
+3. **Panel fan-out (agents):** for each evidence item, spawn `--judge-panel` judges (default 3). Each judge sees **only** that one concern's evidence and the **"Evidence — what counts" bar embedded inline** (the `EVIDENCE_BAR` const — the judge runs headless and cannot read `docs/PLAN_CONCERNS.md`). Each returns `{ falsifiable: bool, reason }`.
+4. **Majority + tally (pure JS):** `judgePanelMajority` reduces each panel to `vague` unless a **strict majority** call it falsifiable (tie → vague). `tallyVagueness` rolls the items into `vaguenessRate` = fraction judged vague, plus a `perConcern` breakdown for the offender log.
+5. **Feed the scorecard:** the resulting `vaguenessRate` is passed to `buildScorecard(rows, scope, vaguenessRate)`, replacing the reserved `null`. With `--judge` off it stays `null` and the ratchet's `vaguenessRate` check is a quiet skip.
+
+`vaguenessRate` is an **"above" metric**: the ratchet (Phase 4) flags it as a regression when `current > baseline + tol.vague` (default `0.1`) — vagueness getting *worse* is the regression. The collection/dedupe/majority/tally functions and the `vaguenessRate` plumbing are exercised by `--selftest` with an **injected synthetic judge** (no agents), including the acceptance check that a deliberately vague string (`"we handle auth"`) is flagged.
+
 ### Phase 4 — Scorecard + baseline ratchet (`4vj.4`)
 
 Rolls the rows into a **scorecard** and diffs it against the blessed baseline. Mirrors the jankurai regression-only ratchet in `hooks/post-build-gate.sh` (regression-only; missing/unblessed baseline = quiet SKIP; deliberate-commit-only bump).
@@ -92,10 +110,12 @@ Rolls the rows into a **scorecard** and diffs it against the blessed baseline. M
 - **`CONCERN_IDS` ↔ `docs/PLAN_CONCERNS.md`** — the ten concern ids are inlined as a JS const (mirroring `vision.js`). When the vocabulary changes, update both.
 - **L1 structural checks ↔ `schemas/plan.lock.schema.json`** — the workflow sandbox cannot read files, so L1 hand-codes the schema's hard constraints rather than loading the schema. When the plan.lock schema changes, update `validatePlanLock` in the same commit. (Same documented-sync discipline the repo uses elsewhere instead of runtime SSOT loading.)
 - **`GATE_TOKENS` ↔ `skills/vision/SKILL.md` gates** — the controlled context vocabulary the run agent tags blocks with, and the patterns L2 matches. When a gate's wording changes, keep the token stable.
+- **`EVIDENCE_BAR` ↔ `docs/PLAN_CONCERNS.md` §"Evidence — what counts"** — the L4 judge runs headless and cannot read the doc, so the falsifiability bar (the five valid anchors + the bare-assertion-fails rule) is inlined as a JS const. When that section of `PLAN_CONCERNS.md` changes, update `EVIDENCE_BAR` in the same commit.
 - **scorecard shape ↔ `agent/baselines/vision-eval.json`** — `buildScorecard` and the seed/baseline file share the `{schemaVersion, blessed, aggregate{...}, fixtures{...}}` shape; `tests/vision-eval/ratchet.mjs` reads it. Change the three together.
 
 ## Verification
 
-- **Pure-JS checkers** are node-reachable: the script guards all `agent()` calls behind `typeof agent === 'function'`, uses no top-level `return`, and (in the node branch) publishes the checkers on `globalThis.__visionEval` — the workflow runtime forbids `export` other than `meta`, so a bridge replaces named exports. `--selftest` (and `node tests/vision-eval/selftest.mjs`, 16 checks) asserts: a schema-invalid lock fails L1; **a deliberately wrong manifest fails L2** (the `4vj.2` acceptance check); the adversarial branches (papering-over, fabricated must-haves, gate-token match) behave; identical locks score 100% stability and a divergent one <100%; the scorecard aggregates correctly; and the ratchet SKIPs an unblessed baseline, PASSes an unchanged corpus, and **BLOCKs an injected regression** (the `4vj.4` acceptance check).
+- **Pure-JS checkers** are node-reachable: the script guards all `agent()` calls behind `typeof agent === 'function'`, uses no top-level `return`, and (in the node branch) publishes the checkers on `globalThis.__visionEval` — the workflow runtime forbids `export` other than `meta`, so a bridge replaces named exports. `--selftest` (and `node tests/vision-eval/selftest.mjs`, 29 checks) asserts: a schema-invalid lock fails L1; **a deliberately wrong manifest fails L2** (the `4vj.2` acceptance check); the adversarial branches (papering-over, fabricated must-haves, gate-token match) behave; identical locks score 100% stability and a divergent one <100%; the scorecard aggregates correctly; the ratchet SKIPs an unblessed baseline, PASSes an unchanged corpus, and **BLOCKs an injected regression** (the `4vj.4` acceptance check); and for **L4** (`4vj.3`): `collectAddressedEvidence` skips excluded concerns, `dedupeEvidence` collapses repeats, the panel majority + even-split-→-vague rule holds, **a deliberately vague `"we handle auth"` string is flagged by the panel** (the `4vj.3` acceptance check, via an injected synthetic judge), `tallyVagueness` computes the rate, and the ratchet BLOCKs a `vaguenessRate` rise beyond tolerance while tolerating a sub-tolerance one.
 - **CI ratchet runner:** `node tests/vision-eval/ratchet.mjs <scorecard.json> [--baseline <path>]` exits `0/1/2` for PASS/BLOCK/SKIP.
 - **Live smoke:** `--only 01-multitenant-saas-web --k 1` runs one real `/vision` pass end-to-end and emits a one-row table (the expensive path; opt-in). `4vj.2`'s smoke (`--only 01,08,10 --k 1`) confirmed L1 3/3 valid and L2 discriminating (01+10 matched the oracle, 08 flagged a real `authz` divergence).
+- **L4 live smoke:** `--only 01-multitenant-saas-web --k 1 --judge --judge-panel 3` runs the real panel over one fixture's addressed evidence and emits a `vaguenessRate` + a vague-by-concern breakdown — the live counterpart to the injected-judge selftest (the well-formed fixture-01 evidence should score a low rate; the panel's flagging behavior on a bare assertion is what the selftest pins deterministically).
