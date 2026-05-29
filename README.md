@@ -1,33 +1,36 @@
 # autonomous-build
 
-Workflow infrastructure for going from a `vision.md` file to a shipped app, with the human as autopilot supervisor rather than pilot. Uses [beads (`bd`)](https://github.com/steveyegge/beads) for task tracking, Claude Code skills for the per-stage workflows, and `/loop` to drive autonomous execution.
+Workflow infrastructure for going from a `vision.md` file to a shipped app, with the human as autopilot supervisor rather than pilot. Uses [beads (`bd`)](https://github.com/steveyegge/beads) for task tracking, a mix of Claude Code skills and dynamic workflows for the per-stage steps, and `/loop` to drive autonomous execution.
 
 ## The pipeline
 
 ```
 vision.md   ──/vision──▶   plan.md + plan.lock.json + tenets.md
-plan.lock.json  ──/compose──▶  beads DAG (epics + tasks + deps)
-   (falls back to plan.md regex parse if lock missing)
+plan.md + plan.lock.json  ──/decompose──▶  blessed beads DAG (epics + tasks + deps)
+   (dynamic workflow: fans out formula pours, atomizes oversized beads,
+    scores each bead, adversarially cross-checks the DAG against the plan,
+    emits a BLESSED | NEEDS-FIX verdict + decomposeReport.md.
+    Subsumes the old /compose + /quality-pass + /split skills.)
    tenets.md ─ read by /build-next for build-time judgment calls
                                   │
+                          human review
+                   (authorize the blessed DAG before build)
+                                  │
                                   ▼
-                          /quality-pass   ──▶  per-bead score; under 95 → /split
-                                  │              (atomize oversized beads
-                                  │               along a named seam,
-                                  │               propose-then-confirm)
-                                  ▼
-              ┌──── /loop /build-next ────┐
-              │  bd ready → claim → build │   ◀── /flag bd-<id> <reason>
-              │  → gate → commit          │       (in-flight workflow capture)
-              │  → bd close (or block)    │
-              └─┬───────────────────┬─────┘
-                │ ready=0,          │ ready=0,
-                │ blocked>0         │ blocked=0
-                ▼                   ▼
-            /escalate            /retro
-            (PushNotification)   (workflow performance report +
-                                  files improvements into
-                                  autonomous-build's own beads)
+        ┌──── /build-batch  (or /loop /build-next) ────┐
+        │  bd ready → claim → build                    │   ◀── /flag bd-<id> <reason>
+        │  → gate → commit → bd close (or block)       │       (in-flight workflow capture)
+        │  /build-batch: N workers in worktrees,       │
+        │   serialized merges behind the post-merge    │
+        │   gate (dynamic workflow, refuses meta mode)  │
+        └─┬───────────────────────────────────┬────────┘
+          │ ready=0,                           │ ready=0,
+          │ blocked>0                          │ blocked=0
+          ▼                                    ▼
+      /escalate                             /retro
+      (PushNotification)                    (workflow performance report +
+                                             files improvements into
+                                             autonomous-build's own beads)
 ```
 
 ## Repo layout
@@ -35,8 +38,8 @@ plan.lock.json  ──/compose──▶  beads DAG (epics + tasks + deps)
 | Path | What it is |
 | --- | --- |
 | `formulas/` | beads workflow templates — the reusable intellectual property |
-| `skills/` | Turn-by-turn Claude Code skills (`vision`, `compose`, `quality-pass`, `split`, `build-next`, `build-batch`, `escalate`, `flag`) |
-| `workflows/` | Dynamic-workflow specs (`<name>.spec.md`) and their canonical generated scripts (`<name>.js`). `retro` lives here. |
+| `skills/` | Turn-by-turn Claude Code skills (`vision`, `build-next`, `escalate`, `flag`) |
+| `workflows/` | Dynamic-workflow specs (`<name>.spec.md`) and their canonical scripts (`<name>.js`). `decompose`, `build-batch`, and `retro` live here. `decompose.js` and `build-batch.js` are hand-authored (load-bearing); `retro.js` is first-run-generated then saved. |
 | `templates/vision.md` | The form you fill out per app |
 | `templates/tenets.md` | Template `/vision` populates per-app — inherits the workflow tenets and derives app-specific ones from vision + plan.lock |
 | `docs/TENETS.md` | The workflow-level tenets — principles the loop falls back on for build-time judgment calls |
@@ -60,7 +63,7 @@ Every app this workflow builds is held to the **[Jankurai](https://github.com/ne
 
 | Stage | Jankurai step | Mode |
 | --- | --- | --- |
-| `/compose` (per-app init) | `jankurai adopt` → `jankurai init --level agents --yes` → first advisory `jankurai audit` | Scaffolds `AGENTS.md`, ownership map, proof lanes; establishes a starting score |
+| `/decompose` (per-app init) | `jankurai adopt` → `jankurai init --level agents --yes` → first advisory `jankurai audit` | Scaffolds `AGENTS.md`, ownership map, proof lanes; establishes a starting score |
 | `/build-next` (per-task) | `jankurai kickoff --intent "<acceptance>"` before coding | Bounds the change — names read-first files, ownership boundaries, forbidden paths, proof lane |
 | `hooks/post-build-gate.ps1` (per-task close) | `jankurai audit --changed-fast` (advisory) + `jankurai witness` against baseline if present (hard fail on regression) | Inner-loop scan; merge witness ratchets only after a baseline has been accepted |
 

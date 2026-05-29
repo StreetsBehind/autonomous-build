@@ -20,17 +20,27 @@ Outputs: a paired `plan.md` (human narrative) and `plan.lock.json` (machine-read
 - Formula picks (which `formulas/*.formula.toml` to pour, with variable bindings)
 - Escalation budget (e.g. "block on >$5/day API spend")
 
-The lock is validated against [`schemas/plan.lock.schema.json`](../schemas/plan.lock.schema.json) before being written; field reference is in [`docs/PLAN_LOCK.md`](PLAN_LOCK.md). The lock is the source of truth `/compose` consumes — `plan.md` exists for human review and as a fallback for repos that pre-date the lock.
+The lock is validated against [`schemas/plan.lock.schema.json`](../schemas/plan.lock.schema.json) before being written; field reference is in [`docs/PLAN_LOCK.md`](PLAN_LOCK.md). The lock is the source of truth `/decompose` consumes — `plan.md` exists for human review and as a fallback for repos that pre-date the lock.
 
 This stage runs *with the user in the loop*. The plan is a contract — the loop won't second-guess it later.
 
-### `/compose` — plan.lock.json → beads DAG
+### `/decompose` — plan.lock.json → blessed beads DAG
 
-Reads `plan.lock.json` (falling back to `plan.md` regex parse with a deprecation warning if the lock is absent). Initializes beads in the app repo, runs `bd setup claude --project`, then for each formula pick:
-- `bd cook <formula> --var k=v ... --persist` (or `bd mol pour`) to spawn the issue subtree
-- `bd dep add` for cross-formula dependencies declared in the plan
+Implemented as a **dynamic workflow** (`workflows/decompose.spec.md` + `workflows/decompose.js`). Subsumes the three former skills `/compose`, `/quality-pass`, and `/split` — their behaviors are now Phases 3 (pour), 5 (score), and 4 (atomize) of one workflow.
 
-Output: a populated beads DB with epics, tasks, and a working dep graph. `bd ready` should return the first true leaf tasks.
+Reads `plan.lock.json` (falling back to `plan.md` regex parse with a deprecation warning if the lock is absent), initializes beads in the app repo, runs `bd setup claude --project` + Jankurai scaffolding, then:
+- **Pour (per-feature fan-out):** `bd cook <formula> --var k=v ... --persist` (or `bd mol pour`) to spawn each formula's issue subtree; `bd dep add` for cross-formula dependencies declared in the plan. Independent agents parallelize the pour (the old `/compose` skill was sequential).
+- **Atomize:** oversized beads are split along a named seam (the old `/split`).
+- **Score:** each bead gets a quality score (the old `/quality-pass`).
+- **Adversarial fidelity cross-check:** two independent agents must agree the DAG covers the source plan before it's blessed.
+
+Output: a populated beads DB with epics, tasks, and a working dep graph, plus a `decomposeReport.md` and a mechanical **`BLESSED` | `NEEDS-FIX`** verdict. The human reviews and authorizes the blessed DAG before any build stage runs. `bd ready` should then return the first true leaf tasks.
+
+### `/build-batch` — parallel build (the concurrent sibling of `/build-next`)
+
+Implemented as a **dynamic workflow** (`workflows/build-batch.spec.md` + `workflows/build-batch.js`), converted from a former single-context skill. One orchestrator script holds in-memory pipeline state, dispatches `beads-builder` workers into their own `bd worktree`s in the background, polls each worker's completion marker file (a cheap `stat()` rather than an LLM round-trip), and merges results to `main` **one at a time** behind the `hooks/post-build-gate.ps1` post-merge gate. Configurable `--workers`, `--max-merges`, and `--budget`.
+
+It **refuses to run in meta mode** in its Phase 0 pre-flight agent (parallel workers would race on this repo's shared checkout). Use `/loop /build-next` for meta work. Keeping pipeline state in script variables (instead of conversation) makes the run cheap to poll and resumable in-session across a context compaction.
 
 ### `/build-next` — one tick of the loop
 

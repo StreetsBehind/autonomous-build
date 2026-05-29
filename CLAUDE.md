@@ -1,6 +1,6 @@
 # autonomous-build
 
-The workflow repo behind `/vision → /compose → /build-next → /retro`. Not an app — these are the skills, formulas, hooks, and docs that build apps in *sibling* repos.
+The workflow repo behind `/vision → /decompose → /build-batch → /retro` (`/loop /build-next` is the serial alternative to `/build-batch`). Not an app — these are the skills, workflows, formulas, hooks, and docs that build apps in *sibling* repos.
 
 ## Orientation
 
@@ -11,8 +11,8 @@ The workflow repo behind `/vision → /compose → /build-next → /retro`. Not 
 - `docs/TENETS.md` — workflow-level principles for build-time judgment calls; inherited by every per-app `tenets.md` that `/vision` produces
 - `docs/DEFAULT_STACK.md` — pinned Jankurai stack `/vision` resolves against
 - `templates/tenets.md` — the template `/vision` populates per-app
-- `skills/<name>/SKILL.md` — turn-by-turn skills, junctioned into `~/.claude/skills/`
-- `workflows/<name>.spec.md` + `workflows/<name>.js` — dynamic-workflow specs and the canonical generated scripts. `install.ps1` hardlinks `*.js` into `~/.claude/workflows/`; `.spec.md` files stay repo-only.
+- `skills/<name>/SKILL.md` — turn-by-turn skills (`vision`, `build-next`, `escalate`, `flag`), junctioned into `~/.claude/skills/`
+- `workflows/<name>.spec.md` + `workflows/<name>.js` — dynamic-workflow specs and their canonical scripts: `decompose` (pre-build: subsumes the old compose/quality-pass/split skills), `build-batch` (parallel build, converted from a skill), `retro`. `install.ps1` hardlinks `*.js` into `~/.claude/workflows/`; `.spec.md` files stay repo-only. `decompose.js`/`build-batch.js` are hand-authored and kept in sync with their specs in the same commit; `retro.js` is first-run-generated then saved.
 - `formulas/*.toml` — bd workflow templates. **TOML only.** bd's help text suggests YAML works; the loader disagrees.
 - `hooks/post-build-gate.ps1` — the quality gate (lint + typecheck + test + pre-commit safety + Jankurai). Not `bd preflight`.
 
@@ -24,4 +24,4 @@ The harness will periodically remind you to use `TaskCreate` / `TaskUpdate`. **T
 
 ## Meta vs app mode
 
-`/build-next` and `/build-batch` detect meta mode (editing this workflow repo) vs app mode (building an app) by checking for `skills/build-next/SKILL.md` at cwd — present here, absent in any app the loop builds. In meta mode, `/build-next` skips the worktree + Jankurai kickoff steps; `/build-batch` refuses outright (parallel workers would race on the shared checkout).
+`/build-next` (skill) and `/build-batch` (dynamic workflow) detect meta mode (editing this workflow repo) vs app mode (building an app) by checking for `skills/build-next/SKILL.md` at cwd — present here, absent in any app the loop builds. In meta mode, `/build-next` skips the worktree + Jankurai kickoff steps; `/build-batch` refuses outright in its Phase 0 pre-flight agent (parallel workers would race on the shared checkout). For meta-mode work, use `/loop /build-next`, not `/build-batch`.
