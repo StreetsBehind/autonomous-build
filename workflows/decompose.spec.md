@@ -276,9 +276,20 @@ The cost is two agents instead of one. The benefit is `BLESSED` means something.
 
 ---
 
-## Phase 7 — Dep audit (sequential, 1 agent)
+## Tier-ordering wiring (Layer 2, epic autonomous-build-onv — runs between Phase 6 and Phase 7)
 
-Topological sanity check on the DAG. Catches cycles, empty ready sets, and implicit file-conflict pairs that `/build-batch` would otherwise discover the hard way.
+Materialize the build-order tiers (`foundational < platform < feature < enforcement`) as **bead-level** dependency edges, so a feature bead cannot land in `bd ready` ahead of the scaffold/floor it depends on. Epics gate by *parent-child*, not dependency, so the ordering must be a per-**bead** edge to actually block readiness (the smbuild root cause: a leaf feature bead was `ready` before the app-skeleton epic and built first, and the Jankurai ratchet correctly rejected it).
+
+**Tier derivation (SYNC with `/vision`).** `decompose.js` mirrors `deriveFeatureTier` / `FEATURE_TIERS` / `TIER_RULES` / `tierOfFormula` from `workflows/vision.js` (kept in lockstep — a SYNC comment marks it). `tierOf(featureName)` is: the lock's `featureOrder[].tier` is **authoritative** when present (the updated `/vision` stamps it); otherwise the tier is *derived* from the entry's formula picks (most-foundational = min over `FEATURE_TIERS` among its formulas), so an old lock with no `tier` still orders correctly. Unknown name → `feature`.
+
+**Generate (the wiring agent `tier-ordering-wiring`, phase label `Dep audit`).** The script groups the Phase-3 pour roots by tier into `tieredEpics` (`{ tier, pourRoot, children }`). **Skipped** (mutation only) when `Context.dryRun` OR fewer than 2 non-empty tiers exist (nothing to order) — `TierWiring.skipped = true`, logged. Otherwise one agent:
+- For each epic, reads its open children's **intra-epic** dep edges (`bd show <child> --json`, restricted to sibling children) to compute that epic's **ENTRY** beads (no dep on a sibling child) and **TERMINAL** beads (no sibling child depends on them); a singleton child is both.
+- For each **consecutive** non-empty tier pair (Lower `L` immediately before Higher `H`): for every entry bead `E` of every `H`-epic and every terminal bead `Tm` of every `L`-epic, `bd dep add <E> <Tm>` (E depends on Tm) and **VERIFY** via `bd show <E> --json` (don't trust the exit code), retrying once. Writes are serialized. Only consecutive pairs are wired — the full chain is materialized link-by-link; the transitive `foundational → feature` edge is implied, not duplicated.
+- Returns `{ wired: [{blocked, blocker}], verified, attempted, missing: [...], errors: [...] }` → stored as `TierWiring`. `missing` + `errors` feed the advisory-warnings tally (the *blocking* check is the topology assertion below).
+
+## Phase 7 — Dep audit (sequential, 1 agent) + topology assertion (deterministic)
+
+Topological sanity check on the DAG. Catches cycles, empty ready sets, and implicit file-conflict pairs that `/build-batch` would otherwise discover the hard way — **and** runs the Layer-2 topology assertion (the *assert* half of epic onv) as a pure-JS gate.
 
 **Agent:** `dep-audit`
 **Tools:** `Bash`
@@ -287,10 +298,23 @@ Topological sanity check on the DAG. Catches cycles, empty ready sets, and impli
 2. `bd ready --json` — must return at least one non-epic issue. Empty ready set means the DAG is malformed (everything blocked).
 3. **Implicit conflict scan:** for every pair of beads (B1, B2) where neither depends on the other (transitively), check whether `B1.metadata.filesTouched` and `B2.metadata.filesTouched` intersect. If yes, surface as `{ beadA: B1.id, beadB: B2.id, overlap: [<paths>] }`. These would race in `/build-batch`'s filesTouched conflict filter — not a hard fail, but worth flagging.
 4. **Cross-dep verification:** confirm every entry in `ParsedPlan.crossDeps` has a corresponding `bd dep` edge. Resolve endpoint names to bead IDs via the Phase 3 `featureToPourRoot` map (passed in), **not** by title — molecule-epic titles are formula names, so a title search never matches and falsely reports every edge missing (`autonomous-build-3fr.3`). A name absent from the map = an unpoured feature (real gap). Phase 3 passes its `verified[]` edge list as a cross-check; surface only edges genuinely absent from the live DB. A genuinely missing poured-to-poured edge means Phase 3 dropped a cross-feature dep (a Phase 3 bug); a missing edge with an unpoured endpoint is a coverage gap, not a wiring bug.
+5. **Bead graph (topology-assertion input):** emit one `{ id, tier, deps }` row for **every** open non-epic bead — `deps` = its direct blockers (open non-epic only), `tier` = looked up from the orchestrator-supplied `beadId → tier` map (computed in JS from `tieredEpics`); a bead not in the map (Phase-4 atomize child / Phase-3.5 enforcement pour) inherits its parent epic's tier, or `unknown` / `enforcement` for an unmapped enforcement bead. This is the data the deterministic assertion runs over — it must be complete and accurate.
 
-**Output:** `DepAuditResult = { cycles: [<cycle paths>], emptyReady: <bool>, implicitConflicts: [...], crossDepsApplied: [...], missingCrossDeps: [...] }`
+**Output:** `DepAuditResult = { cycles, emptyReady, implicitConflicts, crossDepsApplied, missingCrossDeps, beadGraph: [{id, tier, deps}], topologyValid: <bool>, topologyViolations: {...} }`
 
-**Failure:** cycles or `emptyReady=true` → blocking for BLESSED. Implicit conflicts + missing cross-deps are advisory (logged in report, do not block verdict alone — but synthesis weights them into the recommendation).
+### Topology assertion (pure JS, no agent — runs in the orchestrator body)
+
+The HARD CONSTRAINT: the workflow JS sandbox has no shell / `bd` / filesystem, so the *gather* (the `beadGraph`) is done inside the dep-audit agent, and the *assertion* is a deterministic pure-JS pass over that returned JSON. It builds adjacency from `beadGraph` and computes:
+
+- **`acyclic`** — no cycle (DFS); reports the cycle path.
+- **`tierMonotonic`** — for every edge `A → dep(B)` with both tiers known, `tierIndex(A) >= tierIndex(B)` (a bead only depends on its own tier or lower); collects inversions. Unknown-tier endpoints are not asserted on.
+- **`reachesFoundation`** — only when a `foundational` tier exists: every non-foundational bead transitively reaches a foundational bead; collects orphans.
+- **`initialReadyOk`** — only when a `foundational` tier exists: the zero-dep beads (the would-be initial `bd ready` set) are **foundational-only** (nothing dispatchable jumps a tier); collects violations.
+- **`topologyValid`** = `acyclic && no tier inversions && initialReadyOk && no orphans`.
+
+The collected violation lists are attached as `DepAuditResult.topologyViolations` for the report; `DepAuditResult.topologyValid` is set from the result. On a dry run / skip the `beadGraph` is empty and `topologyValid` is `true` vacuously, but the verdict uses `!== false` so it never spuriously blocks (and an empty graph also has no violations to report).
+
+**Failure:** cycles or `emptyReady=true` → blocking for BLESSED. **An explicit `topologyValid === false` is blocking** (a cycle, tier inversion, orphan, or non-foundational bead in the initial ready set — the DAG would build out of order); it forces NEEDS-FIX and is named in the report's "Tier ordering + topology" section with the exact offending edges. Implicit conflicts, missing cross-deps, and tier-wiring shortfalls (`TierWiring.missing`/`errors`) are advisory (logged + tallied into `advisoryWarnings`, do not block verdict alone — but they manifest as a topology violation if they actually broke the order).
 
 ---
 
@@ -303,7 +327,7 @@ Aggregate Phase 3–7 outputs, compute the overall verdict, write `decomposeRepo
 **Steps:**
 1. Aggregate `PourResult[]`, `AtomizeSummary`, `EpicScoreResult[]`, `FidelityResult`, `DepAuditResult`.
 2. Compute verdict:
-   - **BLESSED** iff: every `PourResult.status == 'ok'` AND `AtomizeSummary.persistentlyOversized.length == 0` AND `AtomizeSummary.unsplittable.length == 0` AND every bead in every `EpicScoreResult.scores` has `score >= 95` AND the quality pass actually covered the beads (`scoredCount > 0` when `totalOpenNonEpic > 0`, and `scoredCount >= totalOpenNonEpic`) AND `FidelityResult.bin == 'pass'` AND `DepAuditResult.cycles.length == 0` AND `DepAuditResult.emptyReady == false`. The "every bead ≥ 95" check is vacuously true on an empty score set, so the coverage clause is load-bearing — a run that scored zero beads is NEEDS-FIX, never a silent pass.
+   - **BLESSED** iff: every `PourResult.status == 'ok'` AND `AtomizeSummary.persistentlyOversized.length == 0` AND `AtomizeSummary.unsplittable.length == 0` AND every bead in every `EpicScoreResult.scores` has `score >= 95` AND the quality pass actually covered the beads (`scoredCount > 0` when `totalOpenNonEpic > 0`, and `scoredCount >= totalOpenNonEpic`) AND `FidelityResult.bin == 'pass'` AND `DepAuditResult.cycles.length == 0` AND `DepAuditResult.emptyReady == false` AND `DepAuditResult.topologyValid !== false` (Layer 2, onv — an explicit `false` from the topology assertion blocks; `undefined` from a dry-run/skip does not). The "every bead ≥ 95" check is vacuously true on an empty score set, so the coverage clause is load-bearing — a run that scored zero beads is NEEDS-FIX, never a silent pass.
    - **NEEDS-FIX** otherwise. The report explains exactly which condition failed.
 3. **Baseline acceptance** (igu.2, separate `accept-baseline` agent; runs only when `verdict == BLESSED` AND not a dry run). Confidence/`autoChain` are computed *before* this so it knows whether the run is attended or a walk-away:
    - Capture a fresh **whole-repo** audit straight to the baseline path: `jankurai audit . --json agent/baselines/main.repo-score.json` (full, not `--changed-fast`; its exit code is advisory — nonzero on a sub-85 scaffold is expected). Validate the receipt has a numeric top-level `score`; a `{}`/non-parseable score is a FAIL (the lbq.14 trap), not an acceptable baseline.
@@ -372,6 +396,12 @@ Aggregate Phase 3–7 outputs, compute the overall verdict, write `decomposeRepo
 - Cycles: <none | list>
 - Ready set on launch: <count> non-epic beads
 - Implicit conflicts (filesTouched overlap, no dep): <list>
+
+## Tier ordering + topology (Phase 7 — Layer 2, onv)
+- Tiers present (build order): <tierWiring.tiers joined " < ">
+- Cross-tier ordering edges wired: <tierWiring.verified>/<tierWiring.attempted> verified present (or "skipped — <reason>")
+- Tier-wiring shortfalls: <tierWiring.missing + errors — advisory unless they manifest below>
+- **Topology assertion (deterministic):** valid=<topology.topologyValid> over <nodeCount> beads — acyclic / tier-monotonic / reaches-foundation / initial-ready-⊆-foundational, each with its violation list. A `false` is a BLOCKING failure (forces NEEDS-FIX) naming the exact inverted/missing edges.
 
 ## Jankurai baseline (Phase 8)
 <omit if NEEDS-FIX or dryRun>

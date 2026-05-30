@@ -921,19 +921,153 @@ const FidelityResult = { bin: fidelityBin, A: verifierA, B: verifierB, C: verifi
 log(`Fidelity verdict: ${fidelityBin}${concernGap && fidelityBin !== 'concern-gap' ? ' (+ concern-gap)' : ''}${mustHaveGap && fidelityBin !== 'musthave-gap' ? ' (+ musthave-gap)' : ''}`);
 
 // ---------------------------------------------------------------------------
+// Tier-ordering wiring (Layer 2, epic autonomous-build-onv) — wire bead-level
+// foundational -> platform -> feature -> enforcement ordering edges so a feature
+// bead can't land in `bd ready` ahead of the scaffold/floor it depends on. This
+// is the generate half of the three-layer enforcement; the deterministic topology
+// assertion (below, in Phase 7) is the assert half.
+// ---------------------------------------------------------------------------
+
+// SYNC: mirrors deriveFeatureTier in workflows/vision.js (FEATURE_TIERS + TIER_RULES + tierOfFormula).
+// Keep the mapping in lockstep — /vision stamps `tier` into the lock from the SAME rules; this is the
+// fallback derivation for old locks with no `tier`, and the resolver decompose uses to group pours.
+const FEATURE_TIERS = ['foundational', 'platform', 'feature', 'enforcement'];
+const TIER_RULES = {
+  foundational: ['app-skeleton', 'otel-bootstrap', 'otel', 'observability'],
+  platform: ['tenant-boot', 'oidc-client', 'oidc', 'openfga', 'authz', 'authn', 'audit-chain',
+             'terraform', 'iac', 'migration', 'composer-grammar', 'secrets'],
+  // feature is the DEFAULT (anything unmatched); enforcement is the suffix/substring check below.
+};
+function tierOfFormula(name) {
+  const n = (typeof name === 'string') ? name.toLowerCase() : '';
+  if (!n) return 'feature';
+  // enforcement checked first per-formula (a formula whose name screams enforcement is enforcement),
+  // but the entry-level min in deriveFeatureTier still demotes it under any more-foundational sibling.
+  if (n.includes('concern-enforcement') || n.includes('e2e-acceptance') || n.endsWith('-acceptance')) return 'enforcement';
+  if (TIER_RULES.foundational.some((p) => n.includes(p))) return 'foundational';
+  if (TIER_RULES.platform.some((p) => n.includes(p))) return 'platform';
+  return 'feature';
+}
+// deriveFeatureTier(formulas): most-foundational tier (min over FEATURE_TIERS) among the entry's formulas.
+function deriveFeatureTier(formulas) {
+  const list = (Array.isArray(formulas) ? formulas : []).filter((f) => typeof f === 'string' && f.trim());
+  if (!list.length) return 'feature';
+  let best = FEATURE_TIERS.length - 1; // most-derived = enforcement
+  for (const f of list) {
+    const idx = FEATURE_TIERS.indexOf(tierOfFormula(f));
+    if (idx >= 0 && idx < best) best = idx;
+  }
+  return FEATURE_TIERS[best];
+}
+// tierOf(featureName): the lock's `tier` is authoritative (present on locks from the updated /vision);
+// otherwise derive from the feature entry's formula picks. Defaults to 'feature' for an unknown name.
+const featureByName = {};
+for (const f of (ParsedPlan.features || [])) { if (f && f.name) featureByName[f.name] = f; }
+function tierOf(featureName) {
+  const f = featureByName[featureName];
+  if (f && FEATURE_TIERS.includes(f.tier)) return f.tier;          // lock tier authoritative
+  if (f) return deriveFeatureTier(f.formulas);                     // fallback: derive from formulas
+  return 'feature';
+}
+
+// Group the poured features by tier (FEATURE_TIERS order). Each entry: { tier, pourRoot, children:[beadId] }.
+// pourOk[].children is [{ id, title, metadata }] (Phase 3 snapshot) — the tier-wiring agent re-reads live
+// children from bd, but we capture the snapshot ids here too so beadId->tier covers them as a floor.
+const tieredEpics = pourOk
+  .filter((r) => r.pourRoot)
+  .map((r) => ({ tier: tierOf(r.feature), pourRoot: r.pourRoot, feature: r.feature,
+                 children: (r.children || []).map((c) => (c && c.id) ? c.id : c).filter(Boolean) }));
+const tiersPresent = FEATURE_TIERS.filter((t) => tieredEpics.some((e) => e.tier === t));
+log(`Tier grouping: ${tieredEpics.length} epics across ${tiersPresent.length} non-empty tiers (${tiersPresent.join(' < ') || 'none'})`);
+
+// beadId -> tier, computed in JS from tieredEpics (pourRoot epic + its snapshot children share the
+// feature's tier). Passed into the tier-wiring agent AND the dep-audit agent so each open bead can be
+// labelled by its epic's tier without re-deriving. The dep-audit agent extends this over live children.
+const beadTierMap = {};
+for (const e of tieredEpics) {
+  beadTierMap[e.pourRoot] = e.tier;
+  for (const id of e.children) beadTierMap[id] = e.tier;
+}
+
+let TierWiring = { skipped: true, reason: null, wired: [], verified: 0, attempted: 0, missing: [], errors: [], tiers: tiersPresent };
+if (Context.dryRun || tiersPresent.length < 2) {
+  TierWiring.reason = Context.dryRun ? 'dry run — no mutation' : `only ${tiersPresent.length} non-empty tier(s) — no cross-tier edges to wire`;
+  log(`Tier-ordering wiring: SKIPPED (${TierWiring.reason})`);
+} else {
+  const tierWiringSchema = {
+    type: 'object',
+    required: ['wired', 'verified', 'attempted', 'missing', 'errors'],
+    properties: {
+      wired:     { type: 'array', items: { type: 'object' } },   // [{ blocked, blocker }]
+      verified:  { type: 'number' },
+      attempted: { type: 'number' },
+      missing:   { type: 'array', items: { type: 'object' } },
+      errors:    { type: 'array', items: { type: 'object' } }
+    }
+  };
+  const tierWiringAgent = await agent(`
+You are the tier-ordering wiring agent for /decompose (Layer 2, epic autonomous-build-onv). You wire bead-level dependency edges so that a HIGHER-tier epic's entry beads depend on each LOWER-tier epic's terminal beads — materializing the foundational -> platform -> feature -> enforcement build order as actual \`bd dep\` edges (epics gate by parent-child, NOT dependency, so the order must be a per-BEAD edge to actually block readiness). (Self-contained: all instructions are inline; you run in the app repo cwd, where the workflow spec is not present.)
+
+The epics, grouped by tier (ordered most- to least-foundational; only NON-EMPTY tiers, already in build order):
+${JSON.stringify(tieredEpics.map((e) => ({ tier: e.tier, pourRoot: e.pourRoot, feature: e.feature })), null, 2)}
+
+Non-empty tiers in build order: ${JSON.stringify(tiersPresent)}
+
+STEP 1 — For EACH epic above, compute its ENTRY beads and TERMINAL beads from the LIVE DB:
+  a. List that epic's OPEN non-epic children: \`bd list --parent <pourRoot> --status=open --json\` (these are the SIBLING children — the only beads whose intra-epic edges matter here).
+  b. For each child, \`bd show <child> --json\` and read its dependency/blocked-by edges, RESTRICTED to other SIBLING children of the same epic (ignore edges to beads outside this epic).
+  c. ENTRY beads = sibling children that do NOT depend on any sibling child (nothing in-epic blocks them). TERMINAL beads = sibling children that NO sibling child depends on (nothing in-epic waits on them). A singleton child (no intra-epic edges) is BOTH an entry and a terminal. An epic with no open children contributes neither.
+
+STEP 2 — For each CONSECUTIVE non-empty tier pair (Lower tier L immediately before Higher tier H in the build order above): for EVERY entry bead E of EVERY epic in H, and EVERY terminal bead Tm of EVERY epic in L, add the edge "E depends on Tm":
+  a. \`bd dep add <E> <Tm>\` (E is blocked, Tm is the blocker). SERIALIZE these writes — run them one at a time, never in parallel, so concurrent bd writes don't race on the jsonl. Increment "attempted" per edge you attempt.
+  b. VERIFY the edge actually landed — do NOT trust the add's exit code. \`bd show <E> --json\` and confirm <Tm> appears in E's dependency/blocked-by list (\`bd dep show <E>\` is a fallback if the JSON shape is unclear). Only a CONFIRMED edge counts toward "verified" and goes into "wired" as { "blocked": "<E>", "blocker": "<Tm>" }.
+  c. If the add reports success but verification shows the edge absent, retry the add ONCE; if still absent, record under "missing" as { "blocked": "<E>", "blocker": "<Tm>", "observed": "<what bd show returned>" }.
+  d. Any command error → record under "errors" as { "edge": { "blocked": "<E>", "blocker": "<Tm>" }, "msg": "<error>" }. Do NOT throw (T7).
+
+Wire ONLY consecutive tier pairs — the transitive chain (foundational -> platform -> feature -> enforcement) is materialized link by link; do NOT also wire foundational->feature directly (it's implied transitively and would just add redundant edges).
+
+Return JSON:
+{ "wired": [{ "blocked": "<E>", "blocker": "<Tm>" }, ...], "verified": <n>, "attempted": <n>, "missing": [{ "blocked": "...", "blocker": "...", "observed": "..." }, ...], "errors": [{ "edge": {...}, "msg": "..." }, ...] }
+`, { label: 'tier-ordering-wiring', phase: 'Dep audit', schema: tierWiringSchema, agentType: 'general-purpose' });
+  TierWiring = {
+    skipped: false,
+    reason: null,
+    wired:     tierWiringAgent?.wired || [],
+    verified:  tierWiringAgent?.verified ?? 0,
+    attempted: tierWiringAgent?.attempted ?? 0,
+    missing:   tierWiringAgent?.missing || [],
+    errors:    tierWiringAgent?.errors || [],
+    tiers:     tiersPresent
+  };
+  log(`Tier-ordering wiring: ${TierWiring.verified}/${TierWiring.attempted} cross-tier edges verified present, ${TierWiring.missing.length} missing, ${TierWiring.errors.length} errors (tiers ${tiersPresent.join(' < ')})`);
+}
+
+// ---------------------------------------------------------------------------
 // Phase 7 — Dep audit (sequential, 1 agent)
 // ---------------------------------------------------------------------------
 phase('Dep audit');
 
 const depAuditSchema = {
   type: 'object',
-  required: ['cycles', 'emptyReady', 'implicitConflicts', 'crossDepsApplied', 'missingCrossDeps'],
+  required: ['cycles', 'emptyReady', 'implicitConflicts', 'crossDepsApplied', 'missingCrossDeps', 'beadGraph'],
   properties: {
     cycles:            { type: 'array' },
     emptyReady:        { type: 'boolean' },
     implicitConflicts: { type: 'array' },
     crossDepsApplied:  { type: 'array' },
-    missingCrossDeps:  { type: 'array' }
+    missingCrossDeps:  { type: 'array' },
+    beadGraph: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['id', 'tier', 'deps'],
+        properties: {
+          id:   { type: 'string' },
+          tier: { enum: ['foundational', 'platform', 'feature', 'enforcement', 'unknown'] },
+          deps: { type: 'array', items: { type: 'string' } }
+        }
+      }
+    }
   }
 };
 
@@ -948,6 +1082,10 @@ Steps:
    - For each pair (B1, B2): if neither depends on the other transitively (\`bd dep\` graph), AND their metadata.filesTouched arrays intersect (treat each entry as a glob; intersect if any pair string-equals OR matches via glob), surface { beadA, beadB, overlap: [<paths>] }.
    - Skip pairs where either bead has no filesTouched (they fall through to the post-merge gate in /build-batch).
 4. Cross-dep verification: for each entry in ${JSON.stringify(ParsedPlan.crossDeps)}, resolve both endpoint names to bead IDs using this AUTHORITATIVE Phase 3 name→pour-root map: ${JSON.stringify(featureToPourRoot)} — do NOT resolve by title (molecule-epic titles are formula names like "crud-feature"/"integration-http", never feature names, so a title search always misses). A name absent from the map = that feature never poured; mark its edges applied:false. For resolved pairs, confirm the edge via \`bd show <blockedId> --json\`. Phase 3 already wired + verified these edges: ${JSON.stringify(crossDepWiring.verified)} — surface under missingCrossDeps only edges genuinely absent from the live DB, not edges you merely failed to resolve by title.
+5. BEAD GRAPH (topology assertion input — the orchestrator runs a deterministic pure-JS check over this, so it must be COMPLETE and ACCURATE). For EVERY open NON-epic bead (\`bd list --status=open --json\` filtered to issue_type != "epic"), emit one row { "id", "tier", "deps" }:
+   - "deps" = the bead IDs THIS bead directly depends on (its blockers — what must finish first). Read from \`bd show <id> --json\` (dependency/blocked-by edges) or the snapshot's dependency edges. List ONLY direct deps (not transitive), and ONLY deps that are themselves open non-epic beads (drop edges to epics or closed beads). Empty array if it depends on nothing.
+   - "tier" = the bead's build-order tier. Use this beadId→tier map computed by the orchestrator from the poured epics: ${JSON.stringify(beadTierMap)}. If the bead's id is a key, use that tier. If it is NOT in the map (e.g. a bead created by Phase 4 atomize or a Phase 3.5 enforcement/floor pour), find its parent epic (\`bd show <id> --json\` → parent) and inherit the tier of that epic from the same map (the epic's pourRoot is a map key); for a Phase 3.5 enforcement/floor/e2e bead whose epic is the app epic or otherwise unmapped, label it "enforcement" if its title/description reads as a concern/floor/e2e-acceptance enforcement bead, else "unknown". Never guess a tier that contradicts the map.
+   Cover ALL open non-epic beads — the orchestrator cross-checks this against the live bead count.
 
 Return JSON:
 {
@@ -955,11 +1093,128 @@ Return JSON:
   "emptyReady": <bool>,
   "implicitConflicts": [{ "beadA": "...", "beadB": "...", "overlap": ["..."] }, ...],
   "crossDepsApplied": [{ "blocked": "...", "blocker": "...", "applied": <bool> }, ...],
-  "missingCrossDeps": [...]
+  "missingCrossDeps": [...],
+  "beadGraph": [{ "id": "...", "tier": "foundational|platform|feature|enforcement|unknown", "deps": ["<beadId>", ...] }, ...]
 }
 `, { label: 'dep-audit', phase: 'Dep audit', schema: depAuditSchema, agentType: 'general-purpose' });
 
 log(`Dep audit: cycles=${(DepAuditResult?.cycles || []).length}, emptyReady=${DepAuditResult?.emptyReady}, implicitConflicts=${(DepAuditResult?.implicitConflicts || []).length}`);
+
+// ---------------------------------------------------------------------------
+// Topology assertion (Layer 2, epic autonomous-build-onv — the ASSERT half).
+// Deterministic, pure-JS gate over the beadGraph the dep-audit agent gathered:
+// no LLM judgement, no bd/fs/shell here. Builds adjacency from beadGraph and
+// requires (1) acyclic, (2) tier-monotonic (a bead only depends on its own tier
+// or lower), (3) every non-foundational bead transitively reaches a foundational
+// bead, (4) the initial ready set (zero-dep beads) ⊆ foundational tier. Any
+// violation → topologyValid=false → blocks BLESSED. A dry run / skip leaves the
+// graph empty, so topologyValid stays undefined and never spuriously fails.
+// ---------------------------------------------------------------------------
+function assertTopology(beadGraph, tiersSeen) {
+  const nodes = Array.isArray(beadGraph) ? beadGraph.filter((n) => n && typeof n.id === 'string') : [];
+  const tierIndex = (t) => FEATURE_TIERS.indexOf(t); // -1 for 'unknown'/absent
+  const byId = {};
+  for (const n of nodes) byId[n.id] = n;
+  const adj = {};      // id -> [dep ids that exist as nodes]
+  for (const n of nodes) {
+    adj[n.id] = (Array.isArray(n.deps) ? n.deps : []).filter((d) => typeof d === 'string' && byId[d]);
+  }
+  const hasFoundation = (Array.isArray(tiersSeen) ? tiersSeen : []).includes('foundational')
+    || nodes.some((n) => n.tier === 'foundational');
+
+  // (1) acyclic — DFS with colour marks.
+  let acyclic = true;
+  const cyclePath = [];
+  const colour = {}; // 0=unseen,1=in-stack,2=done
+  const stack = [];
+  const dfs = (id) => {
+    colour[id] = 1; stack.push(id);
+    for (const d of adj[id] || []) {
+      if (colour[d] === 1) { acyclic = false; if (!cyclePath.length) cyclePath.push(...stack.slice(stack.indexOf(d)), d); return; }
+      if (colour[d] === undefined && dfs(d)) return true;
+      if (!acyclic) return true;
+    }
+    colour[id] = 2; stack.pop();
+    return false;
+  };
+  for (const n of nodes) { if (colour[n.id] === undefined) { if (dfs(n.id)) break; } }
+
+  // (2) tier-monotonic — every edge A->B with both tiers known requires tierIndex(A) >= tierIndex(B).
+  const tierViolations = [];
+  for (const n of nodes) {
+    const ai = tierIndex(n.tier);
+    if (ai < 0) continue; // unknown source tier — can't assert
+    for (const d of adj[n.id]) {
+      const bi = tierIndex(byId[d].tier);
+      if (bi < 0) continue; // unknown dep tier — can't assert
+      if (ai < bi) tierViolations.push({ bead: n.id, beadTier: n.tier, dep: d, depTier: byId[d].tier });
+    }
+  }
+
+  // (3) reachesFoundation — only meaningful if a foundational tier exists. Every non-foundational
+  //     bead must have a transitive dep path into SOME foundational bead.
+  const orphans = [];
+  if (hasFoundation) {
+    const reaches = {}; // memoized: id -> reaches a foundational bead transitively
+    const reach = (id, seen) => {
+      if (reaches[id] !== undefined) return reaches[id];
+      if (seen.has(id)) return false; // cycle guard
+      seen.add(id);
+      let r = false;
+      for (const d of adj[id] || []) {
+        if (byId[d].tier === 'foundational') { r = true; break; }
+        if (reach(d, seen)) { r = true; break; }
+      }
+      seen.delete(id);
+      reaches[id] = r;
+      return r;
+    };
+    for (const n of nodes) {
+      if (n.tier === 'foundational') continue;
+      if (!reach(n.id, new Set())) orphans.push({ bead: n.id, tier: n.tier });
+    }
+  }
+
+  // (4) initialReadyOk — the zero-dep beads (the would-be initial `bd ready` set) must be
+  //     foundational-only when a foundational tier exists.
+  const initialViolations = [];
+  let initialReadyOk = true;
+  if (hasFoundation) {
+    for (const n of nodes) {
+      if ((adj[n.id] || []).length === 0 && n.tier !== 'foundational') {
+        initialViolations.push({ bead: n.id, tier: n.tier });
+      }
+    }
+    initialReadyOk = initialViolations.length === 0;
+  }
+
+  const topologyValid = acyclic && tierViolations.length === 0 && initialReadyOk && orphans.length === 0;
+  return {
+    nodeCount: nodes.length,
+    hasFoundation,
+    acyclic,
+    cyclePath,
+    tierMonotonic: tierViolations.length === 0,
+    tierViolations,
+    reachesFoundation: orphans.length === 0,
+    orphans,
+    initialReadyOk,
+    initialViolations,
+    topologyValid
+  };
+}
+
+const topology = assertTopology(DepAuditResult?.beadGraph || [], tiersPresent);
+if (DepAuditResult) {
+  DepAuditResult.topologyValid = topology.topologyValid;
+  DepAuditResult.topologyViolations = {
+    cyclePath: topology.cyclePath,
+    tierViolations: topology.tierViolations,
+    orphans: topology.orphans,
+    initialViolations: topology.initialViolations
+  };
+}
+log(`Topology assertion: valid=${topology.topologyValid} (${topology.nodeCount} beads, foundation=${topology.hasFoundation}) — acyclic=${topology.acyclic}, tierMonotonic=${topology.tierMonotonic} (${topology.tierViolations.length} viol), reachesFoundation=${topology.reachesFoundation} (${topology.orphans.length} orphans), initialReadyOk=${topology.initialReadyOk} (${topology.initialViolations.length} viol)`);
 
 // ---------------------------------------------------------------------------
 // Phase 8 — Synthesis & verdict (verdict + autoChain in JS, then the Baseline
@@ -990,7 +1245,12 @@ const blessed =
   fidelityBin === 'pass' &&
   concernEnforcementClean &&
   (DepAuditResult?.cycles || []).length === 0 &&
-  !DepAuditResult?.emptyReady;
+  !DepAuditResult?.emptyReady &&
+  // Layer 2 topology assertion (onv): an explicit `false` (a real topology
+  // violation — cycle, tier inversion, orphan, or a non-foundational bead in the
+  // initial ready set) blocks BLESSED. `!== false` so a dryRun/skip (where the
+  // beadGraph is empty and topologyValid is undefined) does not spuriously fail.
+  (DepAuditResult?.topologyValid !== false);
 
 const verdict = blessed ? 'BLESSED' : 'NEEDS-FIX';
 
@@ -1006,7 +1266,13 @@ const verdict = blessed ? 'BLESSED' : 'NEEDS-FIX';
 // ---------------------------------------------------------------------------
 const advisoryWarnings =
   (DepAuditResult?.implicitConflicts || []).length +
-  (DepAuditResult?.missingCrossDeps || []).length;
+  (DepAuditResult?.missingCrossDeps || []).length +
+  // tier-ordering edges that were attempted but didn't land (advisory: the
+  // topology assertion below is the BLOCKING check; an un-landed tier edge that
+  // matters shows up there as a tier/initial-ready violation, so this is just a
+  // "glance at the wiring" nudge on an otherwise-BLESSED run).
+  (TierWiring?.missing || []).length +
+  (TierWiring?.errors || []).length;
 const confidence = !blessed ? 'n/a' : (advisoryWarnings === 0 ? 'high' : 'review-recommended');
 const autoChain = parsedArgs.autoBless && confidence === 'high' && !Context.dryRun;
 // beadCount proxies the ready non-epic beads at launch; the worker count is a hint.
@@ -1143,7 +1409,9 @@ const synthesisPayload = {
   quality: qualityResults,
   fidelity: FidelityResult,
   depAudit: DepAuditResult,
-  crossDepWiring
+  crossDepWiring,
+  tierWiring: TierWiring,   // Layer 2 onv: cross-tier ordering edges wired (generate half)
+  topology                  // Layer 2 onv: deterministic topology assertion (assert half)
 };
 
 // Structured return so the orchestrator can read reportPath back. Without a
@@ -1246,6 +1514,18 @@ Steps:
 - Ready set on launch: <count> non-epic beads
 - Implicit conflicts (filesTouched overlap, no dep): <list>
 
+## Tier ordering + topology (Phase 7 — Layer 2, onv)
+<render from tierWiring + topology; if tierWiring.skipped, state the skip reason (dry run or <2 non-empty tiers) and note the topology assertion did not run / passed vacuously>
+- Tiers present (build order): <tierWiring.tiers joined with " < ">
+- Cross-tier ordering edges wired: <tierWiring.verified>/<tierWiring.attempted> verified present (foundational → platform → feature → enforcement; entry beads of each higher tier depend on terminal beads of the lower tier)
+- Tier-wiring shortfalls: <tierWiring.missing + tierWiring.errors — each named; advisory unless they manifest as a topology violation below>
+- **Topology assertion (deterministic, pure-JS gate):** valid=<topology.topologyValid> over <topology.nodeCount> beads (foundation present=<topology.hasFoundation>)
+  - Acyclic: <topology.acyclic — yes/no; if no, show topology.cyclePath>
+  - Tier-monotonic (a bead only depends on its own tier or lower): <topology.tierMonotonic — yes/no; if no, list topology.tierViolations as "<bead>(<beadTier>) → <dep>(<depTier>)">
+  - Reaches foundation (every non-foundational bead transitively depends into a foundational bead): <topology.reachesFoundation — yes/no; if no, list topology.orphans>
+  - Initial ready set ⊆ foundational (no bead jumps a tier into `bd ready`): <topology.initialReadyOk — yes/no; if no, list topology.initialViolations>
+  - <if topology.topologyValid is false: this is a BLOCKING failure — the DAG would build out of order; forces NEEDS-FIX. Name the exact missing/inverted edges so the fix is mechanical.>
+
 ## Jankurai baseline (Phase 8)
 <render from baseline; omit this whole section if verdict is NEEDS-FIX or dryRun>
 - Baseline accepted: <baseline.accepted — yes/no>
@@ -1316,7 +1596,15 @@ const finalResult = {
     (qualityOk && !allBeadsAt95) ? 'quality (some beads < 95)' : null,
     fidelityBin !== 'pass' ? `fidelity (${fidelityBin})` : null,
     (DepAuditResult?.cycles || []).length > 0 ? 'dep-audit (cycles)' : null,
-    DepAuditResult?.emptyReady ? 'dep-audit (empty ready set)' : null
+    DepAuditResult?.emptyReady ? 'dep-audit (empty ready set)' : null,
+    // Layer 2 topology assertion (onv): only an explicit false is a failure
+    // (undefined = dryRun/skip, never a fail). Name which invariant broke.
+    (DepAuditResult?.topologyValid === false) ? `dep-audit (topology: ${[
+      !topology.acyclic ? 'cycle' : null,
+      topology.tierViolations.length ? `${topology.tierViolations.length} tier-inversion(s)` : null,
+      topology.orphans.length ? `${topology.orphans.length} orphan(s) (no path to foundation)` : null,
+      topology.initialViolations.length ? `${topology.initialViolations.length} non-foundational bead(s) in initial ready set` : null
+    ].filter(Boolean).join(', ')})` : null
   ].filter(Boolean)
 };
 
