@@ -581,6 +581,57 @@ function featurePhase(feature, mustHaves) {
   }
   return 1;
 }
+// ── Build-order tier (Layer 1, epic autonomous-build-onv) ────────────────────────────────────────
+// THE single source-of-truth mapping from a featureOrder[] entry's formula picks to its build-order
+// tier. /decompose consumes this to wire foundational -> platform -> feature -> enforcement ordering
+// edges (and falls back to deriving it from the formula category for old locks with no tier).
+//
+// Tier order (most- to least-foundational): foundational < platform < feature < enforcement.
+//   foundational — the compile/build scaffolding the whole tree depends on (app-skeleton, OTel/observability bootstrap).
+//   platform     — shared services/infra every feature builds on (tenancy, auth[nz], audit, IaC, migrations, secrets, composer grammar).
+//   feature      — product features (CRUD, gRPC, integrations, background jobs); the DEFAULT for anything unmatched.
+//   enforcement  — concern-enforcement + acceptance/e2e gates that assert the finished surface; built last.
+//
+// PRECEDENCE: each rule is a list of case-insensitive substrings; the FIRST rule (in foundational ->
+// platform -> feature -> enforcement source order) that any formula matches wins for that formula.
+// A featureOrder entry with MULTIPLE formulas takes the MOST-FOUNDATIONAL (lowest/earliest) tier among
+// them — e.g. an entry pouring app-skeleton + crud-feature is `foundational`, so its bead can't jump
+// ahead of the scaffolding it also lays down. enforcement is checked first per-formula (a formula whose
+// name screams enforcement is enforcement), but loses to any more-foundational formula in the same entry
+// via the entry-level min — matching the documented foundational < ... < enforcement ordering.
+const FEATURE_TIERS = ['foundational', 'platform', 'feature', 'enforcement'];
+const TIER_RULES = {
+  // order within a list does not matter; cross-tier precedence is the entry-level min below.
+  enforcement: ['concern-enforcement', 'e2e-acceptance', '-acceptance'],
+  foundational: ['app-skeleton', 'otel-bootstrap', 'otel', 'observability'],
+  platform: ['tenant-boot', 'oidc-client', 'oidc', 'openfga', 'authz', 'authn', 'audit-chain',
+             'terraform', 'iac', 'migration', 'composer-grammar', 'secrets'],
+  // feature is the DEFAULT (crud-feature*, grpc-tonic*, integration-http, background-job, anything unmatched).
+};
+function tierOfFormula(name) {
+  const n = isStr(name) ? name.toLowerCase() : '';
+  if (!n) return 'feature';
+  // `-acceptance` is a suffix check; the rest are plain substrings. enforcement first so an
+  // *-acceptance formula isn't misread, but the entry-level min still demotes it under any
+  // more-foundational sibling formula.
+  if (n.includes('concern-enforcement') || n.includes('e2e-acceptance') || n.endsWith('-acceptance')) return 'enforcement';
+  if (TIER_RULES.foundational.some((p) => n.includes(p))) return 'foundational';
+  if (TIER_RULES.platform.some((p) => n.includes(p))) return 'platform';
+  return 'feature';
+}
+// deriveFeatureTier(formulas): a featureOrder entry's formulas[] (formula-name strings) -> its tier.
+// Returns the most-foundational tier present (min over the FEATURE_TIERS ordering); empty/absent -> 'feature'.
+function deriveFeatureTier(formulas) {
+  const list = (isArr(formulas) ? formulas : []).filter(nonEmptyStr);
+  if (!list.length) return 'feature';
+  let best = FEATURE_TIERS.length - 1; // most-derived = enforcement
+  for (const f of list) {
+    const idx = FEATURE_TIERS.indexOf(tierOfFormula(f));
+    if (idx >= 0 && idx < best) best = idx;
+  }
+  return FEATURE_TIERS[best];
+}
+
 // Distinct phase numbers across must-haves + features, ascending. <=1 distinct phase => single-phase (null).
 // Phase 1 is the walking skeleton (active, non-provisional); every later phase is planned + provisional
 // (a sketch /replan firms up when reached). name/goal use the agent's `phases` hint when it gave one, else
@@ -756,7 +807,10 @@ function assembleLock(a) {
   const phases = derivePhases(mhList, rawFeatures, sm, f.phases);
   const multiPhase = isArr(phases) && phases.length > 1;
   const featureOrder = rawFeatures.map((x) => {
-    const out = { name: x.name, formulas: x.formulas.filter(nonEmptyStr) };
+    const formulas = x.formulas.filter(nonEmptyStr);
+    // tier: authoritative build-order tier from the formula picks (Layer 1, onv). requires: reserved
+    // for finer cross-feature ordering vision can determine — empty for now (shape must be valid).
+    const out = { name: x.name, formulas, tier: deriveFeatureTier(formulas), requires: [] };
     if (isObj(x.vars) && Object.keys(x.vars).length) out.vars = x.vars;
     if (nonEmptyStr(x.notes)) out.notes = x.notes;
     if (multiPhase) out.phase = featurePhase(x, mhList);
@@ -889,7 +943,10 @@ function validateLock(pl, concernIds = CONCERN_IDS) {
     if (!isObj(f) || !nonEmptyStr(f.name) || !isArr(f.formulas) || f.formulas.length < 1) errors.push(`featureOrder[${i}] needs {name,formulas>=1}`);
     else {
       if ('phase' in f && !(Number.isInteger(f.phase) && f.phase >= 1)) errors.push(`featureOrder[${i}].phase must be an integer >= 1`);
-      for (const k of extraKeys(f, ['name', 'formulas', 'vars', 'notes', 'phase'])) errors.push(`featureOrder[${i}].${k} not allowed`);
+      // tier (required, Layer 1/onv): authoritative build-order tier. requires (optional): array of strings.
+      if (!FEATURE_TIERS.includes(f.tier)) errors.push(`featureOrder[${i}].tier must be one of ${FEATURE_TIERS.join('|')}`);
+      if ('requires' in f && (!isArr(f.requires) || !f.requires.every(nonEmptyStr))) errors.push(`featureOrder[${i}].requires must be an array of strings`);
+      for (const k of extraKeys(f, ['name', 'formulas', 'vars', 'notes', 'phase', 'tier', 'requires'])) errors.push(`featureOrder[${i}].${k} not allowed`);
     }
   });
 
@@ -1817,7 +1874,7 @@ if (typeof agent === 'function') {
     normalizeSkeleton, detectOffEnumPicks, runSelftest,
     concernBlock, isDecided, concernInputs, normalizeConcernResult,
     standardExclusion, reconcileConcerns, buildCoverage, reverseTraceOrphans,
-    phaseOf, featurePhase, derivePhases, mergeReplan,
+    phaseOf, featurePhase, deriveFeatureTier, FEATURE_TIERS, derivePhases, mergeReplan,
     musthaveNongoalConflicts, parseEscalationBudget, mapStack, runGatesV4,
     assembleLock, validateLock, renderTenets, renderPlanMd, reconcileAndAssemble, siblingPath,
     intakePrompt, skeletonPrompt, concernPrompt, assemblePrompt, parseArgs,
