@@ -425,10 +425,12 @@ You are the prep agent for /build-batch wave ${waveNum}. (Self-contained — all
 
 For each bead in ${JSON.stringify(prepCandidates.map(c => ({ id: c.id })))}:
 1. \`bd update <id> --claim\`. If exit≠0, the bead was raced — push into "failed" with reason "claim failed (raced)" and skip the rest for this bead.
-2. \`bd worktree create "task-<id>" --json\` → capture path. If it errors:
-   - \`bd update <id> --status=blocked --notes "worktree create failed"\`
-   - push into "failed" with reason "worktree create failed" and skip.
-3. On success, push into "prepped": { "beadId": "<id>", "worktreePath": "<path>", "branch": "bead/<id>" }.
+2. Create the worktree. **KNOWN bd 0.55.4 BUG (autonomous-build-ahj):** \`bd worktree create\` prints "Error: failed to create worktree: exit status 128 ... already exists" and exits NONZERO **even when it fully creates a usable worktree** (dir + branch + synced issues.jsonl; \`bd ready\`/\`bd show\` work inside). So do NOT trust its exit code — verify the worktree exists instead. Let REPO = \`git rev-parse --show-toplevel\` and WT = "\${REPO}/task-<id>".
+   a. Pre-clean a stale collision from a prior wave: if \`git worktree list --porcelain\` shows a worktree at WT, run \`bd worktree remove "task-<id>" --force\` then \`git worktree prune\`; if \`git branch --list "bead/<id>"\` is non-empty, run \`git branch -D "bead/<id>"\`.
+   b. Run \`bd worktree create "task-<id>" --branch "bead/<id>"\` and IGNORE its (spuriously nonzero) exit code. Pass --branch explicitly: the bare form defaults branch=name=task-<id>, but the merge step uses \`bead/<id>\`.
+   c. VERIFY (this, not the exit code, is the success test): \`git worktree list --porcelain\` must list \`worktree <WT>\` with \`branch refs/heads/bead/<id>\`, AND the directory WT must exist with checked-out files.
+   d. If verified → SUCCESS (worktreePath = WT). ONLY if verification fails: \`bd update <id> --status=blocked --notes "worktree create failed"\`, push into "failed" with reason "worktree create failed", and skip.
+3. On success, push into "prepped": { "beadId": "<id>", "worktreePath": "<WT, i.e. repo-root/task-<id>>", "branch": "bead/<id>" }.
 
 Run these serialized (one bead at a time) — concurrent bd writes can race on the jsonl. Return JSON:
 {

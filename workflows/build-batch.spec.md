@@ -242,9 +242,22 @@ Dispatch-Bead(bead):
   claimOutput = bd update bead.id --claim
   if exitCode != 0: return null
 
-  # Create the worktree. bd handles branch creation (bead/<id>).
-  worktreePath = (bd worktree create "task-$bead.id" --json | ConvertFrom-Json).path
-  if not worktreePath:
+  # Create the worktree. KNOWN bd 0.55.4 BUG (autonomous-build-ahj): `bd worktree create`
+  # prints "Error: failed to create worktree: exit status 128 ... already exists" and exits
+  # NONZERO even when it fully creates a usable worktree (dir + branch + synced issues.jsonl;
+  # bd ready/show work inside). So do NOT trust its exit code — verify the worktree exists.
+  # Also pass --branch explicitly: the bare form defaults branch=name=task-<id>, but the merge
+  # step (`git merge bead/<id>`) and crash-recovery both assume bead/<id> — pass it so they agree.
+  # (a) pre-clean a stale collision from a prior wave so create doesn't fail for a real reason:
+  if (git worktree list --porcelain) shows a worktree at "<repo-root>/task-$bead.id":
+    bd worktree remove "task-$bead.id" --force; git worktree prune
+  if (git branch --list "bead/$bead.id") is non-empty: git branch -D "bead/$bead.id"
+  # (b) create, IGNORING the (spuriously nonzero) exit code:
+  bd worktree create "task-$bead.id" --branch "bead/$bead.id"
+  # (c) verify it actually got created (this — not the exit code — is the success test):
+  worktreePath = "<repo-root>/task-$bead.id"
+  created = (git worktree list --porcelain lists `worktree $worktreePath` with `branch refs/heads/bead/$bead.id`) AND (Test-Path $worktreePath)
+  if not created:
     bd update bead.id --status=blocked --notes "worktree create failed"
     blockedSet += bead.id
     return null
