@@ -175,6 +175,14 @@ let waveNum = 0;
 // reap stale claims; (b) checkpoint after every wave so a restart resumes
 // instead of re-doing or stranding work. The checkpoint file is local runtime
 // state (gitignored), written via a Bash agent since the script has no fs.
+//
+// Salvage (execute-2): the merge agent's `bd close` is its LAST step, so a
+// crash between `git merge --no-ff` and `bd close` leaves a bead `in_progress`
+// whose work is ALREADY on main. Reaping it back to open would rebuild merged
+// work from scratch (and a deterministic crash can permanently strand it). So
+// before reopening an orphan, the reaper checks whether `bead/<id>` is already
+// an ancestor of main; if so it just `bd close`s it. Genuinely unmerged work
+// (never passed the post-merge gate) is still discarded and rebuilt.
 // ---------------------------------------------------------------------------
 const STATE_FILE = '.bd-batch-state.json';
 const recoverSchema = {
@@ -185,29 +193,38 @@ const recoverSchema = {
     blocked:       { type: 'array', items: { type: 'string' } },
     failed:        { type: 'array', items: { type: 'string' } },
     reaped:        { type: 'array', items: { type: 'object' } },   // reset orphans { beadId, hadUnmergedWork }
-    discardedWork: { type: 'number' }                              // count of orphans whose unmerged commit was discarded
+    discardedWork: { type: 'number' },                             // count of orphans whose unmerged commit was discarded
+    closedAlreadyMerged: { type: 'array', items: { type: 'string' } } // orphans whose work already landed on main (crash between merge and bd close) — closed, not rebuilt (execute-2)
   }
 };
 const recovery = await agent(`
 You are the crash-recovery / stale-claim reaper for /build-batch (lbq.7). A prior run may have crashed (OOM, restart) mid-batch. Reconcile from the repo root (\`git rev-parse --show-toplevel\`).
 
 1. RESUME STATE: if \`${STATE_FILE}\` exists, read it — it holds { merged: [...], blocked: [...], failed: [...], waveNum, ts } from the last wave of a prior run. Return those arrays so this run does not reprocess them. If absent, all three are [].
-2. STALE-CLAIM REAP: run \`bd list --status=in_progress --json\`. **At orchestrator startup nothing has been dispatched yet, so every in_progress bead is necessarily an orphan from a crashed run.** Reset each so it re-dispatches cleanly:
-   - \`bd update <id> --status=open\` (un-claim).
-   - If a worktree \`task-<id>\` exists: \`bd worktree remove "task-<id>" --force\`.
-   - If a stale branch \`bead/<id>\` exists: note whether it had a commit ahead of main (\`git log main..bead/<id> --oneline\` non-empty = unmerged work being discarded), then \`git branch -D bead/<id>\` so the re-dispatch's worktree-create doesn't collide. Rebuilding from scratch is the safe choice — an unmerged worker commit never passed the post-merge gate on main.
-   Record each under "reaped" ({ beadId, hadUnmergedWork: <bool> }); set discardedWork = count with hadUnmergedWork true. Run bd/git writes serialized. Do NOT touch closed or blocked beads.
-3. Return { "merged": [...], "blocked": [...], "failed": [...], "reaped": [...], "discardedWork": <n> }.
+2. STALE-CLAIM REAP: run \`bd list --status=in_progress --json\`. **At orchestrator startup nothing has been dispatched yet, so every in_progress bead is necessarily an orphan from a crashed run.** For each, decide salvage-vs-reset:
+   a. ALREADY-MERGED SALVAGE (check this BEFORE any reopen): the merge agent's \`bd close\` is its LAST step, so a crash between \`git merge --no-ff\` and \`bd close\` leaves the bead in_progress with its work already on main. If a branch \`bead/<id>\` exists AND \`git merge-base --is-ancestor bead/<id> main\` exits 0 (its tip is reachable from main ⇒ already merged), the work is DONE — do NOT rebuild it: run \`bd close <id>\`, \`bd worktree remove "task-<id>" --force\` if that worktree exists, and \`git branch -D bead/<id>\` (safe — it is merged). Record the id under "closedAlreadyMerged" and skip the rest for this bead.
+   b. OTHERWISE reset so it re-dispatches cleanly:
+      - \`bd update <id> --status=open\` (un-claim).
+      - If a worktree \`task-<id>\` exists: \`bd worktree remove "task-<id>" --force\`.
+      - If a stale branch \`bead/<id>\` exists: note whether it had a commit ahead of main (\`git log main..bead/<id> --oneline\` non-empty = unmerged work being discarded), then \`git branch -D bead/<id>\` so the re-dispatch's worktree-create doesn't collide. Rebuilding from scratch is the safe choice — an unmerged worker commit never passed the post-merge gate on main.
+      Record under "reaped" ({ beadId, hadUnmergedWork: <bool> }); set discardedWork = count with hadUnmergedWork true.
+   Use LOCAL refs only (builds are local-first; no \`git push\`). Run bd/git writes serialized. Do NOT touch closed or blocked beads.
+3. Return { "merged": [...], "blocked": [...], "failed": [...], "reaped": [...], "closedAlreadyMerged": [...], "discardedWork": <n> }.
 Use Bash. On any error, return empty arrays rather than throwing (T7) — a failed reap must not block a fresh run.
 `, { label: 'crash-recovery', phase: 'Dispatch + drain', schema: recoverSchema, agentType: 'general-purpose' });
 
 if (recovery) {
-  mergedSet.push(...(recovery.merged || []));
+  const resumedMerged = recovery.merged || [];
+  // execute-2: orphans whose work already landed on main (crash between merge and
+  // bd close) were just closed by the reaper. Count them merged so they aren't
+  // re-picked, and surface them distinctly from checkpoint-resumed merges.
+  const salvaged = recovery.closedAlreadyMerged || [];
+  mergedSet.push(...resumedMerged, ...salvaged);
   blockedSet.push(...(recovery.blocked || []));
   failedSet.push(...(recovery.failed || []));
   const reaped = (recovery.reaped || []).length;
-  if (reaped || mergedSet.length || blockedSet.length || failedSet.length) {
-    log(`[RECOVER] resumed ${mergedSet.length} merged / ${blockedSet.length} blocked / ${failedSet.length} failed from checkpoint; reaped ${reaped} stale claim(s)${recovery.discardedWork ? ` (${recovery.discardedWork} had unmerged work discarded — they rebuild)` : ''}`);
+  if (reaped || salvaged.length || mergedSet.length || blockedSet.length || failedSet.length) {
+    log(`[RECOVER] resumed ${resumedMerged.length} merged / ${blockedSet.length} blocked / ${failedSet.length} failed from checkpoint; reaped ${reaped} stale claim(s)${salvaged.length ? `, salvaged ${salvaged.length} already-merged orphan(s) (closed, not rebuilt)` : ''}${recovery.discardedWork ? ` (${recovery.discardedWork} had unmerged work discarded — they rebuild)` : ''}`);
   }
 }
 
