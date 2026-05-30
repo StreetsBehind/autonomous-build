@@ -185,6 +185,12 @@ let waveNum = 0;
 // (never passed the post-merge gate) is still discarded and rebuilt.
 // ---------------------------------------------------------------------------
 const STATE_FILE = '.bd-batch-state.json';
+// Crash-loop ceiling (execute-1): a bead that hard-crashes the runtime mid-worker
+// (OOM, node restart) is reaped to open and re-picked indefinitely — reap → repick
+// → recrash — silently burning an unattended window. After this many reaps without
+// converging, the reaper blocks it for human triage instead of reopening. The count
+// lives on durable bd metadata (metadata.reaped) since there is no resident controller.
+const REAP_QUARANTINE_LIMIT = 3;
 const recoverSchema = {
   type: 'object',
   required: ['merged', 'blocked', 'failed', 'reaped'],
@@ -194,7 +200,8 @@ const recoverSchema = {
     failed:        { type: 'array', items: { type: 'string' } },
     reaped:        { type: 'array', items: { type: 'object' } },   // reset orphans { beadId, hadUnmergedWork }
     discardedWork: { type: 'number' },                             // count of orphans whose unmerged commit was discarded
-    closedAlreadyMerged: { type: 'array', items: { type: 'string' } } // orphans whose work already landed on main (crash between merge and bd close) — closed, not rebuilt (execute-2)
+    closedAlreadyMerged: { type: 'array', items: { type: 'string' } }, // orphans whose work already landed on main (crash between merge and bd close) — closed, not rebuilt (execute-2)
+    quarantined:   { type: 'array', items: { type: 'object' } }     // orphans reaped >= REAP_QUARANTINE_LIMIT times — blocked for human triage, not reopened (execute-1)
   }
 };
 const recovery = await agent(`
@@ -203,13 +210,15 @@ You are the crash-recovery / stale-claim reaper for /build-batch (lbq.7). A prio
 1. RESUME STATE: if \`${STATE_FILE}\` exists, read it — it holds { merged: [...], blocked: [...], failed: [...], waveNum, ts } from the last wave of a prior run. Return those arrays so this run does not reprocess them. If absent, all three are [].
 2. STALE-CLAIM REAP: run \`bd list --status=in_progress --json\`. **At orchestrator startup nothing has been dispatched yet, so every in_progress bead is necessarily an orphan from a crashed run.** For each, decide salvage-vs-reset:
    a. ALREADY-MERGED SALVAGE (check this BEFORE any reopen): the merge agent's \`bd close\` is its LAST step, so a crash between \`git merge --no-ff\` and \`bd close\` leaves the bead in_progress with its work already on main. If a branch \`bead/<id>\` exists AND \`git merge-base --is-ancestor bead/<id> main\` exits 0 (its tip is reachable from main ⇒ already merged), the work is DONE — do NOT rebuild it: run \`bd close <id>\`, \`bd worktree remove "task-<id>" --force\` if that worktree exists, and \`git branch -D bead/<id>\` (safe — it is merged). Record the id under "closedAlreadyMerged" and skip the rest for this bead.
-   b. OTHERWISE reset so it re-dispatches cleanly:
-      - \`bd update <id> --status=open\` (un-claim).
+   b. OTHERWISE reset so it re-dispatches cleanly — but first enforce a CRASH-LOOP CEILING so a bead that keeps hard-crashing the runtime (OOM, node restart) does not loop reap→repick→recrash forever, silently burning the window:
+      - Read the bead's current reap count from \`bd show <id> --json\` (\`metadata.reaped\`, default 0) and increment it (newCount = old + 1).
+      - If newCount >= ${REAP_QUARANTINE_LIMIT}: this orphan has been reaped ${REAP_QUARANTINE_LIMIT} times without ever converging — do NOT reopen it. Run \`bd update <id> --status=blocked --notes "crash-loop: reaped <newCount> times without converging — needs human triage"\`, then clean up (\`bd worktree remove "task-<id>" --force\` if that worktree exists; \`git branch -D bead/<id>\` if present), record under "quarantined" ({ beadId, reaped: <newCount> }), and skip the rest for this bead.
+      - Else (newCount < ${REAP_QUARANTINE_LIMIT}): persist the incremented count and reopen. Read the bead's existing \`metadata\` object from \`bd show <id> --json\`, set its \`reaped\` field to newCount **preserving every other field** (filesTouched, testPlanFile, …), write the merged object to a temp JSON file, and run \`bd update <id> --metadata "@<tempfile>" --status=open\`.
       - If a worktree \`task-<id>\` exists: \`bd worktree remove "task-<id>" --force\`.
       - If a stale branch \`bead/<id>\` exists: note whether it had a commit ahead of main (\`git log main..bead/<id> --oneline\` non-empty = unmerged work being discarded), then \`git branch -D bead/<id>\` so the re-dispatch's worktree-create doesn't collide. Rebuilding from scratch is the safe choice — an unmerged worker commit never passed the post-merge gate on main.
-      Record under "reaped" ({ beadId, hadUnmergedWork: <bool> }); set discardedWork = count with hadUnmergedWork true.
+      Record the reopened bead under "reaped" ({ beadId, hadUnmergedWork: <bool> }); set discardedWork = count with hadUnmergedWork true. (Quarantined beads go under "quarantined", not "reaped".)
    Use LOCAL refs only (builds are local-first; no \`git push\`). Run bd/git writes serialized. Do NOT touch closed or blocked beads.
-3. Return { "merged": [...], "blocked": [...], "failed": [...], "reaped": [...], "closedAlreadyMerged": [...], "discardedWork": <n> }.
+3. Return { "merged": [...], "blocked": [...], "failed": [...], "reaped": [...], "closedAlreadyMerged": [...], "quarantined": [...], "discardedWork": <n> }.
 Use Bash. On any error, return empty arrays rather than throwing (T7) — a failed reap must not block a fresh run.
 `, { label: 'crash-recovery', phase: 'Dispatch + drain', schema: recoverSchema, agentType: 'general-purpose' });
 
@@ -221,10 +230,15 @@ if (recovery) {
   const salvaged = recovery.closedAlreadyMerged || [];
   mergedSet.push(...resumedMerged, ...salvaged);
   blockedSet.push(...(recovery.blocked || []));
+  // execute-1: orphans that hit the crash-loop ceiling were blocked by the reaper,
+  // not reopened. Add them to blockedSet so they aren't re-picked and so the summary
+  // routes them to /escalate (they need human triage, not another doomed rebuild).
+  const quarantined = recovery.quarantined || [];
+  blockedSet.push(...quarantined.map(q => q.beadId).filter(Boolean));
   failedSet.push(...(recovery.failed || []));
   const reaped = (recovery.reaped || []).length;
-  if (reaped || salvaged.length || mergedSet.length || blockedSet.length || failedSet.length) {
-    log(`[RECOVER] resumed ${resumedMerged.length} merged / ${blockedSet.length} blocked / ${failedSet.length} failed from checkpoint; reaped ${reaped} stale claim(s)${salvaged.length ? `, salvaged ${salvaged.length} already-merged orphan(s) (closed, not rebuilt)` : ''}${recovery.discardedWork ? ` (${recovery.discardedWork} had unmerged work discarded — they rebuild)` : ''}`);
+  if (reaped || salvaged.length || quarantined.length || mergedSet.length || blockedSet.length || failedSet.length) {
+    log(`[RECOVER] resumed ${resumedMerged.length} merged / ${blockedSet.length} blocked / ${failedSet.length} failed from checkpoint; reaped ${reaped} stale claim(s)${salvaged.length ? `, salvaged ${salvaged.length} already-merged orphan(s) (closed, not rebuilt)` : ''}${quarantined.length ? `, quarantined ${quarantined.length} crash-loop bead(s) (blocked after ${REAP_QUARANTINE_LIMIT} reaps)` : ''}${recovery.discardedWork ? ` (${recovery.discardedWork} had unmerged work discarded — they rebuild)` : ''}`);
   }
 }
 
