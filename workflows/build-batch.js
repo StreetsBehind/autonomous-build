@@ -166,6 +166,11 @@ const blockedSet = [];
 const failedSet = [];
 let drainOnly = false;
 let waveNum = 0;
+// robustness-5: set when a between-wave store-health probe finds the bd store
+// degraded at the 0-candidates juncture, so an empty ready set is NOT treated
+// as a clean drain (which would false-drain the rest of the batch into /retro).
+let storeAborted = false;
+let abortReason = '';
 
 // ---------------------------------------------------------------------------
 // Crash recovery (lbq.7) — over a 2-day window an OOM/restart strands beads
@@ -407,9 +412,31 @@ Use Bash + the bd CLI. Return at most ${parsedArgs.workers} candidates. If no be
   }
 
   if (candidates.length === 0) {
-    log(`[WAVE ${waveNum}] no eligible candidates — checking exit conditions`);
-    // Refresh: maybe a prior wave unblocked something but it's already excluded;
-    // if exclude is the entire ready set, we're done.
+    log(`[WAVE ${waveNum}] no eligible candidates — verifying store health before concluding drain`);
+    // robustness-5: an empty candidate set is ambiguous — either genuinely no
+    // ready non-epic work (real drain) OR the bd store went blind mid-run (a jsonl
+    // lock, the --db-at-dir trap) and silently returned empty. Concluding "done"
+    // on a blind store false-drains the rest of the batch into /retro. Probe once
+    // to disambiguate; abort loudly rather than false-drain. Fires only at the
+    // drain juncture (not every wave), so it adds no per-wave jsonl contention.
+    const health = await agent(`
+You are the store-health probe for /build-batch (robustness-5). The candidate-picker just returned 0 ready beads. Decide whether the bd store is HEALTHY (a genuine drain) or DEGRADED (a false-drain risk):
+1. Run \`bd ready --json\`. If it exits 0 and parses as JSON (an empty array counts), the store is healthy — return { "healthy": true, "detail": "bd ready ok" }.
+2. If it errors (JSONL lock, db-open failure, non-JSON output): run \`bd doctor --fix\` once, then retry \`bd ready --json\`. If the retry exits 0 and parses: { "healthy": true, "detail": "recovered via bd doctor --fix" }.
+3. If it STILL errors after the doctor retry: { "healthy": false, "detail": "<the underlying bd error>" }.
+Use Bash. This is a cheap one-shot probe — do not loop. (Do not drop gascity's Dolt MB/row metric in here; jsonl health = "bd ready returns parseable JSON".)
+`, { label: `wave${waveNum}-health-probe`, phase: 'Dispatch + drain', schema: { type: 'object', required: ['healthy'], properties: { healthy: { type: 'boolean' }, detail: { type: 'string' } } }, agentType: 'general-purpose' });
+
+    if (health && health.healthy === false) {
+      // Only abort on an EXPLICIT unhealthy verdict — a null/failed probe is more
+      // likely a transient runtime hiccup than a store fault, and false-aborting a
+      // genuine drain is its own harm. Degraded store wins over silent retro.
+      storeAborted = true;
+      abortReason = `bd store unhealthy at drain check: ${health.detail || '(no detail)'}`;
+      log(`[BATCH ABORT] ${abortReason} — refusing to treat empty ready set as a clean drain (false-drain guard)`);
+    } else {
+      log(`[WAVE ${waveNum}] store healthy — genuine drain`);
+    }
     break;
   }
 
@@ -683,9 +710,12 @@ const summaryActions = await agent(`
 You are the summary agent for /build-batch Phase 3. (Self-contained — all steps are inline below; you run in the app repo cwd, where the workflow spec is not present, so do NOT try to read workflows/build-batch.spec.md.)
 
 Inputs:
-  merged:  ${JSON.stringify(mergedSet)}
-  blocked: ${JSON.stringify(blockedSet)}
-  failed:  ${JSON.stringify(failedSet)}
+  merged:       ${JSON.stringify(mergedSet)}
+  blocked:      ${JSON.stringify(blockedSet)}
+  failed:       ${JSON.stringify(failedSet)}
+  storeAborted: ${storeAborted}
+
+If storeAborted is true, the bd store was found DEGRADED at the drain check (robustness-5) — the empty ready set is NOT a real drain, so record postAction="escalate" (a degraded store needs a human) and NEVER "retro-suggested"; skip the rest of the decision below.
 
 Note: failed beads have already been marked \`blocked\` (with a "worker failed unexpectedly … worktree left at <path>" note) by the orchestrator, so they appear in \`bd list --status=blocked\` and their worktrees are preserved. Failed is the most severe outcome and must NOT be silent — it escalates like any other block.
 
@@ -703,13 +733,19 @@ if (summaryActions?.postAction) {
   postAction = summaryActions.postAction;
   log(`Post-action: ${postAction} — ${summaryActions.rationale || ''}`);
 }
+// robustness-5: deterministic guard — a degraded-store abort must never resolve
+// to a clean drain / retro, regardless of what the summary agent returned.
+if (storeAborted) postAction = 'escalate';
 
 // ---------------------------------------------------------------------------
 // Return final result to runtime
 // ---------------------------------------------------------------------------
 return {
   refused: false,
-  drained: blockedSet.length === 0 && failedSet.length === 0,
+  // A degraded-store abort is not a clean drain even with no blocked/failed beads.
+  drained: !storeAborted && blockedSet.length === 0 && failedSet.length === 0,
+  aborted: storeAborted || undefined,
+  reason: storeAborted ? abortReason : undefined,
   postAction,
   merged: mergedSet,
   blocked: blockedSet,

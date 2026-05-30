@@ -193,7 +193,17 @@ if len(activePipelines) == 0 and len(mergeQueue) == 0 and mergeInFlight is null:
   remaining = bd ready --json
     .filter(issue_type != 'epic' and id not in mergedSet and id not in blockedSet)
     .length
-  if remaining == 0: break
+  if remaining == 0:
+    # robustness-5: an empty ready set is ambiguous — genuine drain OR a degraded
+    # bd store (jsonl lock, --db-at-dir trap) that silently returned empty.
+    # Concluding "done" on a blind store false-drains the batch into /retro. Probe
+    # once: `bd ready --json` ok ⇒ genuine drain (break); on error `bd doctor --fix`
+    # then retry; if it STILL errors ⇒ set storeAborted, `[BATCH ABORT]`, postAction
+    # forced to "escalate" (never retro-suggested), return aborted+reason. Only an
+    # EXPLICIT unhealthy verdict aborts — a null probe is treated as healthy so a
+    # genuine drain is never false-aborted. Fires only at this juncture, so it adds
+    # no per-wave contention.
+    break
   # else: loop continues, slots will fill on next iteration
 
 if maxMerges and len(mergedSet) >= maxMerges:
