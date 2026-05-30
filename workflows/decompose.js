@@ -1,13 +1,12 @@
 export const meta = {
   name: 'decompose',
-  description: 'Turn plan.md + plan.lock.json into a blessed atomic bead DAG. Fans out pours per feature, atomizes oversized beads, scores quality, adversarially cross-checks DAG vs plan, audits topology, emits BLESSED|NEEDS-FIX verdict + decomposeReport.md. Subsumes /compose, /quality-pass, /split.',
+  description: 'Turn plan.md + plan.lock.json into a blessed atomic bead DAG. Fans out pours per feature, reworks every bead to the 95 quality bar (split/wire/tighten), adversarially cross-checks DAG vs plan, audits topology, emits BLESSED|NEEDS-FIX verdict + decomposeReport.md. Subsumes /compose, /quality-pass, /split.',
   whenToUse: 'After /vision has produced plan.md + plan.lock.json in an app repo. Run before /build-batch; the report is a human-review gate between the two.',
   phases: [
     { title: 'Pre-flight',           detail: 'Verify plan, formulas, jankurai, repo state' },
     { title: 'Parse plan',           detail: 'Extract features + cross-deps; init beads + jankurai if fresh repo' },
     { title: 'Pour',                 detail: 'One agent per feature pours its formula(s) and writes step metadata' },
-    { title: 'Atomize',              detail: 'Split oversized beads along clean seams; iterate up to 3 times' },
-    { title: 'Quality scoring',      detail: 'Per-epic agent scores every child against the buildability rubric' },
+    { title: 'Quality rework',       detail: 'Score every bead (full rubric) then rework sub-95 beads (split/wire/tighten); loop to the 95 bar, up to 3 passes' },
     { title: 'Fidelity cross-check', detail: 'Three independent verifiers (plan→dag, dag→plan, must-have→dag) + reconciler' },
     { title: 'Dep audit',            detail: 'Cycles, ready-set sanity, implicit conflicts, cross-deps applied' },
     { title: 'Baseline',             detail: 'On BLESSED: accept scaffold jankurai baseline (loud auto-accept on --auto-bless)' },
@@ -446,128 +445,25 @@ Return JSON:
 }
 
 // ---------------------------------------------------------------------------
-// Phase 4 — Atomize oversized beads (iterative parallel)
+// Phase 4+5 — Quality-rework loop (Layer 2, epic autonomous-build-onv.3)
 // ---------------------------------------------------------------------------
-phase('Atomize');
+// Replaces the old read-only `Atomize(4) + Quality(5)` pair with ONE closed
+// rework-to-bar loop. The old flow scored with the FULL rubric but bailed
+// read-only (emitting remediations + wouldReach95 nobody applied), while the
+// only mutating phase (atomize) ran FIRST with a NARROWER sizing rubric — so
+// monoliths the full rubric flagged were never split and sub-95 beads were
+// never reworked. Now each pass SCORES (full rubric) then REWORKS the sub-95
+// beads by applying THAT bead's own remediations (split / wire / tighten),
+// re-discovering + re-scoring the mutated set on the next pass, up to MAX_REWORK.
+//
+// Downstream contracts preserved EXACTLY (verdict + report read these):
+//   - qualityResults / scoredCount / qualityVacuous / qualityUndercovered /
+//     totalOpenNonEpic — the FINAL pass's values, same shapes as before.
+//   - AtomizeSummary { iterations, atomized, unsplittable, persistentlyOversized }
+//     populated from the loop's TERMINAL state.
+const MAX_REWORK = 3;
 
-const atomizeSchema = {
-  type: 'object',
-  required: ['source', 'status'],
-  properties: {
-    source:   { type: 'string' },
-    status:   { enum: ['atomized', 'unsplittable'] },
-    children: { type: 'array', items: { type: 'object' } },
-    seam:     { type: 'string' },
-    attempted:{ type: 'array', items: { type: 'string' } },
-    reason:   { type: 'string' }
-  }
-};
-
-const atomizeIterationCap = 3;
-const atomizedAccum = [];
-const unsplittableAccum = [];
-let persistentlyOversized = [];
-
-for (let iter = 1; iter <= atomizeIterationCap; iter++) {
-  // Identify oversized beads via a scout agent (cheap, single agent reads all open beads).
-  const scout = await agent(`
-You are the atomize-scout agent for /decompose Phase 4, iteration ${iter}/${atomizeIterationCap}. (Self-contained: all instructions are inline below; you run in the app repo cwd, where the workflow spec is not present.)
-
-Run \`bd list --status=open --json\` and filter out epics (issue_type == "epic"). For each remaining bead, compute the SIZING score:
-
-  Start at 100, floor at 0.
-  - ACs > 6 (count "- " / "* " lines in Acceptance section of description): -10
-  - File paths > 5 (count tokens matching \`\\b[\\w/.-]+\\.(ts|tsx|js|jsx|py|sql|md|toml|yaml|json|rs|go|java|kt|swift|rb|php|html|css)\\b\`): -10
-  - Cross-layer reach > 2 (mentions of {UI/component, API/endpoint, DB/migration, test}, -15 per extra layer beyond 2)
-  - metadata.testPlanCases missing or 0: -5
-
-Return JSON: { "oversized": [{ "id": "...", "title": "...", "score": <n>, "penalties": ["..."] }, ...] }
-
-If Context.dryRun, also include the sizing computation for beads that would be created by the dry-run pours (use the pour-result data from earlier phases — passed below).
-
-Context: ${JSON.stringify(Context, null, 2)}
-${Context.dryRun ? `Dry-run pours: ${JSON.stringify(pourResults, null, 2)}` : ''}
-`, { label: `atomize-scout-iter${iter}`, phase: 'Atomize', agentType: 'general-purpose' });
-
-  const oversized = scout?.oversized || [];
-  if (oversized.length === 0) {
-    log(`Atomize iter ${iter}: no oversized beads; phase done.`);
-    break;
-  }
-  log(`Atomize iter ${iter}: ${oversized.length} oversized beads, fanning out`);
-
-  const atomizeTasks = oversized.map((b) => () => agent(`
-You are the atomize agent for /decompose Phase 4, bead=${b.id}. (Self-contained: all instructions are inline below; you run in the app repo cwd, where the workflow spec is not present.)
-
-Bead to atomize: ${JSON.stringify(b)}
-Context: ${JSON.stringify(Context, null, 2)}
-
-Steps:
-1. \`bd show ${b.id} --json\` — capture title, ACs (parse Acceptance section), labels, priority, metadata (testPlanFile, filesTouched), incoming deps, outgoing deps, parent epic.
-2. Identify the seam. Try in this order; first match wins:
-   - Cross-layer: description spans {UI, API, DB} AND ACs partition cleanly → seam="API boundary" or "schema vs app code"
-   - Per-entity: title is a list ("Habits, Goals, Streaks CRUD") → seam="per-entity"
-   - Read-vs-write: ACs split between reads (GET, list) and writes (POST, update, delete) → seam="read path vs write path"
-   - Happy-vs-edge: ACs split between happy-path and explicit edge-cases → seam="happy path vs edge cases"
-3. If no seam fits (ACs straddle every candidate): return { "source": "${b.id}", "status": "unsplittable", "attempted": [<seams tried>], "reason": "<one sentence>" }. Do NOT invent a seam (T1).
-4. Propose N children:
-   - Title = source title + seam term (e.g. "Habits CRUD (DB+API)" + "Habits CRUD (UI)")
-   - ACs partitioned along the seam — each source AC lands in exactly one child. NO new ACs (T4).
-   - filesTouched partitioned — child ownership sets MUST be disjoint.
-   - Dep mode: sequential (UI consumes API) OR parallel (independent subsystems).
-5. Re-audit each proposed child against the SAME sizing rubric. If any child still scores < 95, return status="unsplittable" with reason "seam still produces oversized children". Do NOT retry with another seam in this agent run — that's the next iteration's job.
-6. If Context.dryRun: return the proposal without mutating.
-7. Otherwise mutate:
-   - \`bd create\` each child with --parent=<parentEpic>, --labels=<source labels comma-joined>, --priority=<source priority>, --body-file=<tmp.json>.
-   - Write filesTouched metadata to each child.
-   - Rewire deps (sequential: bd dep add child[i+1] child[i]; preserve incoming on first; preserve outgoing on last. parallel: all children get all incoming + all outgoing).
-   - Close source: \`bd close ${b.id} --reason "superseded by <new-ids joined>"\`.
-
-Return JSON:
-{
-  "source": "${b.id}",
-  "status": "atomized" | "unsplittable",
-  "children": [{ "id": "...", "title": "...", "score": <n> }, ...]  // only if atomized
-  "seam": "<used seam>",  // only if atomized
-  "attempted": ["<seam>"], // only if unsplittable
-  "reason": "<message>"   // only if unsplittable
-}
-`, { label: `atomize-${b.id}`, phase: 'Atomize', schema: atomizeSchema, agentType: 'general-purpose' }));
-
-  const waveResults = await parallel(atomizeTasks);
-  for (const r of waveResults) {
-    if (!r) continue;
-    if (r.status === 'atomized') atomizedAccum.push(r);
-    else if (r.status === 'unsplittable') unsplittableAccum.push(r);
-  }
-
-  if (iter === atomizeIterationCap) {
-    // Final iteration — anything still oversized after this wave is persistently oversized.
-    const remaining = oversized.filter(o => !waveResults.some(r => r?.source === o.id && r.status === 'atomized'));
-    persistentlyOversized = remaining;
-  }
-}
-
-const AtomizeSummary = {
-  iterations: Math.min(atomizeIterationCap, atomizedAccum.length > 0 ? atomizeIterationCap : 1),
-  atomized: atomizedAccum,
-  unsplittable: unsplittableAccum,
-  persistentlyOversized
-};
-log(`Atomize done: ${AtomizeSummary.atomized.length} atomized, ${AtomizeSummary.unsplittable.length} unsplittable, ${AtomizeSummary.persistentlyOversized.length} persistently oversized`);
-
-// ---------------------------------------------------------------------------
-// Phase 5 — Quality scoring (parallel fan-out, K agents)
-// ---------------------------------------------------------------------------
-phase('Quality scoring');
-
-// Discover the epic set after Phase 4 mutations. (Self-contained: no external spec needed.)
-// CRITICAL: pours create app-epic → molecule-root-epic → task. A naive "epics with
-// direct non-epic children" scan can return nothing if the scorer's --parent traversal
-// misses the molecule-root epics — which is exactly how smbuild scored zero beads and
-// passed vacuously. So we (a) enumerate every epic in the app subtree that directly
-// parents an open non-epic bead, and (b) return a ground-truth count of ALL open
-// non-epic beads so synthesis can detect under-coverage even if discovery under-finds.
+// Schemas (shared across passes).
 const epicDiscoverySchema = {
   type: 'object',
   required: ['epics', 'totalOpenNonEpic'],
@@ -583,23 +479,6 @@ const epicDiscoverySchema = {
     totalOpenNonEpic: { type: 'number' }
   }
 };
-
-const epicDiscovery = await agent(`
-Discover the scoring-epic set for /decompose Phase 5.
-
-Context: app epic = ${ParsedPlan.appEpicId}. Pour roots from Phase 3 (the molecule-root epics, reparented under the app epic): ${JSON.stringify(pourOk.map(r => r.pourRoot).filter(Boolean))}.
-
-Steps:
-1. Run \`bd list --status=open --json\`. Split into epics (issue_type=="epic") and non-epics.
-2. Set totalOpenNonEpic = count of open non-epic beads. This is the GROUND TRUTH the orchestrator uses to detect under-scoring — it must be exact.
-3. Return the set of "scoring epics" = every open epic that DIRECTLY parents at least one open non-epic bead (check each epic via \`bd list --parent <id> --status=open --json\`, or by reading parent links in the snapshot). This deliberately includes molecule-root epics AND any deeper sub-epics that directly parent tasks — do not stop at the app epic's direct children. If the app epic itself directly parents non-epic beads, include it too.
-4. Sanity check: if totalOpenNonEpic > 0 but you found zero scoring epics, re-examine the parent links — every open non-epic bead has SOME parent epic, so a non-empty pour set must yield at least one scoring epic. Return what you actually find; the orchestrator cross-checks against totalOpenNonEpic.
-
-Return JSON: { "epics": [{ "id": "...", "title": "..." }, ...], "totalOpenNonEpic": <n> }
-`, { label: 'epic-discovery', phase: 'Quality scoring', schema: epicDiscoverySchema, agentType: 'general-purpose' });
-
-const epics = epicDiscovery?.epics || [];
-const totalOpenNonEpic = epicDiscovery?.totalOpenNonEpic ?? 0;
 
 const qualityScoreSchema = {
   type: 'object',
@@ -624,12 +503,46 @@ const qualityScoreSchema = {
   }
 };
 
-const qualityTasks = epics.map((e) => () => agent(`
-You are the quality-score agent for /decompose Phase 5, epic=${e.id}. (Self-contained: all instructions are inline below; you run in the app repo cwd, where the workflow spec is not present.)
+const reworkSchema = {
+  type: 'object',
+  required: ['beadId', 'action'],
+  properties: {
+    beadId:      { type: 'string' },
+    action:      { enum: ['split', 'tighten', 'wire', 'unreworkable'] },
+    newChildren: { type: 'array', items: { type: 'object' } },   // only on split
+    seam:        { type: 'string' },                              // only on split
+    attempted:   { type: 'array', items: { type: 'string' } },    // only on unreworkable (seams tried)
+    reason:      { type: 'string' }                               // unreworkable / context
+  }
+};
+
+// Helper: discover the scoring-epic set + ground-truth open-non-epic count.
+// CRITICAL: pours create app-epic → molecule-root-epic → task; the rework loop
+// ALSO splits beads (creating new ones, closing old ones), so this MUST re-run at
+// the start of every pass over the freshly-mutated DB — a naive "app epic's direct
+// children" scan misses molecule-root epics (how smbuild scored zero beads and
+// passed vacuously). (Self-contained: no external spec needed.)
+const discoverEpics = (pass) => agent(`
+Discover the scoring-epic set for /decompose Quality-rework pass ${pass}.
+
+Context: app epic = ${ParsedPlan.appEpicId}. Pour roots from Phase 3 (the molecule-root epics, reparented under the app epic): ${JSON.stringify(pourOk.map(r => r.pourRoot).filter(Boolean))}.
+
+Steps:
+1. Run \`bd list --status=open --json\`. Split into epics (issue_type=="epic") and non-epics. (This reflects any beads SPLIT in a prior rework pass — new children are open, superseded sources are closed — so always re-read live; do not assume the Phase-3 pour set.)
+2. Set totalOpenNonEpic = count of open non-epic beads. This is the GROUND TRUTH the orchestrator uses to detect under-scoring — it must be exact.
+3. Return the set of "scoring epics" = every open epic that DIRECTLY parents at least one open non-epic bead (check each epic via \`bd list --parent <id> --status=open --json\`, or by reading parent links in the snapshot). This deliberately includes molecule-root epics AND any deeper sub-epics that directly parent tasks — do not stop at the app epic's direct children. If the app epic itself directly parents non-epic beads, include it too.
+4. Sanity check: if totalOpenNonEpic > 0 but you found zero scoring epics, re-examine the parent links — every open non-epic bead has SOME parent epic, so a non-empty pour set must yield at least one scoring epic. Return what you actually find; the orchestrator cross-checks against totalOpenNonEpic.
+
+Return JSON: { "epics": [{ "id": "...", "title": "..." }, ...], "totalOpenNonEpic": <n> }
+`, { label: `epic-discovery-pass${pass}`, phase: 'Quality rework', schema: epicDiscoverySchema, agentType: 'general-purpose' });
+
+// Helper: score every open child of one epic with the FULL rubric (read-only).
+const scoreEpic = (e, pass) => agent(`
+You are the quality-score agent for /decompose Quality-rework pass ${pass}, epic=${e.id}. (Self-contained: all instructions are inline below; you run in the app repo cwd, where the workflow spec is not present.)
 
 For every open child of epic ${e.id} (\`bd list --parent ${e.id} --status=open --json\`), apply the FULL /quality-pass rubric. Start each bead at 100, floor at 0, apply ALL applicable penalties:
 
-SIZING (same as Phase 4):
+SIZING:
 - ACs > 6: -10
 - Files > 5: -10
 - Cross-layer reach > 2: -15 per extra layer
@@ -656,7 +569,7 @@ RISK SIGNALS (additive):
 
 For EVERY penalty applied, record the exact phrase or absence that triggered it — a bare number is unfalsifiable.
 
-For every bead < 95, propose SPECIFIC remediations: paste proposed schemas, enumerate exact files, name exact test cases. Sum projected penalty clearance; set wouldReach95=true if the sum brings score ≥ 95.
+For every bead < 95, propose SPECIFIC remediations: paste proposed schemas, enumerate exact files, name exact test cases. The rework pass applies these, so they must be actionable. Sum projected penalty clearance; set wouldReach95=true if the sum brings score ≥ 95.
 
 Return JSON:
 {
@@ -675,17 +588,159 @@ Return JSON:
 }
 
 This is read-only: do NOT mutate any bead.
-`, { label: `quality-${e.id}`, phase: 'Quality scoring', schema: qualityScoreSchema, agentType: 'general-purpose' }));
+`, { label: `quality-${e.id}-pass${pass}`, phase: 'Quality rework', schema: qualityScoreSchema, agentType: 'general-purpose' });
 
-const qualityResults = (await parallel(qualityTasks)).filter(Boolean);
-const scoredCount = qualityResults.flatMap(r => r.scores).length;
-// A non-empty pour set that scored zero beads is the smbuild vacuous-pass bug:
-// `every()` over an empty score set returns true, so the gate "passed" without
-// scoring anything. Treat zero-scored-with-beads-present, or scoring fewer beads
-// than exist, as a quality coverage gap that forces NEEDS-FIX.
-const qualityVacuous = totalOpenNonEpic > 0 && scoredCount === 0;
-const qualityUndercovered = scoredCount < totalOpenNonEpic;
-log(`Quality scoring done: ${qualityResults.length} epics scored, ${scoredCount}/${totalOpenNonEpic} open non-epic beads scored, ${qualityResults.flatMap(r => r.scores).filter(s => s.score < 95).length} below 95${qualityVacuous ? ' [VACUOUS — no beads scored despite a non-empty pour set]' : qualityUndercovered ? ' [UNDER-COVERED — fewer beads scored than exist]' : ''}`);
+phase('Quality rework');
+
+// Terminal-state accumulators for AtomizeSummary (populated by the rework passes).
+const atomizedAccum = [];        // every split performed { source, status:'atomized', children, seam }
+const unsplittableAccum = [];    // beads the rework tried to split but couldn't seam
+let reworkPassesRun = 0;
+
+// Final-pass quality state (overwritten each pass; the LAST pass's values are the
+// contract values the verdict reads). Declared with `let` so the loop can reassign.
+let qualityResults = [];
+let scoredCount = 0;
+let totalOpenNonEpic = 0;
+let qualityVacuous = false;
+let qualityUndercovered = false;
+
+for (let pass = 1; pass <= MAX_REWORK; pass++) {
+  reworkPassesRun = pass;
+
+  // (1) Re-discover the epic/bead set from bd. Splits in a prior pass mutate the
+  //     set (new children open, sources closed), so this is MANDATORY before scoring.
+  const epicDiscovery = await discoverEpics(pass);
+  const epics = epicDiscovery?.epics || [];
+  totalOpenNonEpic = epicDiscovery?.totalOpenNonEpic ?? 0;
+
+  // (2) Score every open non-epic bead, per-epic, FULL rubric (read-only).
+  qualityResults = (await parallel(epics.map((e) => () => scoreEpic(e, pass)))).filter(Boolean);
+  scoredCount = qualityResults.flatMap(r => r.scores).length;
+  // A non-empty pour set that scored zero beads is the smbuild vacuous-pass bug:
+  // `every()` over an empty score set returns true, so the gate "passed" without
+  // scoring anything. Treat zero-scored-with-beads-present, or scoring fewer beads
+  // than exist, as a quality coverage gap that forces NEEDS-FIX.
+  qualityVacuous = totalOpenNonEpic > 0 && scoredCount === 0;
+  qualityUndercovered = scoredCount < totalOpenNonEpic;
+
+  const allScores = qualityResults.flatMap(r => r.scores);
+  const subBar = allScores.filter(s => s.score < 95);
+  log(`Quality rework pass ${pass}/${MAX_REWORK}: ${qualityResults.length} epics scored, ${scoredCount}/${totalOpenNonEpic} open non-epic beads scored, ${subBar.length} below 95${qualityVacuous ? ' [VACUOUS — no beads scored despite a non-empty pour set]' : qualityUndercovered ? ' [UNDER-COVERED — fewer beads scored than exist]' : ''}`);
+
+  // (3) Stop if every bead clears the bar (and the pass actually scored something).
+  if (subBar.length === 0 && !qualityVacuous) {
+    log(`Quality rework: all beads >= 95 on pass ${pass}; loop done.`);
+    break;
+  }
+
+  // (4) Dry run: read-only — score once, report the sub-95 set, do NOT mutate.
+  if (Context.dryRun) {
+    log(`Quality rework: dry run — scored only, no rework applied (${subBar.length} beads would be reworked).`);
+    break;
+  }
+
+  // (5) Last pass: do not rework again (nothing would re-score it). Beads still
+  //     <95 stay in qualityResults with their real score → allBeadsAt95=false →
+  //     NEEDS-FIX, the correct terminal signal. Don't loop forever; don't fake 95s.
+  if (pass === MAX_REWORK) {
+    log(`Quality rework: ${subBar.length} bead(s) still < 95 after the final pass ${pass}/${MAX_REWORK} — left as the NEEDS-FIX signal.`);
+    break;
+  }
+
+  // (6) Rework the sub-95 beads in PARALLEL — one agent per bead, each applying
+  //     THAT bead's own remediations (split / wire / tighten) per the rubric class.
+  log(`Quality rework pass ${pass}: reworking ${subBar.length} sub-95 bead(s)`);
+  const reworkTasks = subBar.map((s) => () => agent(`
+You are the quality-rework agent for /decompose Quality-rework pass ${pass}, bead=${s.beadId}. (Self-contained: all instructions are inline below; you run in the app repo cwd, where the workflow spec is not present.)
+
+This bead scored ${s.score}/100 on the FULL quality rubric. Bring it to the 95 bar by applying ITS OWN remediations — pick the ONE action that resolves the dominant penalties. Do NOT add new scope (T4): only make the EXISTING intent concrete; never invent features, ACs, or files the bead did not already imply.
+
+Bead score + penalties + remediations to apply:
+${JSON.stringify(s, null, 2)}
+
+Context: ${JSON.stringify(Context, null, 2)}
+
+Choose the action from the penalty classes present:
+
+A. OVERSIZED / MONOLITH — penalties from SIZING (ACs > 6, Files > 5, cross-layer reach > 2). SPLIT along a clean seam:
+   1. \`bd show ${s.beadId} --json\` — capture title, ACs (parse Acceptance section), labels, priority, metadata (testPlanFile, testPlanCases, filesTouched), incoming deps, outgoing deps, parent epic.
+   2. Identify the seam. Try in this order; first match wins:
+      - Cross-layer: description spans {UI, API, DB} AND ACs partition cleanly → seam="API boundary" or "schema vs app code"
+      - Per-entity: title is a list ("Habits, Goals, Streaks CRUD") → seam="per-entity"
+      - Read-vs-write: ACs split between reads (GET, list) and writes (POST, update, delete) → seam="read path vs write path"
+      - Happy-vs-edge: ACs split between happy-path and explicit edge-cases → seam="happy path vs edge cases"
+   3. If no seam fits (ACs straddle every candidate): return { "beadId": "${s.beadId}", "action": "unreworkable", "attempted": [<seams tried>], "reason": "no clean seam — <one sentence>" }. Do NOT invent a seam (T1).
+   4. Propose N children:
+      - Title = source title + seam term (e.g. "Habits CRUD (DB+API)" + "Habits CRUD (UI)").
+      - ACs partitioned along the seam — each source AC lands in EXACTLY one child. NO new ACs (T4).
+      - filesTouched partitioned — child ownership sets MUST be disjoint.
+      - Dep mode: sequential (UI consumes API) OR parallel (independent subsystems).
+   5. Re-audit each proposed child against the SAME sizing rubric. If any child still scores < 95 on SIZING, return { "action": "unreworkable", "attempted": [<seam>], "reason": "seam still produces oversized children" }. Do NOT retry with another seam in this run — that's the next pass's job.
+   6. Mutate:
+      - \`bd create\` each child with --parent=<parentEpic>, --labels=<source labels comma-joined>, --priority=<source priority>, --body-file=<tmp.json>.
+      - Write filesTouched (and testPlanFile/testPlanCases per the source) metadata to each child.
+      - Rewire deps (sequential: \`bd dep add child[i+1] child[i]\`; preserve incoming blockers on first; preserve outgoing dependents on last. parallel: all children get all incoming + all outgoing).
+      - Close source: \`bd close ${s.beadId} --reason "superseded by <new-ids joined>"\`.
+   7. Return { "beadId": "${s.beadId}", "action": "split", "seam": "<used seam>", "newChildren": [{ "id": "...", "title": "...", "score": <n> }, ...] }.
+
+B. DEPENDENCY-GRAPH MISMATCH — the "Dependency-graph mismatch" penalty (bead asserts "after X" / "depends on X" in its text but no \`bd dep\` edge exists). WIRE the missing edge:
+   1. From the bead description and the remediation, identify the blocker bead it should depend on (resolve the named prior bead/feature to a bead ID via \`bd list --status=open --json\` — match by title/feature).
+   2. \`bd dep add ${s.beadId} <blockerId>\` (this bead is blocked, the named one is the blocker). VERIFY the edge landed via \`bd show ${s.beadId} --json\` — do NOT trust the exit code; retry once if absent.
+   3. If the asserted dependency is spurious (the text says "after X" but X is not a real bead / the order is wrong), instead EDIT the description to drop the false ordering claim (\`bd update ${s.beadId}\`). Do NOT fabricate a dep edge to a bead that should not block it (T1).
+   4. Return { "beadId": "${s.beadId}", "action": "wire", "reason": "<edge added: ${s.beadId} -> <blockerId>, or false-ordering claim removed>" }.
+
+C. VAGUE / UNDERSPEC — SPEC-CONCRETENESS or CONTEXT-COMPLETENESS penalties (vague AC, missing file paths, missing API contract, missing testPlanFile, undefined domain terms, open questions/TBD). TIGHTEN IN PLACE — make the EXISTING intent concrete, add NO new scope (T4):
+   1. \`bd show ${s.beadId} --json\` — read the current description/acceptance + metadata.
+   2. Apply the remediations: rewrite vague ACs into testable assertions WITH thresholds; add the exact file paths the bead already implies; paste the request/response shape for any endpoint it already names; resolve "TBD"/open questions to a concrete decision consistent with the plan; define undefined domain terms inline. Do NOT add a NEW acceptance criterion or a NEW file the bead did not already imply — only concretize what is there.
+   3. \`bd update ${s.beadId}\` the description/acceptance accordingly. Write metadata for any missing fields the remediation names: \`bd update ${s.beadId} --metadata "@<tmp.json>"\` with testPlanFile, testPlanCases, filesTouched (derived from the now-concrete ACs/files).
+   4. Return { "beadId": "${s.beadId}", "action": "tighten", "reason": "<one-sentence summary of what was concretized>" }.
+
+If the bead carries penalties from MULTIPLE classes, prefer A (split) when SIZING penalties dominate (an oversized bead can't be tightened to the bar); otherwise apply C (tighten) and fold any dep-wire from B into the same run. If you genuinely cannot bring this bead to 95 by any of A/B/C (e.g. it needs a plan amendment or a formula that does not exist), return { "beadId": "${s.beadId}", "action": "unreworkable", "reason": "<why — names the missing plan/formula input>" }. Do NOT throw (T7); do NOT fabricate a passing state.
+
+Return JSON matching: { "beadId": "${s.beadId}", "action": "split"|"tighten"|"wire"|"unreworkable", "newChildren"?: [...], "seam"?: "...", "attempted"?: [...], "reason"?: "..." }
+`, { label: `rework-${s.beadId}-pass${pass}`, phase: 'Quality rework', schema: reworkSchema, agentType: 'general-purpose' }));
+
+  const waveResults = (await parallel(reworkTasks)).filter(Boolean);
+  let nSplit = 0, nTighten = 0, nWire = 0, nUnreworkable = 0;
+  for (const r of waveResults) {
+    if (!r) continue;
+    if (r.action === 'split') {
+      nSplit++;
+      // Normalize into the legacy atomize shape so AtomizeSummary.atomized is unchanged.
+      atomizedAccum.push({ source: r.beadId, status: 'atomized', children: r.newChildren || [], seam: r.seam });
+    } else if (r.action === 'unreworkable') {
+      nUnreworkable++;
+      unsplittableAccum.push({ source: r.beadId, status: 'unsplittable', attempted: r.attempted || [], reason: r.reason });
+    } else if (r.action === 'wire') {
+      nWire++;
+    } else if (r.action === 'tighten') {
+      nTighten++;
+    }
+  }
+  log(`Quality rework pass ${pass}: ${nSplit} split, ${nTighten} tightened, ${nWire} wired, ${nUnreworkable} unreworkable — re-scoring next pass`);
+}
+
+// AtomizeSummary — built from the loop's TERMINAL state so the verdict (which gates
+// on persistentlyOversized.length===0 && unsplittable.length===0) is UNCHANGED:
+//   - atomized              = all splits performed across passes
+//   - unsplittable          = beads the rework tried to split but couldn't seam (action 'unreworkable')
+//   - persistentlyOversized = beads STILL scoring <95 on SIZING penalties after the final pass
+//                             (the final qualityResults is the terminal scored set)
+const SIZING_RULE_RX = /size|acs?\b|acceptance|file|cross-?layer|testplancases|oversiz|monolith/i;
+const persistentlyOversized = qualityResults
+  .flatMap(r => r.scores)
+  .filter(s => s.score < 95 && Array.isArray(s.penalties)
+    && s.penalties.some(p => SIZING_RULE_RX.test(typeof p === 'string' ? p : (p && (p.rule || p.evidence) || ''))))
+  .map(s => ({ id: s.beadId, title: s.title, score: s.score, penalties: s.penalties }));
+
+const AtomizeSummary = {
+  iterations: reworkPassesRun,
+  atomized: atomizedAccum,
+  unsplittable: unsplittableAccum,
+  persistentlyOversized
+};
+log(`Quality rework done: ${reworkPassesRun} pass(es) — ${AtomizeSummary.atomized.length} atomized, ${AtomizeSummary.unsplittable.length} unsplittable, ${AtomizeSummary.persistentlyOversized.length} persistently oversized; final scored=${scoredCount}/${totalOpenNonEpic}, ${qualityResults.flatMap(r => r.scores).filter(s => s.score < 95).length} below 95`);
 
 // ---------------------------------------------------------------------------
 // Phase 6 — Adversarial fidelity cross-check (2 verifiers + 1 reconcile)
@@ -1445,7 +1500,7 @@ Steps:
 **Plan source:** <plan.lock.json | plan.md (deprecation: rerun /vision)>
 **Beads created:** <N> (<X> epics, <Y> tasks)
 **App epic:** <id>
-**Phases run:** preflight, parse-plan, pour (<N> features), atomize (<iterations> iters, <M> atomized), quality (<K> epics scored), fidelity (A+B+C+reconcile), dep-audit, synthesis
+**Phases run:** preflight, parse-plan, pour (<N> features), quality-rework (<atomize.iterations> passes, <M> atomized, <K> epics scored), fidelity (A+B+C+reconcile), dep-audit, synthesis
 
 ## Verdict reasoning
 <one paragraph: why blessed, or what blocks it>
@@ -1480,7 +1535,7 @@ Steps:
 - <if mustHaveGap is true: name each vision must-have with status "gap" — this forces NEEDS-FIX>
 - <if disagree: FIDELITY DISAGREEMENT block with both verifier outputs verbatim>
 
-## Per-epic quality (Phase 5)
+## Per-epic quality (Phase 4+5 — final rework pass)
 ### <epicId> — <title>
 - <beadId> — <title> — <score>/100 ✓
 - <beadId> — <title> — <score>/100 ⚠
@@ -1488,11 +1543,11 @@ Steps:
   - Remediations: <numbered list>
   - Projected after remediation: <score>/100
 
-## Atomization (Phase 4)
-- Iterations: <n>/3
-- Atomized: <source → children list>
+## Rework / atomization (Phase 4+5)
+- Rework passes run: <atomize.iterations>/3
+- Atomized (split to the bar): <source → children list>
 - Unsplittable (surfaced for human): <list with bead, attempted seams, reason>
-- Persistently oversized after 3 iterations: <list>
+- Persistently oversized after the final pass (still < 95 on sizing): <list>
 
 ## Pours (Phase 3)
 - Successful: <N>
