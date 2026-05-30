@@ -38,6 +38,12 @@ function parseArgs(s) {
   const out = { plan: 'plan.md', dryRun: false, autoBless: false, phase: 1 };
   if (!s) return out;
   const tokens = (typeof s === 'string') ? s.trim().split(/\s+/).filter(Boolean) : (Array.isArray(s) ? s : []);
+  // 3ch: honor flags ONLY as a leading contiguous run — stop at the first non-flag
+  // (prose) token. A headless/Workflow invocation passes a natural-language wrapper as
+  // the args string; a literal `--no-file`/`--auto-bless` mentioned in that prose — even
+  // inside a negation like "do NOT pass --no-file" — must NOT flip the mode bit. Real
+  // callers (/orchestrate, the /decompose shell) pass flags as leading tokens, so this
+  // is lossless for them while making accidental mid-prose flag tokens inert.
   for (let i = 0; i < tokens.length; i++) {
     if (tokens[i] === '--plan' && tokens[i + 1]) { out.plan = tokens[++i]; }
     else if (tokens[i] === '--no-file') { out.dryRun = true; }
@@ -46,6 +52,7 @@ function parseArgs(s) {
     // Default (flag absent) keeps the human-review gate. (lbq.1)
     else if (tokens[i] === '--auto-bless') { out.autoBless = true; }
     else if (tokens[i] === '--phase' && tokens[i + 1]) { const n = parseInt(tokens[++i], 10); if (Number.isInteger(n) && n >= 1) out.phase = n; }
+    else { break; } // first non-flag token ends flag parsing; the rest is prose, not flags
   }
   return out;
 }
