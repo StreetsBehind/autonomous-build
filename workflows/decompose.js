@@ -299,6 +299,7 @@ For each formula in feature.formulas (usually 1, sometimes more), do:
 1. If Context.dryRun: \`bd mol pour <formula> --dry-run --var k=v ...\`. Capture the planned issues; do NOT mutate. Return one PourResult per formula with status="ok" and children populated from the dry-run output (id may be "<dry-run-1>", etc.).
 2. Otherwise:
    a. \`bd mol pour <formula> --var k=v ... 2>&1\`. Parse \`Root issue: (\\S+)\` from stdout → pourRoot.
+      - TRANSIENT-FAULT RETRY (decompose-4): pour agents run in PARALLEL, so a failure whose error text matches (case-insensitive) a transient store fault — "database is locked", "lock", "i/o timeout", "resource busy", "timeout", "connection reset" — is almost certainly jsonl/db contention from concurrent pours/checkouts, NOT a plan defect. Sleep a short JITTERED interval to avoid a thundering-herd retry (\`sleep $((2 + RANDOM % 3))\`, i.e. 2–4s) and retry the SAME command ONCE. Do NOT run \`bd doctor --fix\` here (it would itself contend with the other in-flight parallel pours). Only if the retry ALSO fails transiently do you fail the pour. Never retry a PERMANENT fault (see below) — re-running cannot fix a plan defect.
    b. \`bd dep add <pourRoot> ${ParsedPlan.appEpicId} --type parent-child\` to reparent under app epic.
    c. Walk the formula TOML at \`~/.beads/formulas/<formula>.formula.toml\`. For each step, identify any \`[steps.testPlan]\` block and any inline \`files = [...]\` field. Build a map of step.title (after variable substitution) → { testPlan?, files? }.
    d. \`bd show <pourRoot> --json\` → walk \`dependents[].id\` to get spawned child IDs and their titles.
@@ -314,7 +315,7 @@ Return JSON:
   "error": "<only if failed>"
 }
 
-If \`bd mol pour\` fails (required-var error, formula validation), return status="failed" with the error message preserved. Do NOT throw (T7).
+If \`bd mol pour\` fails with a PERMANENT cause — required-var error, off-enum / undeclared variable, formula-not-found, or formula validation — return status="failed" IMMEDIATELY with the error message preserved; do NOT retry (re-running cannot fix a plan defect — fail loudly so /vision fixes the plan). A TRANSIENT store fault gets the single jittered sleep-and-retry from step 2a first, and only fails if that retry also faults. Do NOT throw (T7).
 
 Do NOT \`bd create\` outside \`bd mol pour\` (T6: formula precedence).
 `, { label: `pour-${feature.name}`, phase: 'Pour', schema: pourSchema, agentType: 'general-purpose' }));

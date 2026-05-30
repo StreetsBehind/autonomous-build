@@ -101,7 +101,7 @@ One agent per feature in `ParsedPlan.features`. Each agent pours its formula, re
 1. For each formula in `feature.formulas`:
    0. **Validate `feature.vars` against the formula contract before pouring.** Read `~/.beads/formulas/<formula>.formula.toml`, collect declared `[vars.*]` names and any enumerated allowed value sets. If a `feature.vars` key is not a declared variable, or a value falls outside a declared enum, return `{ status: 'failed', error }` — **do not** rename the key to a near-miss var or coerce the value into the enum (T1: do not guess). This is the guard that stops the smbuild failure mode where two pour agents silently renamed `auth_scheme`→`auth_strategy` and poured off-enum values.
    a. If `dryRun`: `bd mol pour <formula> --var ... --dry-run`, return planned issues without mutating.
-   b. Otherwise: `bd mol pour <formula> --var ... 2>&1`. Parse `Root issue: (\S+)` from stdout to get `pourRoot`.
+   b. Otherwise: `bd mol pour <formula> --var ... 2>&1`. Parse `Root issue: (\S+)` from stdout to get `pourRoot`. **Transient-fault retry (decompose-4):** pours run in parallel, so a failure whose error text matches a transient store fault (`database is locked` / `lock` / `i/o timeout` / `resource busy` / `timeout` / `connection reset`) is jsonl/db contention, not a plan defect — sleep a short jittered interval (`sleep $((2 + RANDOM % 3))`, avoiding a thundering-herd retry) and retry the same command **once** before failing (no `bd doctor --fix` here — it would contend with the other in-flight pours).
    c. `bd dep add <pourRoot> <appEpicId> --type parent-child` (reparent under app epic — `bd mol pour` has no `--parent` flag, verified 2026-05-28).
    d. Walk the formula TOML at `~/.beads/formulas/<formula>.formula.toml` and the cooked output. For each spawned child, write step-derived metadata via `bd update <id> --metadata "@<tempfile.json>"`. Fields: `testPlanFile`, `testPlanCases`, `testPlanCoverage` (from `[steps.testPlan]`), `filesTouched` (from the step's inline `files = [...]`). Apply variable substitution to all paths.
    e. Skip metadata write for steps that declare neither `[steps.testPlan]` nor `files` — that's a valid signal (coordination/decision bead).
@@ -109,7 +109,7 @@ One agent per feature in `ParsedPlan.features`. Each agent pours its formula, re
 
 **Output per agent:** `PourResult = { feature: <name>, pourRoot: <id> | "<dry-run>", children: [{id, title, metadata}], status: 'ok' | 'failed', error?: <message> }`
 
-**Failure:** if `bd mol pour` fails (missing required vars, formula validation error), the agent returns `{ status: 'failed', feature, error }` instead of throwing (T7). Synthesis reports it; verdict is NEEDS-FIX.
+**Failure:** if `bd mol pour` fails with a **permanent** cause (missing required vars, off-enum/undeclared variable, formula-not-found, formula validation error), the agent returns `{ status: 'failed', feature, error }` immediately — no retry (re-running can't fix a plan defect) — instead of throwing (T7). A **transient** store fault gets the single jittered sleep-and-retry above first. Synthesis reports a genuine failure; verdict is NEEDS-FIX.
 
 **Concurrency:** N agents, capped at the runtime's 16-concurrent limit. For N > 16, the runtime schedules in batches automatically.
 
