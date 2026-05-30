@@ -278,6 +278,9 @@ const pourSchema = {
         }
       }
     },
+    // decompose-2: step titles the agent is CONFIDENT should have poured as children
+    // (substituted + condition-filtered, omit-if-unsure). Asserted deterministically.
+    expectedStepTitles: { type: 'array', items: { type: 'string' } },
     error: { type: 'string' }
   }
 };
@@ -305,6 +308,7 @@ For each formula in feature.formulas (usually 1, sometimes more), do:
    d. \`bd show <pourRoot> --json\` → walk \`dependents[].id\` to get spawned child IDs and their titles.
    e. For each child, look up step metadata by title. If non-empty, write to a temp JSON file and \`bd update <child.id> --metadata "@<tempfile>"\`. Fields: testPlanFile, testPlanCases, testPlanCoverage (from [steps.testPlan]), filesTouched (from files = [...]). Apply variable substitution to all string values.
    f. Skip metadata write for steps with neither testPlan nor files — that's a valid signal (coordination bead).
+   g. COMPLETENESS (decompose-2): build \`expectedStepTitles\` — the step titles from this formula's TOML that you are CONFIDENT should have poured as children, AFTER variable substitution AND honoring each step's \`condition\`/\`needs\` (omit a step whose condition excludes it). \`bd mol pour\` can exit 0 yet spawn only a subset of steps (a bd hiccup / jsonl write race); this list is asserted deterministically downstream so a silent partial pour can't slip through. **If you cannot confidently evaluate a step's condition, OMIT it** — a wrongly-included title forces a false NEEDS-FIX, so err toward leaving steps out (a genuinely missing UNCONDITIONAL step is still caught). On a dry run this list is ignored, so you may leave it empty.
 
 Return JSON:
 {
@@ -312,6 +316,7 @@ Return JSON:
   "status": "ok" | "failed",
   "pourRoot": "<id>" | null,
   "children": [{ "id": "...", "title": "...", "metadata": {...} }, ...],
+  "expectedStepTitles": ["<step title you are confident should be a child>", ...],
   "error": "<only if failed>"
 }
 
@@ -324,6 +329,30 @@ const pourResults = await parallel(pourTasks);
 const pourOk = pourResults.filter(r => r && r.status === 'ok');
 const pourFailed = pourResults.filter(r => !r || r.status === 'failed');
 log(`Pour: ${pourOk.length}/${ParsedPlan.features.length} ok, ${pourFailed.length} failed`);
+
+// decompose-2 — post-pour step-completeness assertion. `bd mol pour` can exit 0
+// but spawn only a SUBSET of a formula's declared steps (a bd hiccup, a jsonl
+// write race); pourFailed stays 0 and the deficit only *maybe* surfaces later in
+// the probabilistic Phase 6 verifiers. Each pour agent returns the step titles it
+// was confident should pour (substituted + condition-filtered, omit-if-unsure);
+// here we deterministically assert each resolved to a real child. A deficit is a
+// silent-partial-pour and forces NEEDS-FIX. Skipped on dry-run (children are
+// dry-run placeholders). Conservative by construction: an empty expected list
+// (agent unsure) yields no deficit, so this can only catch genuine absences.
+const pourStepDeficits = [];
+if (!Context.dryRun) {
+  const norm = (s) => String(s || '').trim().toLowerCase().replace(/\s+/g, ' ');
+  for (const r of pourOk) {
+    const expected = Array.isArray(r.expectedStepTitles) ? r.expectedStepTitles : [];
+    if (!expected.length) continue;
+    const present = new Set((r.children || []).map(c => norm(c.title)));
+    const missing = expected.filter(t => !present.has(norm(t)));
+    if (missing.length) pourStepDeficits.push({ feature: r.feature, pourRoot: r.pourRoot, missing });
+  }
+  if (pourStepDeficits.length) {
+    log(`[POUR-DEFICIT] ${pourStepDeficits.length} feature(s) poured fewer steps than the formula declares (forces NEEDS-FIX): ${pourStepDeficits.map(d => `${d.feature} missing [${d.missing.join(', ')}]`).join('; ')}`);
+  }
+}
 
 // Apply cross-feature deps sequentially (orchestrator does this, not an agent —
 // it's pure resolve-name-to-id + one bd call per edge, and we want it
@@ -1339,6 +1368,7 @@ const concernEnforcementClean =
   (concernEnforcement.errors || []).length === 0;
 const blessed =
   pourFailed.length === 0 &&
+  pourStepDeficits.length === 0 &&   // decompose-2: a silent partial pour (steps declared but not spawned) blocks BLESSED
   AtomizeSummary.persistentlyOversized.length === 0 &&
   AtomizeSummary.unsplittable.length === 0 &&
   allBeadsAt95 &&
@@ -1505,6 +1535,7 @@ const synthesisPayload = {
   autoChain,
   baseline: { ...baselineResult, accepted: baselineAccepted },
   pours: { ok: pourOk, failed: pourFailed },
+  pourStepDeficits,   // decompose-2: features that poured fewer steps than declared (forces NEEDS-FIX)
   concernEnforcement,
   atomize: AtomizeSummary,
   quality: qualityResults,
@@ -1598,6 +1629,7 @@ Steps:
 ## Pours (Phase 3)
 - Successful: <N>
 - Failed: <list with feature + error>
+- **Step deficits (decompose-2 — poured fewer steps than the formula declares; forces NEEDS-FIX):** <render pourStepDeficits: each feature → the missing step titles, or "none">.
 
 ## Concern + NFR + production-floor enforcement (Phase 3.5)
 <render from concernEnforcement; omit the whole section if planSource != lock>
@@ -1688,8 +1720,10 @@ const finalResult = {
   reportPath: reportResult?.reportPath || null,
   appEpicId: ParsedPlan.appEpicId,
   beadCount: pourOk.reduce((n, r) => n + (r.children?.length || 0), 0),
+  pourStepDeficits,           // decompose-2: features that poured fewer steps than declared
   failedPhases: [
     pourFailed.length > 0 ? `pour (${pourFailed.length} failed)` : null,
+    pourStepDeficits.length > 0 ? `pour (${pourStepDeficits.length} step-deficit: ${pourStepDeficits.map(d => d.feature).join(', ')})` : null,
     AtomizeSummary.unsplittable.length > 0 ? `atomize (${AtomizeSummary.unsplittable.length} unsplittable)` : null,
     AtomizeSummary.persistentlyOversized.length > 0 ? `atomize (${AtomizeSummary.persistentlyOversized.length} persistently oversized)` : null,
     qualityVacuous ? 'quality (no beads scored — vacuous pass)' : null,
