@@ -683,6 +683,7 @@ return {
   merged: mergedSet,
   blocked: blockedSet,
   failed: failedSet,
-  waveCount: waveNum,
-  durationSec: Math.round(durationMs / 1000)
+  // durationSec omitted: wall-clock is uncomputable inside the Workflow runtime
+  // (Date.now()/new Date() forbidden — see beads autonomous-build-4ez / -5fb).
+  waveCount: waveNum
 };

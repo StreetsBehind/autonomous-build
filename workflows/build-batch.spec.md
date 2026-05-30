@@ -435,7 +435,7 @@ After the poll loop exits.
    - If `len(blockedSet) > 0` OR `len(failedSet) > 0` → invoke `/escalate` (it builds the push notification from `bd list --status=blocked`, which now includes the failed beads). Also print worktree paths so the human can find failed-bead worktrees.
    - If `len(blockedSet) == 0` and `len(failedSet) == 0` and `bd ready` is now empty → invoke `/retro` (matches /build-next's DONE path).
 
-**Output:** `BatchSummary = { merged: [...], blocked: [...], failed: [...], durationSec, postActions: [...] }`
+**Output:** `BatchSummary = { merged: [...], blocked: [...], failed: [...], waveCount, postAction }` (no `durationSec`: wall-clock is uncomputable inside the Workflow runtime — `Date.now()`/`new Date()` are forbidden; see beads `autonomous-build-4ez` / `-5fb`)
 
 **Failure:** if `/escalate` or `/retro` invocation fails, log the failure but do not retry — the summary itself is the system of record (T7: loud and recoverable).
 
@@ -444,8 +444,8 @@ After the poll loop exits.
 ## Run-completion behavior
 
 When the workflow finishes:
-- Returns to the conversation: `{ merged: [...], blocked: [...], failed: [...], durationSec, postActions: [...] }`
-- The orchestrator turn prints a one-line summary: `"Batch: merged <N>, blocked <M>, failed <F> in <duration>"` plus any post-action results.
+- Returns to the conversation: `{ refused, drained, postAction, merged: [...], blocked: [...], failed: [...], waveCount }` (no `durationSec` — wall-clock is uncomputable in the Workflow runtime)
+- The orchestrator turn prints a one-line summary: `"Batch: merged <N>, blocked <M>, failed <F>"` plus any post-action results.
 
 ---
 
