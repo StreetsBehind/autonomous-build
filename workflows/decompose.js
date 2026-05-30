@@ -836,15 +836,67 @@ const verifierA = fidelityResults[0];
 const verifierB = fidelityResults[1];
 const verifierC = fidelityResults[2];
 
+// ea1: reconcile verifier C's conservative must-have gaps against the AUTHORITATIVE
+// featureToPourRoot map + verifier A's proven feature coverage. C is independent and
+// string-matches must-have→bead, so when a covering feature poured an epic whose children
+// are named by implementation detail (not the must-have's wording) it flags a FALSE gap.
+// But A already proved feature→pour-root; a must-have whose covering feature poured a real
+// root IS covered by that root + its children. Downgrade those rows to "covered" and
+// recompute C's verdict, so a demonstrably-covered must-have can't force a false NEEDS-FIX.
+// We keep adversarial independence for the plan↔dag direction — this only credits the
+// must-have→bead inheritance A already computed. Pure (no workflow globals) so
+// tests/decompose/reconcile-musthave.test.mjs can exercise it.
+function reconcileMustHaveGaps(verifierA, verifierC, featureToPourRoot) {
+  const out = { matrix: [], traceable: verifierC && verifierC.traceable, credits: [] };
+  if (!verifierC || !Array.isArray(verifierC.matrix)) return out;
+  const poured = Object.keys(featureToPourRoot || {});
+  // C may truncate/extend the exact featureOrder name; match exact, then bidirectional
+  // containment against a feature that actually poured a root.
+  const matchPoured = (name) => {
+    const n = String(name || '').trim().toLowerCase();
+    if (!n) return null;
+    return poured.find((key) => { const kn = key.trim().toLowerCase(); return kn === n || kn.includes(n) || n.includes(kn); }) || null;
+  };
+  const aCovered = new Set(
+    ((verifierA && Array.isArray(verifierA.features)) ? verifierA.features : [])
+      .filter((f) => f && f.status === 'covered' && Array.isArray(f.beads) && f.beads.length)
+      .map((f) => String(f.name || '').trim().toLowerCase())
+  );
+  out.matrix = verifierC.matrix.map((row) => {
+    if (!row || row.status !== 'gap') return row;
+    const feats = Array.isArray(row.features) ? row.features : [];
+    let creditedFeature = null, rootKey = null;
+    for (const fn of feats) {
+      const k = matchPoured(fn);
+      if (k) { creditedFeature = fn; rootKey = k; break; }
+      if (aCovered.has(String(fn || '').trim().toLowerCase())) { creditedFeature = fn; break; }
+    }
+    if (!creditedFeature) return row; // genuine gap — no covering feature poured a root
+    const rootId = rootKey ? featureToPourRoot[rootKey] : null;
+    out.credits.push({ mustHave: row.mustHave, feature: creditedFeature, root: rootId });
+    const beads = rootId ? [rootId, ...(Array.isArray(row.beads) ? row.beads : [])] : (Array.isArray(row.beads) ? row.beads : []);
+    return { ...row, status: 'covered', beads, reconciled: true, reconcileNote: `covered via poured feature "${creditedFeature}"${rootId ? ` (root ${rootId})` : ''}` };
+  });
+  if (out.traceable === 'gap') {
+    out.traceable = out.matrix.some((r) => r && r.status === 'gap') ? 'gap' : 'complete';
+  }
+  return out;
+}
+
 // Reconcile bin — pure synthesis, can be inline JS rather than another agent.
 // A feature-cited "addressed" concern with no implementing bead is a fidelity
 // gap (bfo.9): it forces NEEDS-FIX exactly like coverage-gap. It is reported
 // independently so the offending concern is named even when coverage/traceability
 // also fail (the concern section in the report keys off concernGap, not the bin).
 const concernGap = !!(verifierA && verifierA.concernTrace && verifierA.concernTrace.traceable === 'gap');
-// A dropped must-have (in the vision, absent from the DAG, not deliberately
-// deferred) forces NEEDS-FIX exactly like a coverage gap. "n/a" (md-only plan)
-// and "complete" are both fine.
+// A dropped must-have (in the vision, absent from the DAG, not deliberately deferred)
+// forces NEEDS-FIX exactly like a coverage gap — but only AFTER reconciling C against the
+// authoritative feature→pour-root map (ea1). "n/a" (md-only plan) and "complete" pass.
+const cReconciled = reconcileMustHaveGaps(verifierA, verifierC, featureToPourRoot);
+if (verifierC) { verifierC.matrix = cReconciled.matrix; verifierC.traceable = cReconciled.traceable; }
+if (cReconciled.credits.length) {
+  log(`Fidelity reconcile (ea1): credited ${cReconciled.credits.length} must-have(s) whose covering feature poured a root — ${cReconciled.credits.map((m) => `${m.mustHave} → ${m.feature}`).join('; ')}`);
+}
 const mustHaveGap = !!(verifierC && verifierC.traceable === 'gap');
 let fidelityBin;
 if (!verifierA || !verifierB) {

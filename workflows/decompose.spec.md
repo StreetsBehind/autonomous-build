@@ -246,8 +246,8 @@ A, B, and C run in **parallel** on the same inputs (3 agents total). They must r
 ### Reconciliation
 
 **Agent:** `reconcile-fidelity`
-**Tools:** none — pure synthesis from A and B outputs
-**Inputs:** outputs of A and B
+**Tools:** none — pure synthesis (inline JS) from A, B, and C outputs
+**Inputs:** outputs of A, B, and C, plus the authoritative `featureToPourRoot` map (used to reconcile C's must-have gaps — see `musthave-gap` below)
 **Bins:**
 
 | Bin | Condition | Disposition |
@@ -255,7 +255,7 @@ A, B, and C run in **parallel** on the same inputs (3 agents total). They must r
 | `pass` | A.coverage == 'complete' AND B.traceability == 'clean' AND A.concernTrace.traceable == 'complete' | fidelity passes; no remediation needed |
 | `coverage-gap` | A reports `incomplete` (one or more features have no bead) | fidelity fails; surface gaps; recommend `/vision` rerun OR manual pour of missing formulas |
 | `concern-gap` | A.coverage == 'complete' AND B.traceability == 'clean' BUT A.concernTrace.traceable == 'gap' (a feature-cited `addressed` concern has no implementing bead) | fidelity fails; name the offending concern(s); recommend `/vision` rerun to correct the evidence OR pour the missing feature. The `concernGap` flag is also surfaced independently in the report, so the offending concern is named even when `coverage-gap`/`traceability-drift` is the headline bin |
-| `musthave-gap` | A.coverage == 'complete' AND B.traceability == 'clean' AND no concern-gap BUT C.traceable == 'gap' (a vision must-have has no implementing bead and was not deliberately deferred) | fidelity fails; name the dropped must-have(s); recommend `/vision` rerun to restore the feature OR an explicit deferral in the lock. The `mustHaveGap` flag is surfaced independently in the report (must-have traceability matrix), so the dropped must-have is named even when another bin is the headline |
+| `musthave-gap` | A.coverage == 'complete' AND B.traceability == 'clean' AND no concern-gap BUT C.traceable == 'gap' (a vision must-have has no implementing bead and was not deliberately deferred) — **after reconciliation (ea1)**: before trusting C's gap, the reconcile step (`reconcileMustHaveGaps`) cross-checks each C `gap` against the authoritative `featureToPourRoot` map and A's proven feature coverage. C is independent + conservative and string-matches must-have→bead, so a covering feature that poured an epic whose **children are implementation-named** (not the must-have's wording) reads as a false gap; if that covering feature actually poured a real root (or A marked it covered), the must-have is credited to that root + its children and downgraded to `covered`. Only the survivors are a true `musthave-gap`. | fidelity fails; name the dropped must-have(s); recommend `/vision` rerun to restore the feature OR an explicit deferral in the lock. The `mustHaveGap` flag is surfaced independently in the report (must-have traceability matrix), so the dropped must-have is named even when another bin is the headline |
 | `traceability-drift` | B reports `drift` (one or more beads have no plan citation) | fidelity fails; surface drifted beads; recommend either close as scope creep OR amend `plan.md` to declare the feature |
 | `both-fail` | A and B both fail with non-overlapping concerns | fidelity fails; surface both verdicts; the DAG has both gaps and drift |
 | `disagree` | A and B fail with conflicting evidence (e.g. A says feature X is covered by bead Y; B says bead Y traces to feature Z, not X) | fidelity fails; surface BOTH verifier outputs verbatim under a "FIDELITY DISAGREEMENT" section in the report; **the human resolves**, the workflow does not auto-pick (T1) |
