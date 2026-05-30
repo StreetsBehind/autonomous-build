@@ -37,8 +37,6 @@ function parseArgs(s) {
   return out;
 }
 
-const batchStart = Date.now();
-
 // ---------------------------------------------------------------------------
 // Phase 0 — Meta-mode guard (sequential, 1 agent, first check always)
 // Hard refuse if running inside autonomous-build. Parallel writers would race
@@ -640,14 +638,10 @@ Use Bash. Return JSON: { "ok": <bool>, "reason"?: "<string>" }.
 // ---------------------------------------------------------------------------
 phase('Summary');
 
-const durationMs = Date.now() - batchStart;
-const durationStr = `${Math.floor(durationMs / 60000)}m ${Math.floor((durationMs % 60000) / 1000)}s`;
-
 log(`[BATCH COMPLETE]`);
 log(`  Merged:   ${mergedSet.length} beads → ${mergedSet.join(', ') || '(none)'}`);
 log(`  Blocked:  ${blockedSet.length} beads → ${blockedSet.join(', ') || '(none)'}`);
 log(`  Failed:   ${failedSet.length} beads → ${failedSet.join(', ') || '(none)'}`);
-log(`  Duration: ${durationStr}`);
 
 // Post-action decision: /escalate if blockedSet OR failedSet non-empty (failed
 // beads were marked blocked above so they notify too); /retro if clean drain.
