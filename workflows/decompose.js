@@ -209,6 +209,51 @@ if (!parseResult || parseResult.status !== 'ok') {
 const ParsedPlan = parseResult;
 log(`Parse OK — ${ParsedPlan.features.length} features, ${ParsedPlan.crossDeps.length} cross-deps, appEpic=${ParsedPlan.appEpicId}`);
 
+// decompose-3 — pre-pour cycle check over the plan's cross-feature dependency
+// edges. A crossDeps entry { blocked, blocker } means `blocked` depends on
+// `blocker`; a cycle in that dependency graph can never be poured into an acyclic
+// DAG, and was otherwise only caught by Phase 7's assertTopology AFTER a full
+// pour + wiring pass had already mutated bd (a wasted run; fix is a /vision
+// re-author). Catching it here fails fast, before any bd write — in dry-run too,
+// since the edges come from the parsed plan, not the poured graph. Pure JS,
+// mirrors assertTopology's colour-DFS; returns the cycle path (empty = acyclic).
+// Scoped to cross-feature edges only: tier edges are acyclic by construction and
+// formula-internal deps aren't known pre-pour.
+function detectCrossDepCycle(crossDeps) {
+  const adj = {};
+  const nodes = new Set();
+  for (const e of (Array.isArray(crossDeps) ? crossDeps : [])) {
+    if (!e || typeof e.blocked !== 'string' || typeof e.blocker !== 'string') continue;
+    nodes.add(e.blocked); nodes.add(e.blocker);
+    (adj[e.blocked] = adj[e.blocked] || []).push(e.blocker);
+  }
+  const colour = {}; // undefined=unseen, 1=in-stack, 2=done
+  const stack = [];
+  let cyclePath = [];
+  const dfs = (n) => {
+    colour[n] = 1; stack.push(n);
+    for (const d of (adj[n] || [])) {
+      if (colour[d] === 1) { if (!cyclePath.length) cyclePath = [...stack.slice(stack.indexOf(d)), d]; return true; }
+      if (colour[d] === undefined && dfs(d)) return true;
+    }
+    colour[n] = 2; stack.pop();
+    return false;
+  };
+  for (const n of nodes) { if (colour[n] === undefined && dfs(n)) break; }
+  return cyclePath;
+}
+
+const crossDepCycle = detectCrossDepCycle(ParsedPlan.crossDeps);
+if (crossDepCycle.length) {
+  log(`[PRE-POUR] crossFeatureDependencies cycle detected: ${crossDepCycle.join(' -> ')} — failing before any pour mutates bd`);
+  return {
+    verdict: 'NEEDS-FIX',
+    phase: 'pre-pour-cycle-check',
+    failedReason: `crossFeatureDependencies contains a dependency cycle: ${crossDepCycle.join(' -> ')}. A cyclic cross-feature dependency set can never be poured into an acyclic DAG — fix the plan's cross-feature deps and re-run /decompose.`,
+    reportPath: null
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Phase 3 — Pour beads per feature (parallel fan-out)
 // ---------------------------------------------------------------------------

@@ -84,6 +84,8 @@ Extract the structured feature list and cross-feature deps from the plan. Bootst
 
 **Output:** `ParsedPlan = { features: [...], crossDeps: [...], appEpicId }` (features/crossDeps scoped to phase `N`)
 
+**Pre-pour cycle check (decompose-3, deterministic).** Immediately after parse — before any pour mutates bd — a pure-JS colour-DFS (`detectCrossDepCycle`, mirroring Phase 7's `assertTopology`) runs over `ParsedPlan.crossDeps` (edge `blocked → blocker`). A cyclic cross-feature dependency set can never be poured into an acyclic DAG; previously this was caught only by Phase 7's topology assertion **after** a full pour + wiring pass had already mutated bd (a wasted run). On a cycle the workflow returns `{ verdict: 'NEEDS-FIX', phase: 'pre-pour-cycle-check', failedReason: <cycle path> }` early — in dry-run too, since the edges come from the parsed plan, not the poured graph. Scoped to cross-feature edges only (tier edges are acyclic by construction; formula-internal deps aren't known pre-pour).
+
 **Failure:** parse failure (missing required fields) → stop. `bd init` / `jankurai init` failure → stop with the underlying error preserved (T7: no swallowed exceptions).
 
 ---
