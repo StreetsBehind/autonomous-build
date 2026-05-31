@@ -32,3 +32,10 @@ ready.json
 /dolt-access.lock
 /ephemeral.sqlite3
 
+.bd-batch-state.json
+
+# Build / eval output (jankurai receipts, vision-eval results — regenerated, not source)
+/target/
+
+# Claude Code runtime locks (per-machine, not source)
+.claude/scheduled_tasks.lock
